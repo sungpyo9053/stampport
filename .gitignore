@@ -2,11 +2,15 @@
 __pycache__/
 *.py[cod]
 .venv/
+**/.venv/
 .env
+.env.*
 
 # Node
 node_modules/
+**/node_modules/
 dist/
+**/dist/
 .env.local
 
 # macOS
