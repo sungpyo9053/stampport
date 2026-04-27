@@ -229,6 +229,12 @@ ALLOWED_COMMANDS: tuple[str, ...] = (
     # both LOCAL_RUNNER_ALLOW_PUBLISH=true and
     # LOCAL_RUNNER_PUBLISH_DRY_RUN=false are set on the Mac side.
     "publish_changes",
+    # Full server deployment. Wraps publish_changes with an SSH-driven
+    # remote build + dist copy + healthcheck pass so a single click
+    # ships local edits all the way to /var/www/stampport(/-control).
+    # Single-flight guarded; same dry-run levers as publish_changes
+    # plus LOCAL_RUNNER_DEPLOY_DRY_RUN for the SSH side.
+    "deploy_to_server",
     # Self-management commands. The runner can replace itself with
     # the latest on-disk code (`restart_runner`) or fast-forward main +
     # bounce factory + replace itself (`update_runner`). The existing

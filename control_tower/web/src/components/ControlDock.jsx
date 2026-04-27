@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   pauseFactory,
@@ -9,6 +9,25 @@ import {
   startFactory,
   stopFactory,
 } from "../api/controlTowerApi.js";
+
+// In-flight guard for the deploy button. Module-scoped so it survives
+// re-renders and double-mounts in StrictMode without sliding into a
+// duplicate enqueue. The Promise is set when the click handler fires
+// and cleared when the request resolves (or after DEPLOY_GUARD_MS as a
+// belt-and-braces timeout for a hung enqueue).
+const DEPLOY_GUARD_MS = 90_000;
+let _deployInflight = null;
+let _deployInflightSince = 0;
+
+function _deployGuardActive() {
+  if (!_deployInflight) return false;
+  if (Date.now() - _deployInflightSince > DEPLOY_GUARD_MS) {
+    _deployInflight = null;
+    _deployInflightSince = 0;
+    return false;
+  }
+  return true;
+}
 
 // Game-style control dock. Floats at the bottom of the office. Each
 // command is a square pixel button with a pictogram and a label that
@@ -176,11 +195,27 @@ function DockButton({
 
 export default function ControlDock({ factory, runners = [], onChanged }) {
   const [busy, setBusy] = useState(null);
+  // Re-render trigger when the module-scoped deploy guard flips. We
+  // can't just read _deployInflight in render — React doesn't know to
+  // refresh — so this state is touched in the deploy click handler.
+  const [, setDeployTick] = useState(0);
+  const deployTimerRef = useRef(null);
   const status = factory?.status || "idle";
   const meta = STATUS_LABEL[status] || STATUS_LABEL.idle;
 
   const onlineRunner = runners.find((r) => r.status === "online");
   const runnerId = onlineRunner?.id;
+
+  // Clear any outstanding deploy guard timer when this dock unmounts
+  // so we don't tick a stale setState.
+  useEffect(() => {
+    return () => {
+      if (deployTimerRef.current) {
+        clearInterval(deployTimerRef.current);
+        deployTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const wrap = (label, fn) => async () => {
     if (busy) return;
@@ -195,6 +230,49 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
       setBusy(null);
     }
   };
+
+  // Deploy is special — it has a *module-level* guard so rapid
+  // remounts (StrictMode dev double-mount, or a panel re-render mid
+  // click) cannot enqueue a second deploy_to_server command. The
+  // local component `busy` is also set so the button greys out
+  // visually.
+  const onDeployClick = async () => {
+    if (busy) return;
+    if (_deployGuardActive()) {
+      alert("이미 배포가 진행 중입니다. 잠시 후 다시 시도하세요.");
+      return;
+    }
+    if (!runnerId) return;
+    setBusy("deploy");
+    _deployInflightSince = Date.now();
+    // Refresh the disabled state every 2s so the lockout reflects the
+    // module-level timeout in the UI even if no other state changes.
+    if (deployTimerRef.current) clearInterval(deployTimerRef.current);
+    deployTimerRef.current = setInterval(() => setDeployTick((n) => n + 1), 2000);
+    const p = (async () => {
+      try {
+        await sendRunnerCommand(runnerId, "deploy_to_server");
+        await onChanged?.();
+      } catch (e) {
+        console.error(e);
+        alert(`배포 명령 실패: ${e.message}`);
+      }
+    })();
+    _deployInflight = p;
+    try {
+      await p;
+    } finally {
+      _deployInflight = null;
+      _deployInflightSince = 0;
+      if (deployTimerRef.current) {
+        clearInterval(deployTimerRef.current);
+        deployTimerRef.current = null;
+      }
+      setBusy(null);
+      setDeployTick((n) => n + 1);
+    }
+  };
+  const deployGuardActive = _deployGuardActive();
 
   const canStart = ["idle", "stopped", "completed", "failed"].includes(status);
   const canPause = status === "running";
@@ -343,14 +421,17 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
           />
           <DockButton
             icon="deploy"
-            label="배포"
+            label={busy === "deploy" || deployGuardActive ? "배포 중" : "배포"}
             tone="success"
-            disabled={!runnerId || !!busy}
-            busy={busy === "deploy"}
-            title={noRunnerNote || "배포하기"}
-            onClick={wrap("deploy", () =>
-              sendRunnerCommand(runnerId, "publish_changes"),
-            )}
+            disabled={!runnerId || !!busy || deployGuardActive}
+            busy={busy === "deploy" || deployGuardActive}
+            title={
+              noRunnerNote ||
+              (deployGuardActive
+                ? "이미 배포가 진행 중입니다 — 완료 후 다시 시도"
+                : "서버 배포 (publish + SSH 빌드 + 헬스체크)")
+            }
+            onClick={onDeployClick}
           />
         </div>
       </div>
