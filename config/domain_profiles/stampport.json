@@ -1,0 +1,177 @@
+{
+  "domain_id": "stampport",
+  "domain_name_ko": "스탬포트",
+  "domain_name_en": "Stampport",
+  "tagline_ko": "오늘 다녀온 곳, 스탬포트에 도장 찍기.",
+  "subline_ko": "먹고 머문 곳들이, 나만의 로컬 여권이 됩니다.",
+  "one_liner_ko": "스탬포트는 카페·빵집·맛집 방문을 여권 도장처럼 스탬프로 모으고, EXP·레벨·뱃지·칭호·퀘스트로 키우는 로컬 취향 RPG 서비스다.",
+  "is_not": [
+    "맛집 리뷰 앱",
+    "지도 검색 앱",
+    "일반 음식 추천 앱",
+    "할 일/체크리스트 앱"
+  ],
+  "is": [
+    "방문을 도장으로 모으는 로컬 여권",
+    "수집·진행·과시 욕구를 자극하는 로컬 취향 RPG",
+    "감성 공유 카드가 핵심 보상인 SNS형 컬렉션 앱"
+  ],
+  "core_loop": [
+    "방문",
+    "스탬프 찍기",
+    "EXP 획득",
+    "뱃지/칭호 진행률 상승",
+    "킥 포인트 확인",
+    "내 여권 업데이트",
+    "감성 공유 카드 생성",
+    "다음 퀘스트 추천"
+  ],
+  "primary_categories": ["cafe", "bakery", "restaurant", "dessert"],
+  "primary_areas": ["성수", "관악", "망원", "연남", "한남", "기타"],
+  "primary_tags": [
+    "소금빵",
+    "조용함",
+    "웨이팅",
+    "혼밥 가능",
+    "데이트",
+    "감성공간",
+    "디저트",
+    "창가자리",
+    "사진맛집",
+    "재방문 의사"
+  ],
+  "mvp_screens": [
+    "Landing",
+    "Login",
+    "StampForm",
+    "StampResult",
+    "MyPassport",
+    "Badges",
+    "Quests",
+    "Share"
+  ],
+  "mvp_features": [
+    "Mock login (닉네임 + 이메일)",
+    "Stamp creation (place, area, category, tags, menu, visited_at)",
+    "Stamp acquired result card",
+    "EXP / Level system",
+    "Badges + Titles",
+    "Weekly Quests",
+    "Kick points (3개)",
+    "My Passport (지역/카테고리/뱃지 요약)",
+    "Share Card (감성 SNS 카드)"
+  ],
+  "mvp_exclusions": [
+    "실제 지도",
+    "GPS 인증",
+    "QR 인증",
+    "영수증 OCR",
+    "결제",
+    "실시간 커뮤니티",
+    "추천 알고리즘 고도화",
+    "Supabase Auth",
+    "푸시 알림",
+    "네이티브 앱 변환"
+  ],
+  "design_palette": {
+    "primary": ["deep-green", "cream", "gold"],
+    "secondary": ["burgundy", "navy", "warm-brown"]
+  },
+  "design_keywords_must": [
+    "passport",
+    "stamp",
+    "badge",
+    "title",
+    "quest",
+    "local exploration",
+    "warm analog paper",
+    "premium but playful",
+    "RPG progression",
+    "SNS-shareable"
+  ],
+  "design_keywords_must_not": [
+    "Naver Map",
+    "generic review app",
+    "admin dashboard",
+    "todo app"
+  ],
+  "button_language_use": [
+    "스탬프 찍기",
+    "내 여권 보기",
+    "칭호 확인하기",
+    "공유 카드 만들기",
+    "이번 주 퀘스트 보기"
+  ],
+  "button_language_avoid": ["등록하기", "제출하기", "리뷰 쓰기"],
+  "agent_collaboration": {
+    "core_pair": ["planner", "designer"],
+    "philosophy": "기획자 에이전트와 디자이너 에이전트의 ping-pong이 공장의 핵심이다.",
+    "planner_must_propose": [
+      "새 보상 / 새 뱃지 / 새 칭호",
+      "새 수집 루프",
+      "새 퀘스트",
+      "새 여권 슬롯",
+      "스탬프 카드 진화",
+      "재방문을 끌어내는 작은 장치"
+    ],
+    "designer_must_challenge": [
+      "이 뱃지/칭호가 정말 갖고 싶게 보이는가",
+      "이 카드가 인스타 스토리에 자랑하고 싶게 생겼는가",
+      "이 빈 슬롯이 다음 방문 욕구를 만드는가",
+      "이 도장이 실제 여권 도장처럼 느껴지는가",
+      "이 화면이 RPG/취향 컬렉션처럼 보이는가"
+    ],
+    "ping_pong_rules": [
+      "기획자는 매 사이클 3개 이상의 후보를 제안한다.",
+      "디자이너는 각 후보의 수집욕/과시욕/소유욕을 비판한다.",
+      "PM은 합의된 1개를 가장 작은 출하 단위로 자른다.",
+      "개발자는 합의된 단위만 구현한다.",
+      "QA는 기능 동작 + 감정 루프를 같이 검증한다."
+    ]
+  },
+  "qa_emotional_checks": [
+    "수집욕: 더 모으고 싶은 욕구를 만드는가",
+    "과시욕: SNS 공유하고 싶은 카드/도장이 나오는가",
+    "성장욕: EXP/레벨/칭호 진행이 다음 방문을 자극하는가",
+    "희소성: 빈 슬롯/미획득 뱃지가 다음 행동을 자극하는가",
+    "재방문: 킥 포인트가 다음 방문지를 명확히 제시하는가"
+  ],
+  "qa_functional_gates": [
+    "app/web npm run build 통과",
+    "app/api app/main.py py_compile 통과",
+    "app/api FastAPI에 /health 엔드포인트 존재",
+    "app/web/src/screens 에 Landing/Login/StampForm/StampResult/MyPassport/Badges/Quests/Share 존재",
+    "mock login / addStamp / computeBadges / computeQuests / Share 카드 코드 경로 존재",
+    "control_tower/web 빌드 통과"
+  ],
+  "factory_pipeline_stages": [
+    {"id": "pm",            "ko": "PM",            "agent": "pm"},
+    {"id": "planner",       "ko": "기획자",         "agent": "planner"},
+    {"id": "designer",      "ko": "디자이너",        "agent": "designer"},
+    {"id": "frontend",      "ko": "프론트엔드",      "agent": "frontend"},
+    {"id": "backend",       "ko": "백엔드",         "agent": "backend"},
+    {"id": "ai_architect",  "ko": "AI 설계자",       "agent": "ai_architect"},
+    {"id": "qa",            "ko": "QA",            "agent": "qa"},
+    {"id": "deploy",        "ko": "배포 관리자",     "agent": "deploy"}
+  ],
+  "agents": [
+    {"id": "pm",            "name_ko": "PM",          "role_ko": "제품 비전과 합의 조율"},
+    {"id": "planner",       "name_ko": "기획자",       "role_ko": "스탬프/뱃지/칭호/퀘스트/공유카드 신규 장치 제안"},
+    {"id": "designer",      "name_ko": "디자이너",      "role_ko": "도장/뱃지/카드가 갖고 싶고 자랑하고 싶은지 반박과 개선"},
+    {"id": "frontend",      "name_ko": "프론트엔드",    "role_ko": "React 화면과 모바일 우선 UI 구현"},
+    {"id": "backend",       "name_ko": "백엔드",       "role_ko": "FastAPI/DB/스탬프 데이터 모델"},
+    {"id": "ai_architect",  "name_ko": "AI 설계자",    "role_ko": "킥 포인트/추천/취향 클러스터링 같은 LLM 설계"},
+    {"id": "qa",            "name_ko": "QA",         "role_ko": "기능 동작 + 감정 루프(수집/과시/성장/재방문) 검증"},
+    {"id": "deploy",        "name_ko": "배포 관리자",  "role_ko": "빌드/헬스체크/배포 후 모니터링"}
+  ],
+  "default_cycle_goal_ko": "스탬포트의 수집/과시/성장 루프를 한 단계 더 강화한다. 기획자가 새 장치를 제안하고 디자이너가 갖고 싶은지 반박해 가장 작은 한 단계만 출하한다.",
+  "references": {
+    "claude_md": "CLAUDE.md",
+    "product_doc": "docs/product.md",
+    "design_doc": "docs/design-system.md",
+    "architecture_doc": "docs/architecture.md",
+    "agent_collaboration_doc": "docs/agent-collaboration.md",
+    "qa_doc": "docs/qa-checklist.md",
+    "roadmap_doc": "docs/roadmap.md"
+  }
+}

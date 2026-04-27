@@ -18,3 +18,37 @@ dist/
 
 # Claude local settings
 .claude/
+
+# Factory runtime
+.runtime/
+control_tower/.runtime/
+control_tower/api/.venv/
+control_tower/web/node_modules/
+control_tower/web/dist/
+scripts/*.log
+*.pid
+
+# Factory runtime
+.runtime/
+control_tower/.runtime/
+control_tower/api/.venv/
+control_tower/web/node_modules/
+control_tower/web/dist/
+scripts/*.log
+*.pid
+
+# Factory runtime
+.runtime/
+control_tower/.runtime/
+control_tower/api/.venv/
+control_tower/web/node_modules/
+control_tower/web/dist/
+scripts/*.log
+*.pid
+
+# Runtime DB / cache
+*.db
+*.sqlite
+*.sqlite3
+.runtime/
+control_tower/.runtime/
