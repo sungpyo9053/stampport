@@ -1753,6 +1753,150 @@ def _log_tail(n: int = 20) -> str:
         return ""
 
 
+def _artifact_preview(path: Path, max_chars: int = 280) -> str | None:
+    """Read a Markdown artifact and return the first non-heading
+    paragraph as a single-line preview. Headings (`# ...`, `## ...`)
+    are stripped so the dashboard surfaces *content*, not the title
+    we already display elsewhere. Returns None when the file is
+    missing/empty/unreadable so the caller can decide whether to
+    fall back to demo copy."""
+    if not path.is_file():
+        return None
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    paragraphs: list[str] = []
+    cur: list[str] = []
+    for raw in body.splitlines():
+        s = raw.strip()
+        if not s:
+            if cur:
+                paragraphs.append(" ".join(cur))
+                cur = []
+            continue
+        # Skip pure heading lines and table separator rows.
+        if s.startswith("#") or re.fullmatch(r"\|[\s\-:|]+\|", s):
+            if cur:
+                paragraphs.append(" ".join(cur))
+                cur = []
+            continue
+        cur.append(s)
+    if cur:
+        paragraphs.append(" ".join(cur))
+    for p in paragraphs:
+        # Strip basic markdown emphasis so the preview reads cleanly
+        # in the dashboard (no orphan `**` / backticks).
+        cleaned = re.sub(r"[*_`]", "", p).strip()
+        if cleaned:
+            return cleaned[: max_chars - 3] + "..." if len(cleaned) > max_chars else cleaned
+    return None
+
+
+def _build_pingpong_meta(state: dict) -> dict:
+    """Compose the heartbeat's `metadata.local_factory.ping_pong`
+    payload from the five Markdown artifacts cycle.py writes plus
+    the structured desire_scorecard.json.
+
+    The block is *cycle-scoped*: when cycle.py finishes a run it
+    leaves these files on disk and updates factory_state.json with
+    status/at/path fields. The dashboard reads this block to render
+    the live planner ↔ designer ping-pong (the demo workflow's
+    artifact_created events are now a fallback, not the source of
+    truth).
+
+    enabled is True when *any* of the four downstream stages have
+    generated an artifact in the current cycle, OR when the file is
+    present on disk from a prior cycle. That keeps the panel populated
+    after a cycle that skipped (e.g., FACTORY_PLANNER_DESIGNER_PINGPONG
+    was off this run).
+    """
+    PLANNER_PROPOSAL_F  = RUNTIME_DIR / "planner_proposal.md"
+    DESIGNER_CRITIQUE_F = RUNTIME_DIR / "designer_critique.md"
+    PLANNER_REVISION_F  = RUNTIME_DIR / "planner_revision.md"
+    DESIGNER_FINAL_F    = RUNTIME_DIR / "designer_final_review.md"
+    PM_DECISION_F       = RUNTIME_DIR / "pm_decision.md"
+    DESIRE_SCORECARD_F  = RUNTIME_DIR / "desire_scorecard.json"
+
+    scorecard_obj: dict | None = None
+    if DESIRE_SCORECARD_F.is_file():
+        try:
+            scorecard_obj = json.loads(
+                DESIRE_SCORECARD_F.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError):
+            scorecard_obj = None
+
+    # Synthesize a scorecard dict when the JSON is missing but
+    # factory_state.json carries the parsed values from the most
+    # recent designer_final_review stage. Either source feeds the
+    # same UI ship/hold gate.
+    if not scorecard_obj:
+        scorecard_obj = {
+            "scores": dict(state.get("desire_scorecard") or {}),
+            "total":  int(state.get("desire_scorecard_total") or 0),
+            "ship_ready": bool(state.get("desire_scorecard_ship_ready")),
+            "rework": list(state.get("desire_scorecard_rework") or []),
+            "verdict": state.get("designer_final_review_verdict"),
+            "generated_at": state.get("designer_final_review_at"),
+        }
+
+    pp_existed = any(
+        f.is_file()
+        for f in (
+            PLANNER_PROPOSAL_F, DESIGNER_CRITIQUE_F, PLANNER_REVISION_F,
+            DESIGNER_FINAL_F, PM_DECISION_F,
+        )
+    )
+    pp_generated_this_cycle = any(
+        state.get(k) == "generated"
+        for k in (
+            "designer_critique_status", "planner_revision_status",
+            "designer_final_review_status", "pm_decision_status",
+        )
+    )
+
+    return {
+        "enabled": bool(pp_existed or pp_generated_this_cycle),
+        # File existence flags — cheap booleans the UI uses to switch
+        # between live-data and fallback rendering per step.
+        "planner_proposal_exists":      PLANNER_PROPOSAL_F.is_file(),
+        "designer_critique_exists":     DESIGNER_CRITIQUE_F.is_file(),
+        "planner_revision_exists":      PLANNER_REVISION_F.is_file(),
+        "designer_final_review_exists": DESIGNER_FINAL_F.is_file(),
+        "pm_decision_exists":           PM_DECISION_F.is_file(),
+        # Single-line previews so the dashboard panel doesn't have to
+        # download the whole markdown file.
+        "planner_proposal_preview":      _artifact_preview(PLANNER_PROPOSAL_F),
+        "designer_critique_preview":     _artifact_preview(DESIGNER_CRITIQUE_F),
+        "planner_revision_preview":      _artifact_preview(PLANNER_REVISION_F),
+        "designer_final_review_preview": _artifact_preview(DESIGNER_FINAL_F),
+        "pm_decision_preview":           _artifact_preview(PM_DECISION_F),
+        # Stage statuses + timestamps so the UI can render the dot
+        # next to each step (idle / running / passed / failed).
+        "designer_critique_status":     state.get("designer_critique_status") or "skipped",
+        "planner_revision_status":      state.get("planner_revision_status") or "skipped",
+        "designer_final_review_status": state.get("designer_final_review_status") or "skipped",
+        "pm_decision_status":           state.get("pm_decision_status") or "skipped",
+        "designer_critique_at":         state.get("designer_critique_at"),
+        "planner_revision_at":          state.get("planner_revision_at"),
+        "designer_final_review_at":     state.get("designer_final_review_at"),
+        "pm_decision_at":               state.get("pm_decision_at"),
+        "planner_revision_selected_feature": state.get("planner_revision_selected_feature"),
+        "designer_final_review_verdict": state.get("designer_final_review_verdict"),
+        "pm_decision_message":           state.get("pm_decision_message"),
+        # Score gate. Both the structured scorecard object AND the
+        # flat ship_ready/rework fields ride along — UI consumers can
+        # pick whichever is convenient.
+        "desire_scorecard": scorecard_obj,
+        "ship_ready": bool(scorecard_obj.get("ship_ready")),
+        "rework":     list(scorecard_obj.get("rework") or []),
+        "scorecard_path": (
+            str(DESIRE_SCORECARD_F) if DESIRE_SCORECARD_F.is_file() else None
+        ),
+    }
+
+
 def _build_local_factory_meta() -> dict:
     """Compose the `metadata.local_factory` payload for heartbeats.
 
@@ -1881,6 +2025,11 @@ def _build_local_factory_meta() -> dict:
         "publish_blocker": _build_publish_blocker_meta(state),
         "qa_gate": _build_qa_meta(state),
         "operator_fix": _build_operator_fix_meta(),
+        # Planner ↔ Designer ping-pong cycle output. See
+        # _build_pingpong_meta for the full schema. Always present so
+        # the dashboard can decide enabled=true/false on the runner
+        # side, instead of every consumer guessing.
+        "ping_pong": _build_pingpong_meta(state),
         "log_tail": _log_tail(8),
     }
 

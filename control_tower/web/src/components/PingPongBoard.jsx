@@ -101,16 +101,72 @@ function pickArtifact(events, type) {
     .sort((a, b) => b.id - a.id)[0];
 }
 
-function toCard(ev, fallback) {
-  if (!ev) return { ...fallback, isLive: false };
-  return {
-    title: ev.payload?.artifact_title || ev.message || fallback.title,
-    preview: ev.payload?.preview || fallback.preview,
-    isLive: true,
-  };
+// Pick the first runner whose heartbeat carries a live ping-pong
+// block. We prefer "online" over "busy" so we don't echo a runner
+// that's mid-publish, but we accept either: a busy runner is still
+// the one driving the cycle.
+function pickPingPongMeta(runners = []) {
+  const ranked = [...runners].sort((a, b) => {
+    const order = (s) => (s === "online" ? 0 : s === "busy" ? 1 : 2);
+    return order(a?.status) - order(b?.status);
+  });
+  for (const r of ranked) {
+    const pp = r?.metadata_json?.local_factory?.ping_pong;
+    if (pp && pp.enabled) return pp;
+  }
+  return null;
 }
 
-function StepCard({ agent, verb, card, isLatest }) {
+function toCard({ pp, ev, stepKey, fallback }) {
+  // Source of truth precedence:
+  //   1. live ping-pong block in heartbeat metadata (real cycle)
+  //   2. demo workflow's artifact_created event
+  //   3. hard-coded fallback copy so the panel stays alive on a
+  //      fresh page load.
+  if (pp) {
+    const previewKey = `${stepKey}_preview`;
+    const existsKey  = `${stepKey}_exists`;
+    if (pp[existsKey] && pp[previewKey]) {
+      // Title pulls from the cycle artifacts when available; we don't
+      // store a title server-side so reuse the fallback title which
+      // already names the step.
+      const selected = pp.planner_revision_selected_feature;
+      const title =
+        stepKey === "planner_revision" && selected
+          ? `기획자 수정안 — ${selected}`
+          : stepKey === "pm_decision" && pp.pm_decision_message
+          ? `PM 결정 — ${pp.pm_decision_message}`
+          : fallback.title;
+      return {
+        title,
+        preview: pp[previewKey],
+        isLive: true,
+        source: "cycle",
+      };
+    }
+  }
+  if (ev) {
+    return {
+      title: ev.payload?.artifact_title || ev.message || fallback.title,
+      preview: ev.payload?.preview || fallback.preview,
+      isLive: true,
+      source: "demo",
+    };
+  }
+  return { ...fallback, isLive: false, source: "fallback" };
+}
+
+// Map cycle-stage statuses (from heartbeat metadata.local_factory.ping_pong)
+// into a small label + color the StepCard renders next to the agent name.
+const STATUS_TAG = {
+  generated: { text: "완료",  color: "#34d399" },
+  running:   { text: "실행",  color: "#fbbf24" },
+  failed:    { text: "실패",  color: "#f87171" },
+  skipped:   { text: "스킵",  color: "#94a3b8" },
+};
+
+function StepCard({ agent, verb, card, status, isLatest }) {
+  const tag = STATUS_TAG[status] || null;
   return (
     <div
       className="relative p-2.5"
@@ -123,25 +179,44 @@ function StepCard({ agent, verb, card, isLatest }) {
       }}
     >
       <div
-        className="flex items-center justify-between text-[9px] font-bold uppercase tracking-[0.3em]"
+        className="flex items-center justify-between gap-2 text-[9px] font-bold uppercase tracking-[0.3em]"
         style={{ color: agent.color }}
       >
         <span>
           {agent.name} · {verb}
         </span>
-        {isLatest && (
-          <motion.span
-            className="inline-block h-1.5 w-1.5"
-            style={{ backgroundColor: agent.color }}
-            animate={{ opacity: [0.3, 1, 0.3] }}
-            transition={{ duration: 1.2, repeat: Infinity }}
-          />
-        )}
-        {!card.isLive && (
-          <span className="text-[8.5px] tracking-widest text-slate-500">
-            (기본값)
-          </span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {tag && card.source === "cycle" && (
+            <span
+              className="rounded px-1.5 py-0.5 text-[8.5px]"
+              style={{
+                color: tag.color,
+                border: `1px solid ${tag.color}66`,
+                backgroundColor: "#0a1228",
+              }}
+            >
+              {tag.text}
+            </span>
+          )}
+          {isLatest && (
+            <motion.span
+              className="inline-block h-1.5 w-1.5"
+              style={{ backgroundColor: agent.color }}
+              animate={{ opacity: [0.3, 1, 0.3] }}
+              transition={{ duration: 1.2, repeat: Infinity }}
+            />
+          )}
+          {card.source === "demo" && (
+            <span className="text-[8.5px] tracking-widest text-sky-400">
+              데모
+            </span>
+          )}
+          {card.source === "fallback" && (
+            <span className="text-[8.5px] tracking-widest text-slate-500">
+              (기본값)
+            </span>
+          )}
+        </div>
       </div>
       <div className="mt-1 text-[12px] font-semibold text-[#f5e9d3] line-clamp-1">
         {card.title}
@@ -206,30 +281,62 @@ function ScoreCell({ axis, score, threshold }) {
   );
 }
 
-function DesireScorecard({ scoreEv, decisionEv }) {
-  // Source order: live event payload → live decision payload → default.
-  const liveScores =
+// Map a runner-side rework axis id back to the human prose the
+// docs/agent-collaboration.md gate uses. Both the helper here and
+// the local recompute below produce the same labels so the panel
+// reads consistently regardless of which source is authoritative.
+const REWORK_LABEL = {
+  visual_desire:   "디자이너 재작업",
+  share:           "공유 카드 개선 필요",
+  revisit:         "기획자 재작업",
+  total_below_24:  "총점 미달",
+  no_score:        "점수 미수신",
+};
+
+function DesireScorecard({ pp, scoreEv, decisionEv }) {
+  // Source order:
+  //   1. live runner heartbeat block (cycle.py output, authoritative)
+  //   2. demo's desire_scorecard event payload
+  //   3. demo's pm_decision payload (fallback for older demo runs)
+  //   4. hard-coded defaults so the panel renders on a fresh page.
+  const liveCard = pp?.desire_scorecard || null;
+  const eventScores =
     scoreEv?.payload?.scores ||
     decisionEv?.payload?.scores ||
     null;
-  const scores = liveScores || DEFAULT_SCORES;
-  const total = Object.values(scores).reduce((acc, n) => acc + (Number(n) || 0), 0);
-  const isLive = !!liveScores;
 
-  // Threshold gate (mirrors docs/agent-collaboration.md).
-  const visualOk = (scores.visual_desire ?? 0) >= 4;
-  const shareOk = (scores.share ?? 0) >= 4;
-  const revisitOk = (scores.revisit ?? 0) >= 4;
-  const totalOk = total >= 24;
-  const shipReady = totalOk && visualOk && shareOk && revisitOk;
+  let scores, total, shipReady, reworkAxes, source;
+  if (liveCard && Object.keys(liveCard.scores || {}).length > 0) {
+    scores = liveCard.scores;
+    total = liveCard.total || Object.values(scores).reduce((a, n) => a + (Number(n) || 0), 0);
+    shipReady = !!liveCard.ship_ready;
+    reworkAxes = liveCard.rework || [];
+    source = "cycle";
+  } else if (eventScores) {
+    scores = eventScores;
+    total = Object.values(scores).reduce((a, n) => a + (Number(n) || 0), 0);
+    // The demo event payloads don't pre-compute the gate, so we
+    // recompute it here using the same thresholds the factory uses.
+    const v = scores.visual_desire ?? 0;
+    const s = scores.share ?? 0;
+    const r = scores.revisit ?? 0;
+    const axes = [];
+    if (v < 4) axes.push("visual_desire");
+    if (s <= 3) axes.push("share");
+    if (r <= 3) axes.push("revisit");
+    if (total < 24) axes.push("total_below_24");
+    shipReady = total >= 24 && axes.length === 0;
+    reworkAxes = axes;
+    source = "demo";
+  } else {
+    scores = DEFAULT_SCORES;
+    total = Object.values(scores).reduce((a, n) => a + (Number(n) || 0), 0);
+    shipReady = true;
+    reworkAxes = [];
+    source = "fallback";
+  }
 
-  // Per-axis re-work hints map onto the documented rules so the
-  // dashboard surfaces the same prose the factory uses.
-  const reworkLabels = [];
-  if (!totalOk) reworkLabels.push("총점 미달");
-  if (!visualOk) reworkLabels.push("디자이너 재작업");
-  if (!shareOk) reworkLabels.push("공유 카드 개선");
-  if (!revisitOk) reworkLabels.push("기획자 재작업");
+  const reworkLabels = reworkAxes.map((id) => REWORK_LABEL[id] || id);
 
   return (
     <div
@@ -244,9 +351,19 @@ function DesireScorecard({ scoreEv, decisionEv }) {
       <div className="mb-1.5 flex items-center justify-between">
         <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.3em] text-[#d4a843]">
           <span>욕구 점수표</span>
-          {!isLive && (
+          {source === "fallback" && (
             <span className="text-[8.5px] tracking-widest text-slate-500">
               (기본값)
+            </span>
+          )}
+          {source === "demo" && (
+            <span className="text-[8.5px] tracking-widest text-sky-400">
+              데모
+            </span>
+          )}
+          {source === "cycle" && (
+            <span className="text-[8.5px] tracking-widest text-emerald-300">
+              CYCLE LIVE
             </span>
           )}
         </div>
@@ -255,16 +372,16 @@ function DesireScorecard({ scoreEv, decisionEv }) {
             총점{" "}
             <span
               className="text-[12px] font-bold"
-              style={{ color: totalOk ? "#34d399" : "#f87171" }}
+              style={{ color: total >= 24 ? "#34d399" : "#f87171" }}
             >
               {total}
             </span>
             <span className="text-slate-500"> / 30</span>
           </span>
           {shipReady ? (
-            <Pill color="#34d399">SHIP</Pill>
+            <Pill color="#34d399">출하 가능</Pill>
           ) : (
-            <Pill color="#fb923c">HOLD</Pill>
+            <Pill color="#fb923c">재작업 필요</Pill>
           )}
         </div>
       </div>
@@ -297,7 +414,12 @@ function DesireScorecard({ scoreEv, decisionEv }) {
   );
 }
 
-export default function PingPongBoard({ events = [] }) {
+export default function PingPongBoard({ events = [], runners = [] }) {
+  // Live cycle data wins over demo/fallback. The block is null when
+  // no runner heartbeat carries `ping_pong.enabled = true`, in which
+  // case the panel falls through to artifact_created events.
+  const pp = pickPingPongMeta(runners);
+
   // Lookup each step's latest event in the event stream.
   const stepEvents = STEPS.map((step) => ({
     step,
@@ -306,8 +428,32 @@ export default function PingPongBoard({ events = [] }) {
   const scorecardEv = pickArtifact(events, "desire_scorecard");
   const decisionEv = stepEvents.find((s) => s.step.key === "pm_decision")?.ev;
 
-  // "latest talker" = whichever step's event is most recent.
+  // Per-step status derived from runner metadata so the StepCard can
+  // render a status pill ("완료" / "실행" / "실패" / "스킵"). The
+  // planner_proposal step doesn't have its own runner-side status
+  // field — it inherits the upstream product_planner status.
+  const stepStatusOf = (key) => {
+    if (!pp) return null;
+    if (key === "planner_proposal") {
+      return pp.planner_proposal_exists ? "generated" : null;
+    }
+    return pp[`${key}_status`] || null;
+  };
+
+  // "latest talker" — prefer the cycle data (newest stage in pp), fall
+  // back to events. We pick whichever step has the most recent
+  // generated_at timestamp (stage statuses are generated/skipped/failed).
   const latestStep = (() => {
+    if (pp) {
+      const order = [
+        "pm_decision", "designer_final_review", "planner_revision",
+        "designer_critique", "planner_proposal",
+      ];
+      for (const k of order) {
+        if (k === "planner_proposal" && pp.planner_proposal_exists) return k;
+        if (pp[`${k}_status`] === "generated") return k;
+      }
+    }
     let best = null;
     for (const s of stepEvents) {
       if (!s.ev) continue;
@@ -336,8 +482,19 @@ export default function PingPongBoard({ events = [] }) {
             기획자 ↔ 디자이너 PING-PONG
           </span>
         </div>
-        <span className="text-[10px] tracking-wider text-slate-500">
-          5단계 + 욕구 점수표
+        <span className="flex items-center gap-1.5 text-[10px] tracking-wider text-slate-500">
+          {pp ? (
+            <span className="rounded px-1.5 py-0.5 text-[9px] font-bold tracking-widest text-emerald-300"
+              style={{ border: "1px solid #34d39955", backgroundColor: "#0a1228" }}>
+              CYCLE LIVE
+            </span>
+          ) : (
+            <span className="rounded px-1.5 py-0.5 text-[9px] font-bold tracking-widest text-sky-400"
+              style={{ border: "1px solid #38bdf855", backgroundColor: "#0a1228" }}>
+              데모 / 기본값
+            </span>
+          )}
+          <span>5단계 + 욕구 점수표</span>
         </span>
       </div>
 
@@ -346,13 +503,19 @@ export default function PingPongBoard({ events = [] }) {
       <div className="grid gap-2">
         {stepEvents.map(({ step, ev }) => {
           const agent = AGENTS[step.agentId];
-          const card = toCard(ev, step.fallback);
+          const card = toCard({
+            pp,
+            ev,
+            stepKey: step.key,
+            fallback: step.fallback,
+          });
           return (
             <StepCard
               key={step.key}
               agent={agent}
               verb={step.verb}
               card={card}
+              status={stepStatusOf(step.key)}
               isLatest={latestStep === step.key}
             />
           );
@@ -360,7 +523,7 @@ export default function PingPongBoard({ events = [] }) {
       </div>
 
       {/* Desire scorecard — drives the shipment gate. */}
-      <DesireScorecard scoreEv={scorecardEv} decisionEv={decisionEv} />
+      <DesireScorecard pp={pp} scoreEv={scorecardEv} decisionEv={decisionEv} />
     </section>
   );
 }

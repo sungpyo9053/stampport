@@ -228,7 +228,7 @@ export default function ControlTowerPage() {
         </div>
 
         <aside className="flex flex-col gap-3">
-          <PingPongBoard events={events} />
+          <PingPongBoard events={events} runners={runners} />
           <ArtifactBoard events={events} factory={factory} />
         </aside>
       </main>
