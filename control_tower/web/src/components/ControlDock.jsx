@@ -9,6 +9,7 @@ import {
   startFactory,
   stopFactory,
 } from "../api/controlTowerApi.js";
+import ReleasePreviewPanel from "./ReleasePreviewPanel.jsx";
 
 // In-flight guard for the deploy button. Module-scoped so it survives
 // re-renders and double-mounts in StrictMode without sliding into a
@@ -988,6 +989,8 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
           />
         </div>
       </div>
+
+      <ReleasePreviewPanel deployState={deployState} />
 
       <DeployInfoStrip deployState={deployState} />
 
