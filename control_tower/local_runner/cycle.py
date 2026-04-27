@@ -63,6 +63,11 @@ PLANNER_REVISION_FILE       = RUNTIME / "planner_revision.md"
 DESIGNER_FINAL_REVIEW_FILE  = RUNTIME / "designer_final_review.md"
 PM_DECISION_FILE            = RUNTIME / "pm_decision.md"
 DESIRE_SCORECARD_FILE       = RUNTIME / "desire_scorecard.json"
+# Implementation Ticket — single source of truth for "what code does
+# this cycle actually intend to write?". Lives between PM 결정 and
+# claude_apply. claude_apply refuses to run if the ticket is missing
+# or has no concrete target files. See stage_implementation_ticket.
+IMPLEMENTATION_TICKET_FILE  = RUNTIME / "implementation_ticket.md"
 # QA Gatekeeper artifacts. qa_report.md is always (re)written by
 # stage_qa_gate; qa_feedback.md is written ONLY when a check fails so
 # the next cycle's qa_fix_propose stage has a precise repro/instruction
@@ -351,6 +356,10 @@ STAGES: list[tuple[str, str, int]] = [
     ("build_control",            "control_tower/web 빌드",  25),
     ("syntax_check",             "문법 검사",              25),
     ("claude_propose",           "Claude 패치 제안",        0),
+    # Implementation Ticket — bridges PM 결정 + claude_propose into the
+    # single-source-of-truth ticket that claude_apply consumes. No
+    # ticket, no apply.
+    ("implementation_ticket",    "Implementation Ticket",   0),
     ("claude_apply",             "Claude 제안 적용",        0),
     # Stampport QA Gatekeeper — runs AFTER any code change this cycle.
     # Sub-checks: build artifact validation (app/web + control_tower/web
@@ -548,6 +557,25 @@ class CycleState:
     failed_reason: str | None = None
     suggested_action: str | None = None
     cycle_log: list[dict] = field(default_factory=list)
+    # Implementation Ticket — written by stage_implementation_ticket
+    # after PM 결정. claude_apply gates on this when ping-pong is
+    # enabled: no ticket / no target files = cycle stays planning_only.
+    implementation_ticket_status: str = "skipped"  # generated|missing|skipped|failed
+    implementation_ticket_path: str | None = None
+    implementation_ticket_at: str | None = None
+    implementation_ticket_selected_feature: str | None = None
+    implementation_ticket_target_files: list[str] = field(default_factory=list)
+    implementation_ticket_target_screens: list[str] = field(default_factory=list)
+    implementation_ticket_message: str | None = None
+    implementation_ticket_skipped_reason: str | None = None
+    # Per-tier file-change flags — set in main() after claude_apply by
+    # _categorize_changed_files. The dashboard shows "FE 변경 / BE 변경 /
+    # 관제실 변경" badges off these so the operator can tell at a glance
+    # whether the cycle hit the user-facing surface.
+    frontend_changed: bool = False
+    backend_changed: bool = False
+    control_tower_changed: bool = False
+    docs_only: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -653,6 +681,18 @@ class CycleState:
             "failed_reason": self.failed_reason,
             "suggested_action": self.suggested_action,
             "cycle_log": list(self.cycle_log),
+            "implementation_ticket_status": self.implementation_ticket_status,
+            "implementation_ticket_path": self.implementation_ticket_path,
+            "implementation_ticket_at": self.implementation_ticket_at,
+            "implementation_ticket_selected_feature": self.implementation_ticket_selected_feature,
+            "implementation_ticket_target_files": list(self.implementation_ticket_target_files),
+            "implementation_ticket_target_screens": list(self.implementation_ticket_target_screens),
+            "implementation_ticket_message": self.implementation_ticket_message,
+            "implementation_ticket_skipped_reason": self.implementation_ticket_skipped_reason,
+            "frontend_changed": self.frontend_changed,
+            "backend_changed": self.backend_changed,
+            "control_tower_changed": self.control_tower_changed,
+            "docs_only": self.docs_only,
         }
 
 
@@ -724,6 +764,7 @@ def _suggest_action_for_stage(stage_name: str) -> str:
         "git_check":               "working tree 의 conflict marker / unmerged 파일 정리 후 재시도",
         "publish_blocker_resolve": "blocker_resolve_report.md 확인 후 hard_risky/secret 파일 처리",
         "claude_propose":          "claude CLI 설치/CLAUDE_BIN/예산 환경변수 확인 후 재시도",
+        "implementation_ticket":   "PM 결정 / claude 제안에 수정 대상 파일이 명시됐는지 확인 — 비어 있으면 planner/proposal 다시 작성",
         "claude_apply":            "claude_apply.diff 확인 후 사람이 수동으로 적용 또는 롤백",
         "qa_gate":                 "qa_feedback.md 확인 — 실패 카테고리별 파일 수정 후 재시도",
         "qa_recheck":              "qa_feedback.md 확인 후 다시 cycle 실행",
@@ -3322,6 +3363,349 @@ def stage_claude_propose(state: CycleState) -> StageResult:
 
 
 # ---------------------------------------------------------------------------
+# Implementation Ticket stage
+# ---------------------------------------------------------------------------
+#
+# Bridges the planner ↔ designer ↔ PM artifacts (high-level intent) with
+# the Claude proposal (concrete change set) into a single ticket file.
+#
+# Cycle contract:
+#   * Ticket present + has target files → claude_apply may run.
+#   * Ticket missing or no target files  → cycle stays planning_only.
+#
+# This stage does NOT call Claude. It parses what we already have on disk
+# (planner_revision.md / pm_decision.md / claude_proposal.md) and
+# composes a deterministic ticket. That keeps the bridge cheap and
+# means a planner-only run can still report "we wanted to do X but
+# nothing was concrete enough to ship".
+
+
+# Code paths that count as "real product code". Anything outside these
+# roots is treated as docs/config-only — see _categorize_changed_files.
+PRODUCT_CODE_PREFIXES: tuple[str, ...] = (
+    "app/web/src/",
+    "app/api/",
+    "control_tower/web/src/",
+    "control_tower/api/",
+    "control_tower/local_runner/",
+)
+FRONTEND_PATH_PREFIXES: tuple[str, ...] = (
+    "app/web/src/",
+)
+BACKEND_PATH_PREFIXES: tuple[str, ...] = (
+    "app/api/",
+)
+CONTROL_TOWER_PATH_PREFIXES: tuple[str, ...] = (
+    "control_tower/web/src/",
+    "control_tower/api/",
+    "control_tower/local_runner/",
+)
+
+
+def _categorize_changed_files(files: list[str]) -> dict:
+    """Classify a list of changed paths into FE / BE / control_tower /
+    docs-only. Used by main() to decide whether an "applied" cycle
+    counts as real code work or a docs-only reshuffle."""
+    files = [f for f in (files or []) if f]
+    fe = any(f.startswith(p) for f in files for p in FRONTEND_PATH_PREFIXES)
+    be = any(f.startswith(p) for f in files for p in BACKEND_PATH_PREFIXES)
+    ct = any(f.startswith(p) for f in files for p in CONTROL_TOWER_PATH_PREFIXES)
+    product_files = [
+        f for f in files
+        if any(f.startswith(p) for p in PRODUCT_CODE_PREFIXES)
+    ]
+    docs_only = bool(files) and not product_files
+    return {
+        "frontend": fe,
+        "backend": be,
+        "control_tower": ct,
+        "docs_only": docs_only,
+        "product_files": product_files,
+    }
+
+
+_TICKET_FILE_LINE = re.compile(
+    r"""(?ix)                       # ignore-case, verbose
+    ^[\-\*•]\s*                # bullet (- / * / •)
+    `?                              # optional backtick wrapping
+    (
+        (?:app|control_tower|scripts|config|docs)
+        /[\w./\-]+                  # subpath
+    )
+    """,
+    re.MULTILINE,
+)
+
+
+def _parse_target_files_from_md(md: str) -> list[str]:
+    """Pull bullet-list file paths out of a markdown body. Looks first
+    inside the `## 변경 대상 파일` / `## 수정 대상 파일` section, then
+    falls back to the whole document. Path-shape filter keeps stray
+    prose out."""
+    if not md:
+        return []
+    headings = ("## 변경 대상 파일", "## 수정 대상 파일", "## 수정 대상")
+    section = ""
+    for h in headings:
+        slice_text = _extract_md_section(md, h.lstrip("# ").strip())
+        if slice_text:
+            section = slice_text
+            break
+    haystack = section or md
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _TICKET_FILE_LINE.finditer(haystack):
+        path = m.group(1).strip().rstrip("`,. ")
+        # Skip obviously non-file ish lines.
+        if "/" not in path:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        found.append(path)
+    return found
+
+
+def _parse_screens_from_md(md: str) -> list[str]:
+    """Pull the `## 수정 대상 화면` (or 변경 대상 화면) bullet list. Looser
+    than file parsing — we keep raw human strings since "스탬프 결과 화면"
+    isn't a path."""
+    if not md:
+        return []
+    for h in ("수정 대상 화면", "변경 대상 화면"):
+        section = _extract_md_section(md, h)
+        if not section:
+            continue
+        out: list[str] = []
+        for line in section.splitlines():
+            ls = line.strip()
+            if not ls.startswith(("-", "*", "•")):
+                continue
+            text = ls[1:].strip()
+            if text:
+                out.append(text[:80])
+        if out:
+            return out[:8]
+    return []
+
+
+def _selected_feature_for_ticket(state: CycleState) -> str | None:
+    """Best-effort pick of the cycle's chosen feature name. Falls back
+    through PM decision → planner revision → product planner."""
+    candidates = [
+        state.implementation_ticket_selected_feature,
+        state.product_planner_selected_feature,
+        state.planner_revision_selected_feature,
+    ]
+    for c in candidates:
+        if c and c.strip():
+            return c.strip()[:120]
+    # Try to read pm_decision.md "출하 결정" line.
+    if PM_DECISION_FILE.is_file():
+        try:
+            body = PM_DECISION_FILE.read_text(encoding="utf-8")
+        except OSError:
+            body = ""
+        for h in ("선정 기능", "선택 기능", "선택한 기능"):
+            section = _extract_md_section(body, h)
+            line = _first_meaningful_line(section)
+            if line:
+                return line[:120]
+    return None
+
+
+def _build_ticket_markdown(
+    state: CycleState,
+    *,
+    feature: str | None,
+    target_files: list[str],
+    target_screens: list[str],
+    pm_md: str,
+    planner_md: str,
+    proposal_md: str,
+) -> str:
+    """Compose the deterministic ticket body. The exact section headings
+    here match the contract in CLAUDE.md / docs so claude_apply and the
+    dashboard panel can both rely on the layout."""
+    def _section(md: str, heading: str) -> str:
+        s = _extract_md_section(md, heading)
+        return s.strip() or "(자료 없음)"
+
+    user_problem = _section(planner_md, "사용자 문제") if planner_md else "(자료 없음)"
+    if user_problem == "(자료 없음)":
+        user_problem = _section(pm_md, "사용자 문제")
+    cycle_scope = _section(planner_md, "MVP 범위") or _section(pm_md, "이번 사이클 구현 범위")
+    success = (
+        _section(planner_md, "성공 기준")
+        or _section(pm_md, "성공 기준")
+        or "수동 QA 시나리오 통과 + 검증 통과"
+    )
+    qa_scenario = _section(pm_md, "수동 QA 시나리오") or _section(
+        planner_md, "수동 QA 시나리오"
+    )
+
+    files_block = (
+        "\n".join(f"- {p}" for p in target_files) if target_files else "(없음)"
+    )
+    screens_block = (
+        "\n".join(f"- {s}" for s in target_screens) if target_screens else "(별도 표기 없음)"
+    )
+
+    return (
+        "# Implementation Ticket\n\n"
+        f"## 선택한 기능\n{feature or '(미정)'}\n\n"
+        f"## 사용자 문제\n{user_problem}\n\n"
+        f"## 이번 사이클 구현 범위\n{cycle_scope}\n\n"
+        f"## 수정 대상 화면\n{screens_block}\n\n"
+        f"## 수정 대상 파일\n{files_block}\n\n"
+        "## 구현해야 할 동작\n"
+        + (proposal_md.strip() or pm_md.strip() or "(claude_proposal.md / pm_decision.md 참조)")
+        + "\n\n"
+        "## UI 변경사항\n(claude_apply 단계에서 위 파일들에 반영)\n\n"
+        "## 데이터 변경사항\n(스키마/저장소 변경이 있다면 위 파일 목록에 명시)\n\n"
+        "## 제외 범위\n"
+        "- 위 파일 목록에 없는 경로 수정 금지\n"
+        "- 단순 스탬프/배지/칭호 이름 추가만 하는 변경 금지\n"
+        "- 사용자 행동을 바꾸지 않는 문구 변경만 하는 변경 금지\n\n"
+        f"## 수동 QA 시나리오\n{qa_scenario}\n\n"
+        f"## 성공 기준\n{success}\n"
+    )
+
+
+def stage_implementation_ticket(state: CycleState) -> StageResult:
+    """Compose .runtime/implementation_ticket.md from the cycle's
+    upstream artifacts. Marks the ticket "missing" when no concrete
+    target files can be derived — that's the signal main() uses to
+    classify the cycle as planning_only and refuse claude_apply."""
+    label = next(lab for n, lab, _ in STAGES if n == "implementation_ticket")
+    sr = StageResult(name="implementation_ticket", label=label, status="running")
+    t0 = time.time()
+
+    def _skip(reason: str) -> StageResult:
+        sr.status = "skipped"
+        sr.message = reason
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.implementation_ticket_status = "skipped"
+        state.implementation_ticket_skipped_reason = reason
+        return sr
+
+    # Don't write a ticket while the working tree is locked.
+    if state.publish_blocked:
+        return _skip("차단 사유로 ticket 작성 보류")
+
+    pm_md = ""
+    planner_md = ""
+    proposal_md = ""
+    try:
+        if PM_DECISION_FILE.is_file():
+            pm_md = PM_DECISION_FILE.read_text(encoding="utf-8")
+    except OSError:
+        pm_md = ""
+    try:
+        if PLANNER_REVISION_FILE.is_file():
+            planner_md = PLANNER_REVISION_FILE.read_text(encoding="utf-8")
+        elif PRODUCT_PLANNER_FILE.is_file():
+            planner_md = PRODUCT_PLANNER_FILE.read_text(encoding="utf-8")
+    except OSError:
+        planner_md = ""
+    try:
+        if PROPOSAL_FILE.is_file():
+            proposal_md = PROPOSAL_FILE.read_text(encoding="utf-8")
+    except OSError:
+        proposal_md = ""
+
+    feature = _selected_feature_for_ticket(state)
+    state.implementation_ticket_selected_feature = feature
+
+    target_files: list[str] = []
+    for src in (proposal_md, pm_md, planner_md):
+        if not src:
+            continue
+        target_files = _parse_target_files_from_md(src)
+        if target_files:
+            break
+    target_screens = _parse_screens_from_md(planner_md) or _parse_screens_from_md(pm_md)
+
+    if not target_files:
+        # No concrete file targets → ticket is "missing". We still write
+        # a stub so the operator can see what was attempted.
+        body = _build_ticket_markdown(
+            state,
+            feature=feature,
+            target_files=[],
+            target_screens=target_screens,
+            pm_md=pm_md,
+            planner_md=planner_md,
+            proposal_md=proposal_md,
+        )
+        try:
+            IMPLEMENTATION_TICKET_FILE.write_text(body, encoding="utf-8")
+        except OSError as e:
+            sr.status = "failed"
+            sr.message = f"ticket write failed: {e}"
+            sr.duration_sec = round(time.time() - t0, 3)
+            state.implementation_ticket_status = "failed"
+            state.implementation_ticket_message = sr.message
+            return sr
+        sr.status = "skipped"
+        sr.message = (
+            "Implementation Ticket 비어 있음 — 수정 대상 파일이 명시되지 않아 "
+            "이번 사이클은 planning_only 로 종료됩니다."
+        )
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.implementation_ticket_status = "missing"
+        state.implementation_ticket_path = str(IMPLEMENTATION_TICKET_FILE)
+        state.implementation_ticket_at = utc_now_iso()
+        state.implementation_ticket_target_files = []
+        state.implementation_ticket_target_screens = list(target_screens)
+        state.implementation_ticket_message = sr.message
+        _emit_cycle_log(
+            state, "implementation_ticket_missing",
+            "implementation ticket missing — 수정 대상 파일 없음, planning_only 로 종료 예정",
+            feature=feature,
+        )
+        return sr
+
+    body = _build_ticket_markdown(
+        state,
+        feature=feature,
+        target_files=target_files,
+        target_screens=target_screens,
+        pm_md=pm_md,
+        planner_md=planner_md,
+        proposal_md=proposal_md,
+    )
+    try:
+        IMPLEMENTATION_TICKET_FILE.write_text(body, encoding="utf-8")
+    except OSError as e:
+        sr.status = "failed"
+        sr.message = f"ticket write failed: {e}"
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.implementation_ticket_status = "failed"
+        state.implementation_ticket_message = sr.message
+        return sr
+
+    state.implementation_ticket_status = "generated"
+    state.implementation_ticket_path = str(IMPLEMENTATION_TICKET_FILE)
+    state.implementation_ticket_at = utc_now_iso()
+    state.implementation_ticket_target_files = list(target_files)
+    state.implementation_ticket_target_screens = list(target_screens)
+    state.implementation_ticket_message = (
+        f"Implementation Ticket 작성됨 — 대상 파일 {len(target_files)}개"
+    )
+    _emit_cycle_log(
+        state, "implementation_ticket_created",
+        f"implementation ticket created — 대상 파일 {len(target_files)}개",
+        feature=feature,
+        target_files=target_files[:20],
+    )
+    sr.status = "passed"
+    sr.message = state.implementation_ticket_message
+    sr.duration_sec = round(time.time() - t0, 3)
+    return sr
+
+
+# ---------------------------------------------------------------------------
 # Claude apply stage (opt-in via FACTORY_APPLY_CLAUDE)
 # ---------------------------------------------------------------------------
 
@@ -3743,6 +4127,21 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     if state.claude_proposal_status != "generated":
         return _skip(
             f"이번 사이클의 claude_propose가 generated 아님 ({state.claude_proposal_status}) — 적용 건너뜀"
+        )
+
+    # Pre-condition 2b: Implementation Ticket must be present with
+    # concrete target files. Without a ticket, we don't know what the
+    # cycle is supposed to write — so we refuse to let claude_apply
+    # touch the working tree on speculation. The ticket stage already
+    # logged implementation_ticket_missing so the operator can see why.
+    if state.implementation_ticket_status != "generated":
+        return _skip(
+            "Implementation Ticket이 없어 claude_apply 건너뜀 — "
+            "이번 사이클은 planning_only 로 종료됩니다."
+        )
+    if not state.implementation_ticket_target_files:
+        return _skip(
+            "Implementation Ticket 의 수정 대상 파일이 비어 있어 claude_apply 건너뜀"
         )
 
     # Pre-condition 3: don't apply on top of leaking files.
@@ -5129,11 +5528,25 @@ def main() -> int:
     # Track per-stage progress contribution.
     weights = {n: w for n, _, w in STAGES}
 
+    # Stages that count as "validation" for the System Log. Emitting
+    # validation_started / passed / failed events around these gives
+    # the operator a per-stage Build/QA chip without us teaching every
+    # stage to log itself.
+    VALIDATION_STAGES = {
+        "build_app", "build_control", "syntax_check", "qa_gate", "qa_recheck",
+    }
+
     def run_stage(name: str, fn) -> StageResult:
         state.current_stage = name
         state.current_task = next(lab for n, lab, _ in STAGES if n == name)
         state.last_message = f"{state.current_task} 진행 중"
         _write_state(state)
+        if name in VALIDATION_STAGES:
+            _emit_cycle_log(
+                state, "validation_started",
+                f"validation started — {state.current_task}",
+                stage=name,
+            )
         sr = fn()
         state.stages.append(sr)
         # Bump progress by stage weight whether passed/failed/skipped — the
@@ -5141,6 +5554,19 @@ def main() -> int:
         state.progress = min(100, state.progress + weights.get(name, 0))
         state.last_message = f"{sr.label}: {sr.message or sr.status}"
         _log(f"stage {name} -> {sr.status} ({sr.duration_sec}s) {sr.message}")
+        if name in VALIDATION_STAGES:
+            if sr.status == "passed":
+                _emit_cycle_log(
+                    state, "validation_passed",
+                    f"validation passed — {sr.label}",
+                    stage=name,
+                )
+            elif sr.status == "failed":
+                _emit_cycle_log(
+                    state, "validation_failed",
+                    f"validation failed — {sr.label}: {sr.message[:200]}",
+                    stage=name, reason=sr.message,
+                )
         _write_state(state)
         return sr
 
@@ -5175,6 +5601,13 @@ def main() -> int:
     )
     run_stage("syntax_check", lambda: stage_syntax_check(state))
     run_stage("claude_propose", lambda: stage_claude_propose(state))
+    # Implementation Ticket — composed deterministically from PM 결정 +
+    # planner revision + claude proposal. claude_apply gates on this:
+    # missing ticket means the cycle stays planning_only.
+    run_stage(
+        "implementation_ticket",
+        lambda: stage_implementation_ticket(state),
+    )
     run_stage("claude_apply", lambda: stage_claude_apply(state))
 
     # QA Gate — final verification that what we built is shippable.
@@ -5279,16 +5712,66 @@ def main() -> int:
             stage=first.name, reason=first.message or "",
         )
     elif apply_status == "applied" and apply_changed:
-        state.status = "succeeded"
-        state.code_changed = True
-        state.last_message = (
-            f"이번 사이클 코드 변경 {len(apply_changed)}개 — 검증 통과"
-        )
-        _emit_cycle_log(
-            state, "cycle_produced_code_change",
-            f"cycle produced code change: {len(apply_changed)}개 파일",
-            files=apply_changed[:30],
-        )
+        cats = _categorize_changed_files(apply_changed)
+        state.frontend_changed = bool(cats["frontend"])
+        state.backend_changed = bool(cats["backend"])
+        state.control_tower_changed = bool(cats["control_tower"])
+        state.docs_only = bool(cats["docs_only"])
+        if cats["docs_only"]:
+            # Files changed, but none of them are product code — treat
+            # this as docs_only so the dashboard doesn't claim a
+            # successful feature ship.
+            state.status = "docs_only"
+            state.code_changed = False
+            state.no_code_change_reason = "docs_only"
+            state.last_message = (
+                f"이번 사이클 변경 {len(apply_changed)}개 — 모두 docs/config "
+                "이라 사용자 영향 없음"
+            )
+            _emit_cycle_log(
+                state, "cycle_produced_docs_only",
+                f"cycle produced docs only: {len(apply_changed)}개 파일",
+                files=apply_changed[:30],
+            )
+        else:
+            state.status = "succeeded"
+            state.code_changed = True
+            state.last_message = (
+                f"이번 사이클 코드 변경 {len(apply_changed)}개 — 검증 통과"
+            )
+            _emit_cycle_log(
+                state, "cycle_produced_code_change",
+                f"cycle produced code change: {len(apply_changed)}개 파일",
+                files=apply_changed[:30],
+                frontend_changed=state.frontend_changed,
+                backend_changed=state.backend_changed,
+                control_tower_changed=state.control_tower_changed,
+            )
+            if state.frontend_changed:
+                _emit_cycle_log(
+                    state, "frontend_files_changed",
+                    f"frontend files changed — {sum(1 for f in apply_changed if f.startswith('app/web/src/'))}개",
+                    files=[f for f in apply_changed if f.startswith("app/web/src/")][:20],
+                )
+            if state.backend_changed:
+                _emit_cycle_log(
+                    state, "backend_files_changed",
+                    f"backend files changed — {sum(1 for f in apply_changed if f.startswith('app/api/'))}개",
+                    files=[f for f in apply_changed if f.startswith("app/api/")][:20],
+                )
+            if state.control_tower_changed:
+                ct_count = sum(
+                    1 for f in apply_changed
+                    if any(f.startswith(p) for p in CONTROL_TOWER_PATH_PREFIXES)
+                )
+                _emit_cycle_log(
+                    state, "control_tower_files_changed",
+                    f"control_tower files changed — {ct_count}개",
+                    files=[
+                        f for f in apply_changed
+                        if any(f.startswith(p) for p in CONTROL_TOWER_PATH_PREFIXES)
+                    ][:20],
+                )
     else:
         # No failed stages, but no actual code change either. Distinguish
         # planning_only (planner / designer / pm artifact freshly generated)

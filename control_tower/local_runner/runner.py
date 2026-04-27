@@ -738,26 +738,127 @@ def _merge_factory_state_qa(qa_dict: dict) -> None:
         sys.stderr.write(f"[runner] failed to merge on-demand QA state: {e}\n")
 
 
-def _run_on_demand_qa_gate() -> tuple[bool, str, dict]:
-    """Run the QA Gate against the *current* working tree.
+def _qa_targeted_command_plan(changed_files: list[str]) -> list[dict]:
+    """Decide which validation commands to run for an on-demand QA
+    Gate based on what actually changed in the working tree.
 
-    Used when publish is requested but no QA report exists yet — e.g.,
-    the user committed manually outside the factory loop, or a partial
-    operator_request modified files without ever reaching stage_qa_gate.
-    Mirrors the cycle's pre-QA correctness pass so the QA Gate's
-    dist-artifact check sees freshly-built outputs:
+    Returns a list of step dicts: [{key, label, argv, cwd, env, category}].
+    Each step is run sequentially; the first failure stops the gate
+    and gets surfaced with its stderr tail in the deploy_progress
+    history.
 
-      1. _revalidate_after_apply — npm run build (app/web +
-         control_tower/web), py_compile across the api/runner trees,
-         bash -n on the factory scripts, plus a risky-file scan.
-      2. stage_qa_gate — the existing build_artifact + api_health +
-         screen_presence + flow_presence + domain_profile checks.
-         Writes qa_report.md (and qa_feedback.md on failure) so the
-         dashboard can deep-link the result.
+    The plan is *targeted* by design — running every npm build + every
+    py_compile on every deploy click wastes minutes when only one
+    folder changed.
+    """
+    import shutil as _shutil
 
-    Returns (passed, message, qa_dict). qa_dict carries the QA fields
-    factory_state.json expects so the heartbeat reflects the
-    on-demand result.
+    npm = _shutil.which("npm")
+    py = sys.executable
+
+    def _has_prefix(prefix: str) -> bool:
+        return any(p.startswith(prefix) for p in changed_files)
+
+    plan: list[dict] = []
+
+    # 1. app/web build — fired only when the SPA tree was touched.
+    if _has_prefix("app/web/") and npm:
+        plan.append({
+            "key": "build_app",
+            "label": "app/web npm run build",
+            "argv": [npm, "run", "build"],
+            "cwd": REPO_ROOT / "app" / "web",
+            "env": {"CI": "1"},
+            "category": "Build Artifact",
+        })
+
+    # 2. control_tower/web build.
+    if _has_prefix("control_tower/web/") and npm:
+        plan.append({
+            "key": "build_control",
+            "label": "control_tower/web npm run build",
+            "argv": [npm, "run", "build"],
+            "cwd": REPO_ROOT / "control_tower" / "web",
+            "env": {"CI": "1"},
+            "category": "Build Artifact",
+        })
+
+    # 3. local_runner py_compile — runner.py + cycle.py only,
+    # mirroring the user's explicit minimum.
+    if _has_prefix("control_tower/local_runner/"):
+        for rel in (
+            "control_tower/local_runner/runner.py",
+            "control_tower/local_runner/cycle.py",
+        ):
+            target = REPO_ROOT / rel
+            if target.is_file():
+                plan.append({
+                    "key": f"py_compile_{Path(rel).stem}",
+                    "label": f"py_compile {rel}",
+                    "argv": [py, "-m", "py_compile", str(target)],
+                    "cwd": REPO_ROOT,
+                    "env": None,
+                    "category": "Local Runner",
+                })
+
+    # 4. control_tower/api py_compile — main.py only.
+    if _has_prefix("control_tower/api/"):
+        target = REPO_ROOT / "control_tower" / "api" / "main.py"
+        if target.is_file():
+            plan.append({
+                "key": "py_compile_control_api",
+                "label": "py_compile control_tower/api/main.py",
+                "argv": [py, "-m", "py_compile", str(target)],
+                "cwd": REPO_ROOT,
+                "env": None,
+                "category": "API Health",
+            })
+
+    # 5. app/api py_compile — prefer the project venv if present,
+    # fall back to the system python. We don't `source .venv/bin/activate`
+    # (subprocess can't), but invoking the venv binary directly has
+    # the same import effect.
+    if _has_prefix("app/api/"):
+        target = REPO_ROOT / "app" / "api" / "app" / "main.py"
+        if target.is_file():
+            venv_py = REPO_ROOT / "app" / "api" / ".venv" / "bin" / "python"
+            py_bin = str(venv_py) if venv_py.is_file() else py
+            plan.append({
+                "key": "py_compile_app_api",
+                "label": "py_compile app/api/app/main.py",
+                "argv": [py_bin, "-m", "py_compile", str(target)],
+                "cwd": REPO_ROOT,
+                "env": None,
+                "category": "API Health",
+            })
+
+    return plan
+
+
+def _stderr_tail(output: str, lines: int = 12) -> str:
+    """Pull the trailing N lines from a captured subprocess output —
+    cycle._run returns stdout + '\\n--stderr--\\n' + stderr; for the
+    failure copy in the dashboard we want the *last* lines, which
+    are almost always the actionable error lines from stderr."""
+    if not output:
+        return ""
+    tail = "\n".join(output.splitlines()[-lines:])
+    return tail.strip()
+
+
+def _run_targeted_qa_gate(
+    changed_files: list[str],
+) -> tuple[bool, str, dict, list[dict]]:
+    """Run only the validations relevant to `changed_files`, then run
+    cycle.stage_qa_gate to lock in screen_presence / flow_presence /
+    domain_profile. Returns (passed, message, qa_dict, step_results).
+
+    `step_results` is a list of {key, label, ok, stderr_tail, command,
+    cwd, category} so the caller can render exact "여기서 실패" detail
+    in the deploy progress UI.
+
+    On any targeted-step failure we stop early — there's no point
+    running domain_profile when the build is broken.
     """
     try:
         from . import cycle as _cycle
@@ -777,31 +878,76 @@ def _run_on_demand_qa_gate() -> tuple[bool, str, dict]:
             "qa_feedback_path": None,
         }
         _merge_factory_state_qa(qa_dict)
-        return False, msg, qa_dict
+        return False, msg, qa_dict, []
 
-    revalidate_ok, failures = _cycle._revalidate_after_apply()
-    if not revalidate_ok:
-        msg = "build/syntax 실패: " + ", ".join(failures or ["unknown"])
-        qa_dict = {
-            "qa_status": "failed",
-            "qa_publish_allowed": False,
-            "qa_failed_reason": msg,
-            "qa_failed_categories": ["Build/Syntax"],
-            "qa_build_artifact": (
-                "failed"
-                if any(f in failures for f in ("build_app", "build_control"))
-                else "skipped"
-            ),
-            "qa_api_health": "failed" if "syntax_check_py" in failures else "skipped",
-            "qa_screen_presence": "skipped",
-            "qa_flow_presence": "skipped",
-            "qa_domain_profile": "skipped",
-            "qa_report_path": None,
-            "qa_feedback_path": None,
+    plan = _qa_targeted_command_plan(changed_files)
+    step_results: list[dict] = []
+
+    for step in plan:
+        ok, out = _cycle._run(
+            step["argv"],
+            cwd=step.get("cwd"),
+            timeout=300.0,
+            env_override=step.get("env"),
+        )
+        cmd_str = " ".join(shlex.quote(a) for a in step["argv"])
+        record = {
+            "key": step["key"],
+            "label": step["label"],
+            "category": step["category"],
+            "command": cmd_str,
+            "cwd": str(step["cwd"]) if step.get("cwd") else None,
+            "ok": bool(ok),
+            "stderr_tail": _stderr_tail(out) if not ok else "",
         }
-        _merge_factory_state_qa(qa_dict)
-        return False, msg, qa_dict
+        step_results.append(record)
+        if not ok:
+            cat_set: list[str] = []
+            for r in step_results:
+                if not r["ok"] and r["category"] not in cat_set:
+                    cat_set.append(r["category"])
+            qa_dict = {
+                "qa_status": "failed",
+                "qa_publish_allowed": False,
+                "qa_failed_reason": (
+                    f"{step['label']} 실패 — "
+                    + (record["stderr_tail"][:200] or "오류 출력 없음")
+                ),
+                "qa_failed_categories": cat_set or ["Build/Syntax"],
+                "qa_build_artifact": (
+                    "failed"
+                    if any(
+                        r["key"].startswith("build_") and not r["ok"]
+                        for r in step_results
+                    )
+                    else "skipped"
+                ),
+                "qa_api_health": (
+                    "failed"
+                    if any(
+                        r["key"].startswith("py_compile_") and not r["ok"]
+                        for r in step_results
+                    )
+                    else "skipped"
+                ),
+                "qa_screen_presence": "skipped",
+                "qa_flow_presence": "skipped",
+                "qa_domain_profile": "skipped",
+                "qa_report_path": None,
+                "qa_feedback_path": None,
+            }
+            _merge_factory_state_qa(qa_dict)
+            return (
+                False,
+                f"{step['label']} 실패",
+                qa_dict,
+                step_results,
+            )
 
+    # Targeted commands all passed (or there were none for this diff —
+    # docs-only change). Hand off to stage_qa_gate so the
+    # screen_presence / flow_presence / domain_profile invariants
+    # still get checked and qa_report.md gets written.
     state = _cycle.CycleState()
     sr = _cycle.stage_qa_gate(state)
     qa_dict = {
@@ -818,7 +964,16 @@ def _run_on_demand_qa_gate() -> tuple[bool, str, dict]:
         "qa_feedback_path": state.qa_feedback_path,
     }
     _merge_factory_state_qa(qa_dict)
-    return sr.status == "passed", sr.message, qa_dict
+    return sr.status == "passed", sr.message, qa_dict, step_results
+
+
+def _run_on_demand_qa_gate() -> tuple[bool, str, dict]:
+    """Back-compat wrapper for callers (operator_fix flow) that don't
+    have a changed-files list handy. Delegates to the targeted runner
+    using the current `git status` diff and discards the per-step
+    detail — operator_fix surfaces its own QA telemetry."""
+    ok, msg, qa_dict, _steps = _run_targeted_qa_gate(_git_changed_files())
+    return ok, msg, qa_dict
 
 
 def _format_qa_failure_detail(qa_dict: dict, qa_msg: str) -> dict:
@@ -2171,6 +2326,23 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         })
         return False, msg
 
+    # Single-flight: refuse a second operator_request while the first
+    # is still in-flight. A double-click on the dashboard would
+    # otherwise queue two Claude CLI invocations against the same
+    # working tree — the second would race the first's edits.
+    prior_fix = _read_operator_fix_state() or {}
+    if prior_fix.get("status") == "running":
+        msg = (
+            "이미 operator_request 가 실행 중입니다 — already_running. "
+            "이전 요청이 끝난 뒤 다시 시도하세요."
+        )
+        # Don't overwrite the running row's started_at; just stamp a
+        # rejection marker for the heartbeat consumers.
+        _save_operator_fix_state({
+            "last_message": msg,
+        })
+        return False, msg
+
     started_at = _utc_now_z()
     request_redacted, redactions = _redact_request_text(prompt_raw)
     truncated = request_redacted.strip()[:OPERATOR_REQUEST_MAX_CHARS]
@@ -2846,11 +3018,11 @@ def _build_cycle_effectiveness_meta(state: dict) -> dict:
     block — the dashboard's source-of-truth for "did the most recent
     cycle actually change product code, or did we just spin?".
 
-    Pulls cycle status / claude_apply detail from factory_state.json
-    and the commit_hash + push status from publish_state.json (the
-    runner owns push, not cycle.py — so the linkage is "the cycle
-    that produced these files" + "the publish_changes invocation that
-    pushed them").
+    Pulls cycle status / claude_apply detail from factory_state.json,
+    the commit_hash + push status from publish_state.json, and a short
+    preview of the implementation_ticket.md the cycle produced (or
+    didn't produce) from disk. Together those answer "was this cycle
+    real" without forcing the dashboard to cross-reference three files.
     """
     code_changed = bool(state.get("code_changed"))
     apply_status = state.get("claude_apply_status") or "skipped"
@@ -2861,6 +3033,51 @@ def _build_cycle_effectiveness_meta(state: dict) -> dict:
     failed_reason = state.get("failed_reason")
     suggested_action = state.get("suggested_action")
     cycle_log = list(state.get("cycle_log") or [])
+
+    # Per-tier file-change flags. cycle.py sets these at end of main()
+    # via _categorize_changed_files; default to False on older state
+    # files that don't carry them yet.
+    frontend_changed = bool(state.get("frontend_changed"))
+    backend_changed = bool(state.get("backend_changed"))
+    control_tower_changed = bool(state.get("control_tower_changed"))
+    docs_only = bool(state.get("docs_only"))
+
+    # Implementation Ticket — the per-cycle source-of-truth document.
+    # We surface its existence + a small preview so the panel can render
+    # "이번 사이클은 X 기능을 구현하기로 했는데 ...".
+    ticket_path = state.get("implementation_ticket_path")
+    if not ticket_path:
+        candidate = RUNTIME_DIR / "implementation_ticket.md"
+        if candidate.is_file():
+            ticket_path = str(candidate)
+    ticket_exists = bool(ticket_path) and Path(ticket_path).is_file()
+    ticket_preview = None
+    if ticket_exists:
+        ticket_preview = _artifact_preview(Path(ticket_path), max_chars=480)
+
+    ticket_status = state.get("implementation_ticket_status") or "skipped"
+    ticket_target_files = list(state.get("implementation_ticket_target_files") or [])
+    ticket_target_screens = list(state.get("implementation_ticket_target_screens") or [])
+    ticket_feature = state.get("implementation_ticket_selected_feature")
+    ticket_message = state.get("implementation_ticket_message")
+    ticket_at = state.get("implementation_ticket_at")
+    ticket_skipped_reason = state.get("implementation_ticket_skipped_reason")
+
+    # Validation status rolled up from the validation-class stages so
+    # the FE doesn't have to scan all stages itself. Picks the worst
+    # status so a single failed build_app shows as "failed".
+    validation_status = "skipped"
+    for sr in state.get("stages") or []:
+        if sr.get("name") not in {
+            "build_app", "build_control", "syntax_check", "qa_gate", "qa_recheck",
+        }:
+            continue
+        st = sr.get("status")
+        if st == "failed":
+            validation_status = "failed"
+            break
+        if st == "passed" and validation_status != "failed":
+            validation_status = "passed"
 
     # Pull commit / push status from publish_state.json so the panel
     # can show "이 사이클이 만든 변경이 push 되었는가" without the FE
@@ -2888,6 +3105,22 @@ def _build_cycle_effectiveness_meta(state: dict) -> dict:
         "code_changed": code_changed,
         "changed_files_count": len(changed_files),
         "changed_files": changed_files[:30],
+        "frontend_changed": frontend_changed,
+        "backend_changed": backend_changed,
+        "control_tower_changed": control_tower_changed,
+        "docs_only": docs_only,
+        "implementation_ticket_status": ticket_status,
+        "implementation_ticket_exists": ticket_exists,
+        "implementation_ticket_path": ticket_path,
+        "implementation_ticket_preview": ticket_preview,
+        "implementation_ticket_selected_feature": ticket_feature,
+        "implementation_ticket_target_files": ticket_target_files[:20],
+        "implementation_ticket_target_files_count": len(ticket_target_files),
+        "implementation_ticket_target_screens": ticket_target_screens[:8],
+        "implementation_ticket_message": ticket_message,
+        "implementation_ticket_at": ticket_at,
+        "implementation_ticket_skipped_reason": ticket_skipped_reason,
+        "validation_status": validation_status,
         "commit_hash": commit_hash,
         "commit_hash_short": (commit_hash[:8] if commit_hash else None),
         "push_status": push_status,

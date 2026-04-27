@@ -6,6 +6,7 @@ import ControlDock from "../components/ControlDock.jsx";
 import PipelineTimeline from "../components/PipelineTimeline.jsx";
 import OperatorCommandPanel from "../components/OperatorCommandPanel.jsx";
 import SystemLogPanel from "../components/SystemLogPanel.jsx";
+import CycleEffectivenessPanel from "../components/CycleEffectivenessPanel.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -244,6 +245,7 @@ export default function ControlTowerPage() {
         </div>
 
         <aside className="flex flex-col gap-3">
+          <CycleEffectivenessPanel runners={runners} />
           <PingPongBoard events={events} runners={runners} />
           <ArtifactBoard events={events} factory={factory} />
         </aside>

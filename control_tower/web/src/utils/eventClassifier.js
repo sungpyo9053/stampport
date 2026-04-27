@@ -214,11 +214,22 @@ const KEYWORD_TABLE = [
   [/claude\s*(code|cli)?\s*(failed|error|timeout)/i,      { category: "Error",  actor: "claude", severity: "error",   phase: "failed"    }],
   [/(operator[_ ]?request|claude에게 작업 지시)/i,        { category: "Claude", actor: "claude", severity: "info",    phase: "info"      }],
 
+  // Implementation Ticket — the bridge between PM 결정 and claude_apply.
+  // No ticket = no code change this cycle, so absence is an Error chip.
+  [/implementation\s+ticket\s+(missing|absent|없음|비어)/i, { category: "Error",  actor: "factory", severity: "error",   phase: "failed"    }],
+  [/implementation\s+ticket\s+(created|generated|작성|생성)/i, { category: "Claude", actor: "factory", severity: "success", phase: "completed" }],
+
   // Cycle outcomes — derived from heartbeat cycle_log on the FE.
   [/cycle\s+produced\s+code\s+change/i,                   { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
+  [/cycle\s+produced\s+docs\s+only/i,                     { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],
   [/cycle\s+produced\s+no\s+code\s+change/i,              { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],
   [/cycle\s+planning\s+only/i,                            { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],
   [/cycle\s+failed/i,                                     { category: "Error", actor: "factory", severity: "error",   phase: "failed"    }],
+
+  // Per-tier file change markers — surface "FE 변경" vs "BE 변경" vs "관제실 변경".
+  [/frontend\s+files\s+changed/i,                         { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
+  [/backend\s+files\s+changed/i,                          { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
+  [/control[\s_-]*tower\s+files\s+changed/i,              { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
 
   // Validation (cycle's _revalidate_after_apply).
   [/validation\s+started/i,                               { category: "Build", actor: "factory", severity: "info",    phase: "started"   }],
