@@ -30,6 +30,21 @@ export default function MyPassport({ navigate }) {
         <h2>{user?.nickname}님의 로컬 여권</h2>
         <div className="ps-title">현재 칭호 · {selectedTitle}</div>
 
+        <div className="passport-card-identity">
+          <div className="pci-avatar">{(user?.nickname || '?').slice(0, 1)}</div>
+          <div className="pci-text">
+            <div className="pci-title">
+              Lv.{level} · {user?.passport_title || '동네 도장 수집가'}
+            </div>
+            <div className="pci-meta">
+              {user?.nickname || '게스트'}님 · 도장 {stamps.length}개 · 다음 레벨까지 {Math.max(0, levelInfo.expForLevel - levelInfo.expIntoLevel)} EXP
+            </div>
+            <div className="pci-provider">
+              {(user?.provider || 'guest').toUpperCase()} 여권
+            </div>
+          </div>
+        </div>
+
         <div className="ps-stats">
           <div className="ps-stat">
             <div className="label">Stamps</div>

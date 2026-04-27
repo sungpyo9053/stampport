@@ -4,6 +4,7 @@ import {
   loadProfileMeta,
   loadStamps,
   loadUser,
+  makeNewProfile,
   saveProfileMeta,
   saveStamps,
   saveUser,
@@ -14,16 +15,14 @@ import { expGainFor, levelFor, levelProgress, totalExp } from '../utils/leveling
 import { generateKickPoints } from '../utils/kickPoints.js';
 import { AppContext } from './appContext.js';
 
-function makeUserId(email) {
-  const base = (email || '').toLowerCase().trim() || `guest-${Date.now()}`;
-  return `u_${base.replace(/[^a-z0-9]/g, '_')}`;
-}
-
 function makeStampId() {
   return `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function AppProvider({ children }) {
+  // loadUser() already migrates legacy {nickname, email} blobs into
+  // the new passport-identity shape, so the rest of the provider can
+  // just trust the schema.
   const [user, setUser] = useState(() => loadUser());
   const [stamps, setStamps] = useState(() => {
     const u = loadUser();
@@ -46,26 +45,68 @@ export function AppProvider({ children }) {
     if (user) saveProfileMeta(user.user_id, profileMeta);
   }, [user, profileMeta]);
 
-  const login = useCallback(({ nickname, email }) => {
-    const userId = makeUserId(email);
-    const existingUser = loadUser();
-    let nextUser;
-    if (existingUser && existingUser.user_id === userId) {
-      nextUser = { ...existingUser, nickname, email };
-    } else {
-      nextUser = {
-        user_id: userId,
-        nickname,
-        email,
-        created_at: new Date().toISOString(),
-      };
-    }
-    setUser(nextUser);
-    setStamps(loadStamps(userId));
-    setProfileMeta(loadProfileMeta(userId));
-    saveUser(nextUser);
-    return nextUser;
-  }, []);
+  // Generic login entry point — used by both the legacy guest form
+  // (nickname/email) and the new social/mock flows. Caller passes
+  // provider + nickname; everything else is filled in by
+  // makeNewProfile and merged on top of any existing profile so a
+  // returning user keeps their stamps.
+  const loginAs = useCallback(
+    ({
+      provider = 'guest',
+      nickname,
+      email = null,
+      provider_user_id = null,
+      avatar_style,
+      passport_title,
+    } = {}) => {
+      const existing = loadUser();
+      let nextUser;
+      // Returning user with the same provider + provider_user_id (or
+      // same email for guest) — keep their existing user_id so the
+      // stamps bucket is preserved.
+      const isSameUser = !!existing
+        && existing.provider === provider
+        && (provider_user_id
+          ? existing.provider_user_id === provider_user_id
+          : email
+          ? existing.email === email
+          : provider === 'guest');
+      if (isSameUser) {
+        nextUser = {
+          ...existing,
+          nickname: nickname || existing.nickname,
+          provider_user_id: provider_user_id ?? existing.provider_user_id,
+          email: email ?? existing.email,
+          avatar_style: avatar_style || existing.avatar_style,
+          passport_title: passport_title || existing.passport_title,
+          last_login_at: new Date().toISOString(),
+        };
+      } else {
+        nextUser = makeNewProfile({
+          provider,
+          nickname,
+          email,
+          provider_user_id,
+          avatar_style,
+          passport_title,
+        });
+      }
+      setUser(nextUser);
+      setStamps(loadStamps(nextUser.user_id));
+      setProfileMeta(loadProfileMeta(nextUser.user_id));
+      saveUser(nextUser);
+      return nextUser;
+    },
+    [],
+  );
+
+  // Back-compat: the legacy nickname+email login form still calls
+  // `login({ nickname, email })`. Forward to loginAs as a guest so
+  // the existing screen keeps working without a rewrite.
+  const login = useCallback(
+    ({ nickname, email }) => loginAs({ provider: 'guest', nickname, email }),
+    [loginAs],
+  );
 
   const logout = useCallback(() => {
     clearUser();
@@ -138,6 +179,7 @@ export function AppProvider({ children }) {
       stamps,
       addStamp,
       login,
+      loginAs,
       logout,
       exp,
       level,
@@ -155,6 +197,7 @@ export function AppProvider({ children }) {
       stamps,
       addStamp,
       login,
+      loginAs,
       logout,
       exp,
       level,

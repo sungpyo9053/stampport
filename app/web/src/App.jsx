@@ -10,6 +10,7 @@ import MyPassport from './screens/MyPassport.jsx';
 import Badges from './screens/Badges.jsx';
 import Quests from './screens/Quests.jsx';
 import Share from './screens/Share.jsx';
+import AuthCallback from './screens/AuthCallback.jsx';
 import { useApp } from './context/appContext.js';
 import { useHashRoute } from './utils/router.js';
 
@@ -20,34 +21,44 @@ function isProtected(path) {
 }
 
 function pickRoute(path) {
-  if (path === '/' || path === '/landing' || path === '') {
+  // Strip an optional `?...` querystring before matching — OAuth
+  // providers append code/state/error to the redirect URL.
+  const clean = path.split('?')[0];
+  if (clean === '/' || clean === '/landing' || clean === '') {
     return { name: 'landing' };
   }
-  if (path === '/login') return { name: 'login' };
-  if (path === '/stamp') return { name: 'stamp' };
-  if (path.startsWith('/result/')) {
-    return { name: 'result', stampId: path.slice('/result/'.length) };
+  if (clean === '/login') return { name: 'login' };
+  if (clean.startsWith('/auth/callback/')) {
+    return {
+      name: 'auth_callback',
+      provider: clean.slice('/auth/callback/'.length) || 'unknown',
+    };
   }
-  if (path === '/passport') return { name: 'passport' };
-  if (path === '/badges') return { name: 'badges' };
-  if (path === '/quests') return { name: 'quests' };
-  if (path.startsWith('/share/')) {
-    return { name: 'share', stampId: path.slice('/share/'.length) };
+  if (clean === '/stamp') return { name: 'stamp' };
+  if (clean.startsWith('/result/')) {
+    return { name: 'result', stampId: clean.slice('/result/'.length) };
+  }
+  if (clean === '/passport') return { name: 'passport' };
+  if (clean === '/badges') return { name: 'badges' };
+  if (clean === '/quests') return { name: 'quests' };
+  if (clean.startsWith('/share/')) {
+    return { name: 'share', stampId: clean.slice('/share/'.length) };
   }
   return { name: 'landing' };
 }
 
-const HIDE_TABBAR = new Set(['landing', 'login', 'result', 'share']);
+const HIDE_TABBAR = new Set(['landing', 'login', 'auth_callback', 'result', 'share']);
 
 export default function App() {
   const { user } = useApp();
   const { path, navigate } = useHashRoute();
 
   useEffect(() => {
-    if (!user && isProtected(path)) {
+    const cleanPath = path.split('?')[0];
+    if (!user && isProtected(cleanPath)) {
       navigate('/login', { replace: true });
     }
-    if (user && (path === '/' || path === '' || path === '/landing')) {
+    if (user && (cleanPath === '/' || cleanPath === '' || cleanPath === '/landing')) {
       navigate('/passport', { replace: true });
     }
   }, [user, path, navigate]);
@@ -61,6 +72,9 @@ export default function App() {
       break;
     case 'login':
       screen = <Login navigate={navigate} />;
+      break;
+    case 'auth_callback':
+      screen = <AuthCallback navigate={navigate} provider={route.provider} />;
       break;
     case 'stamp':
       screen = user ? <StampForm navigate={navigate} /> : null;
@@ -85,7 +99,10 @@ export default function App() {
   }
 
   const showTabBar = user && !HIDE_TABBAR.has(route.name);
-  const fullBleed = route.name === 'landing' || route.name === 'login';
+  const fullBleed =
+    route.name === 'landing' ||
+    route.name === 'login' ||
+    route.name === 'auth_callback';
 
   return (
     <div className="app-shell">

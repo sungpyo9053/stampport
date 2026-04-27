@@ -1314,3 +1314,166 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Passport-identity login layout */
+
+.passport-monogram {
+  width: 84px;
+  height: 84px;
+  margin: 0 auto 18px;
+  border-radius: 14px;
+  background-color: var(--color-deep-green);
+  color: var(--color-cream);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-serif);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  border: 2px solid var(--color-gold);
+  box-shadow: 0 6px 16px rgba(31, 61, 43, 0.18);
+}
+
+.login-perks {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px 14px;
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line-soft);
+  border-radius: var(--radius-md);
+  font-size: 12.5px;
+  color: var(--color-deep-green);
+}
+
+.login-perks li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-cta {
+  margin-top: 4px;
+}
+
+.login-cta .btn {
+  font-size: 14px;
+}
+
+.login-mock-note {
+  margin-top: 4px;
+  text-align: center;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* Character / passport identity card on Header + MyPassport */
+
+.identity-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 6px;
+  border-radius: 999px;
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  color: var(--color-deep-green);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-serif);
+}
+
+.identity-chip .avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background-color: var(--color-deep-green);
+  color: var(--color-cream);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.identity-chip .meta {
+  font-size: 10.5px;
+  color: var(--color-ink-muted);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.passport-card-identity {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  margin-top: 12px;
+}
+
+.passport-card-identity .pci-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background-color: var(--color-deep-green);
+  color: var(--color-cream);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.passport-card-identity .pci-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.passport-card-identity .pci-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-deep-green);
+}
+
+.passport-card-identity .pci-meta {
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+}
+
+.passport-card-identity .pci-provider {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-burgundy);
+}
+
+/* Auth callback "잠시만요" screen */
+.auth-callback {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+  text-align: center;
+  gap: 14px;
+}
+
+.auth-callback h1 {
+  font-family: var(--font-serif);
+  font-size: 22px;
+}
+
+.auth-callback p {
+  color: var(--color-ink-muted);
+  font-size: 13.5px;
+}
