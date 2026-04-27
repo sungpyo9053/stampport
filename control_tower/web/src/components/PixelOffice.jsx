@@ -3,6 +3,7 @@ import { AnimatePresence } from "framer-motion";
 import AgentDesk from "./AgentDesk.jsx";
 import SpeechBubble from "./SpeechBubble.jsx";
 import AgentRouteLayer from "./AgentRouteLayer.jsx";
+import AgentPresenceLayer from "./AgentPresenceLayer.jsx";
 import {
   AGENTS,
   AGENT_LIST,
@@ -210,6 +211,7 @@ export default function PixelOffice({
   activeAgentId = null,
   factory = null,
   runners = [],
+  onHandoff = null,
 }) {
   const hostRef = useRef(null);
   const [scale, setScale] = useState(1);
@@ -391,6 +393,14 @@ export default function PixelOffice({
             );
           })}
 
+          {/* presence layer — small pip + status tag + ambient
+              particles per desk. Sits between desks and couriers so
+              moving cards still draw on top of pips. */}
+          <AgentPresenceLayer
+            agentStatuses={agentStatuses}
+            activeAgentId={activeAgentId}
+          />
+
           {/* moving handoff cards — overlay rendered last so the paper
               draws on top of desks while in flight. */}
           <AgentRouteLayer
@@ -398,6 +408,7 @@ export default function PixelOffice({
             runners={runners}
             onBannerChange={handleBannerChange}
             onDemoChange={handleDemoChange}
+            onHandoff={onHandoff}
             isMobile={isMobile}
           />
         </div>

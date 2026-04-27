@@ -219,6 +219,16 @@ const KEYWORD_TABLE = [
   [/implementation\s+ticket\s+(missing|absent|없음|비어)/i, { category: "Error",  actor: "factory", severity: "error",   phase: "failed"    }],
   [/implementation\s+ticket\s+(created|generated|작성|생성)/i, { category: "Claude", actor: "factory", severity: "success", phase: "completed" }],
 
+  // Agent handoff — surface in System Log so the operator sees who
+  // handed work to whom in the same timeline as runner/claude/build.
+  [/handoff\s+started/i,                                  { category: "Runner", actor: "factory", severity: "info",    phase: "started"   }],
+  [/handoff\s+(completed|finished|done)/i,                { category: "Runner", actor: "factory", severity: "success", phase: "completed" }],
+
+  // Deploy progress synthesized from deploy_progress.history.
+  [/deploy\s+failed/i,                                    { category: "Error",  actor: "github",  severity: "error",   phase: "failed"    }],
+  [/deploy\s+(completed|done|success)/i,                  { category: "Deploy", actor: "github",  severity: "success", phase: "completed" }],
+  [/deploy\s+step/i,                                      { category: "Deploy", actor: "github",  severity: "info",    phase: "info"      }],
+
   // Cycle outcomes — derived from heartbeat cycle_log on the FE.
   [/cycle\s+produced\s+code\s+change/i,                   { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
   [/cycle\s+produced\s+docs\s+only/i,                     { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],

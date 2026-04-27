@@ -17,11 +17,18 @@ import {
   resetDemo,
   runDemo,
 } from "../api/controlTowerApi.js";
-import { synthesizeCycleEvents } from "../utils/cycleEventSynth.js";
+import {
+  makeHandoffEvent,
+  synthesizeCycleEvents,
+  synthesizeDeployEvents,
+} from "../utils/cycleEventSynth.js";
 
 const POLL_MS = 1500;
 const FAST_POLL_MS = 800;
 const BUBBLE_TTL_MS = 4500;
+// Cap how many in-page handoff events we keep on screen — they're
+// transient notifications, not durable state.
+const HANDOFF_LOG_MAX = 40;
 
 // Stampport Control Tower — pixel-office layout.
 //
@@ -38,8 +45,19 @@ export default function ControlTowerPage() {
   const [factoryEvents, setFactoryEvents] = useState([]);
   const [runners, setRunners] = useState([]);
   const [bubbles, setBubbles] = useState({});
+  const [handoffLog, setHandoffLog] = useState([]);
   const [isRunningDemo, setIsRunningDemo] = useState(false);
   const [apiError, setApiError] = useState(null);
+
+  // AgentRouteLayer hands us {kind, from, to, label, banner, source}
+  // each time a non-demo handoff card starts/ends. Convert to an
+  // event-shaped row and prepend so SystemLog renders newest first.
+  const handleHandoff = useCallback((info) => {
+    if (!info || !info.kind) return;
+    setHandoffLog((prev) =>
+      [makeHandoffEvent(info), ...prev].slice(0, HANDOFF_LOG_MAX),
+    );
+  }, []);
 
   const lastEventIdRef = useRef(0);
   const initializedRef = useRef(false);
@@ -223,7 +241,12 @@ export default function ControlTowerPage() {
           the input field). */}
       <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
         <SystemLogPanel
-          events={[...events, ...synthesizeCycleEvents(runners)]}
+          events={[
+            ...events,
+            ...synthesizeCycleEvents(runners),
+            ...synthesizeDeployEvents(runners),
+            ...handoffLog,
+          ]}
         />
         <OperatorCommandPanel runners={runners} onSent={tick} />
       </section>
@@ -241,6 +264,7 @@ export default function ControlTowerPage() {
             activeAgentId={activeAgentId}
             factory={factory}
             runners={runners}
+            onHandoff={handleHandoff}
           />
         </div>
 

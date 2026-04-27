@@ -90,6 +90,7 @@ export default function AgentRouteLayer({
   runners = [],
   onBannerChange,
   onDemoChange,
+  onHandoff = null,
   isMobile = false,
 }) {
   const [activeCard, setActiveCard] = useState(null);
@@ -131,7 +132,21 @@ export default function AgentRouteLayer({
     setActiveCard(next);
     onBannerChange?.(bannerFor(next));
     onDemoChange?.(next.source === "demo");
-  }, [activeCard, onBannerChange, onDemoChange]);
+    // Fire a "handoff started" lifecycle event so the host page can
+    // surface it in System Log. We deliberately *don't* fire for demo
+    // cards — the operator only cares about real handoffs in the log.
+    if (next.source !== "demo") {
+      onHandoff?.({
+        kind: "handoff_started",
+        from: next.from,
+        to: next.to,
+        label: next.label,
+        artifactType: next.artifactType,
+        banner: bannerFor(next),
+        source: next.source,
+      });
+    }
+  }, [activeCard, onBannerChange, onDemoChange, onHandoff]);
 
   // Watch factory.current_stage for forward transitions.
   const currentStage = factory?.current_stage || null;
@@ -213,9 +228,20 @@ export default function AgentRouteLayer({
 
   // Card finished — clear active so the queue can advance.
   const handleDone = useCallback(() => {
+    if (activeCard && activeCard.source !== "demo") {
+      onHandoff?.({
+        kind: "handoff_completed",
+        from: activeCard.from,
+        to: activeCard.to,
+        label: activeCard.label,
+        artifactType: activeCard.artifactType,
+        banner: bannerFor(activeCard),
+        source: activeCard.source,
+      });
+    }
     setActiveCard(null);
     onBannerChange?.(null);
-  }, [onBannerChange]);
+  }, [activeCard, onBannerChange, onHandoff]);
 
   // Mobile: skip animations entirely if the user opted into reduced
   // motion AND we're on a narrow viewport. Otherwise we still play, just

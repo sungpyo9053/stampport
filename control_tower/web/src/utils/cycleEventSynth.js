@@ -37,6 +37,13 @@ const KIND_TO_TYPE = {
   cycle_produced_docs_only:       "agent_message",
   cycle_produced_no_code_change:  "agent_message",
   cycle_failed:                   "error",
+  // FE-only synthetic kinds (handoff lifecycle from AgentRouteLayer +
+  // deploy_progress.history transitions).
+  handoff_started:                "agent_message",
+  handoff_completed:              "agent_message",
+  deploy_step:                    "agent_message",
+  deploy_failed:                  "error",
+  deploy_completed:               "agent_message",
 };
 
 // Stable id from the entry's content. Negative so it can't collide
@@ -70,6 +77,11 @@ const KIND_TO_PHRASE = {
   cycle_produced_docs_only:       "cycle produced docs only",
   cycle_produced_no_code_change:  "cycle produced no code change",
   cycle_failed:                   "cycle failed",
+  handoff_started:                "handoff started",
+  handoff_completed:              "handoff completed",
+  deploy_step:                    "deploy step",
+  deploy_failed:                  "deploy failed",
+  deploy_completed:               "deploy completed",
 };
 
 function entryToEvent(entry) {
@@ -110,4 +122,111 @@ export function synthesizeCycleEvents(runners = []) {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Deploy progress → System Log events.
+//
+// The runner heartbeat carries a structured `deploy_progress` block at
+//   metadata.local_factory.publish.deploy_progress
+// with a `history` array of step transitions. We turn each transition
+// into a synthetic event so the operator can scroll back through:
+//   "deploy started", "git push origin main 진행 중", "deploy failed at qa_gate", ...
+// without having to read the raw JSON.
+// ---------------------------------------------------------------------------
+
+function pickDeployProgress(runners = []) {
+  for (const r of runners) {
+    const dp = r?.metadata_json?.local_factory?.publish?.deploy_progress;
+    if (dp) return dp;
+  }
+  return null;
+}
+
+function deployStepKind(status) {
+  if (status === "completed" || status === "actions_triggered") return "deploy_completed";
+  if (status === "failed") return "deploy_failed";
+  return "deploy_step";
+}
+
+function deployStepMessage(entry) {
+  // Each history row carries `{ at, status, current_step?, failed_reason? }`.
+  // We prefer the human label the runner already wrote.
+  if (entry.failed_reason) {
+    return `deploy failed (${entry.status}) — ${entry.failed_reason}`;
+  }
+  if (entry.current_step) {
+    return `deploy step · ${entry.status} · ${entry.current_step}`;
+  }
+  return `deploy step · ${entry.status}`;
+}
+
+function deployEntryId(attemptId, idx) {
+  // Stable hash from attempt + index so a re-render of the same heartbeat
+  // doesn't churn React keys.
+  const seed = `deploy|${attemptId || "anon"}|${idx}`;
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+  return -1 - (Math.abs(h) % 2_000_000_000);
+}
+
+export function synthesizeDeployEvents(runners = []) {
+  const dp = pickDeployProgress(runners);
+  if (!dp || !Array.isArray(dp.history)) return [];
+  const attemptId = dp.attempt_id || dp.command_id || "current";
+  const out = [];
+  dp.history.forEach((entry, idx) => {
+    if (!entry || !entry.status) return;
+    const kind = deployStepKind(entry.status);
+    out.push({
+      id: deployEntryId(attemptId, idx),
+      type: kind === "deploy_failed" ? "error" : "agent_message",
+      message: deployStepMessage(entry),
+      payload: {
+        source: "deploy_progress",
+        attempt_id: attemptId,
+        status: entry.status,
+        current_step: entry.current_step,
+        failed_reason: entry.failed_reason,
+      },
+      created_at: entry.at,
+      agent_id: null,
+      task_id: null,
+    });
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// In-page handoff events. AgentRouteLayer calls back when a card
+// starts/finishes its trip; ControlTowerPage funnels those through this
+// helper before merging into the SystemLog.
+// ---------------------------------------------------------------------------
+
+let handoffSeq = 0;
+
+export function makeHandoffEvent({ kind, from, to, label, banner, source }) {
+  // We assign a fresh negative id per call — these aren't deduplicable
+  // between renders (they're event-shaped notifications, not state).
+  handoffSeq -= 1;
+  const phrase = KIND_TO_PHRASE[kind] || kind;
+  const message = banner
+    ? `${phrase} — ${banner}`
+    : `${phrase} — ${from} → ${to} (${label})`;
+  return {
+    id: handoffSeq,
+    type: "agent_message",
+    message,
+    payload: {
+      source: "handoff",
+      kind,
+      from,
+      to,
+      label,
+      flow_source: source,
+    },
+    created_at: new Date().toISOString(),
+    agent_id: null,
+    task_id: null,
+  };
 }
