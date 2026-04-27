@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PixelOffice from "../components/PixelOffice.jsx";
 import PingPongBoard from "../components/PingPongBoard.jsx";
 import ArtifactBoard from "../components/ArtifactBoard.jsx";
@@ -48,6 +48,24 @@ export default function ControlTowerPage() {
   const [handoffLog, setHandoffLog] = useState([]);
   const [isRunningDemo, setIsRunningDemo] = useState(false);
   const [apiError, setApiError] = useState(null);
+
+  // ?handoffDemo=1 (or ?demo=handoff) forces the courier demo loop on
+  // top of whatever the runner is reporting, so an operator can verify
+  // the animation regardless of factory state. Computed once per
+  // mount — toggling the flag requires a navigation, which is fine for
+  // a debug-only switch.
+  const forceDemoHandoff = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const v = params.get("handoffDemo") || params.get("demo");
+      if (!v) return false;
+      const lowered = v.toLowerCase();
+      return lowered === "1" || lowered === "true" || lowered === "handoff";
+    } catch {
+      return false;
+    }
+  }, []);
 
   // AgentRouteLayer hands us {kind, from, to, label, banner, source}
   // each time a non-demo handoff card starts/ends. Convert to an
@@ -265,6 +283,7 @@ export default function ControlTowerPage() {
             factory={factory}
             runners={runners}
             onHandoff={handleHandoff}
+            forceDemoHandoff={forceDemoHandoff}
           />
         </div>
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence } from "framer-motion";
 import AgentDesk from "./AgentDesk.jsx";
 import SpeechBubble from "./SpeechBubble.jsx";
-import AgentRouteLayer from "./AgentRouteLayer.jsx";
+import AgentCourierLayer from "./AgentCourierLayer.jsx";
 import AgentPresenceLayer from "./AgentPresenceLayer.jsx";
 import {
   AGENTS,
@@ -186,6 +186,77 @@ function OfficeRoom() {
   );
 }
 
+// Short-lived highlight that pulses on the receiving desk the instant
+// a HandoffCourier arrives. Renders a colored ring + a "RECEIVED"
+// badge for ~700ms (the parent removes us by clearing arrivedAt).
+function ArrivalHighlight({ x, y, color, label, isDemo }) {
+  return (
+    <div
+      className="pointer-events-none absolute"
+      style={{
+        left: x,
+        top: y,
+        transform: "translate(-50%, -50%)",
+        zIndex: 12,
+      }}
+    >
+      <style>{`
+        @keyframes arrival-ring {
+          0%   { transform: translate(-50%, -50%) scale(0.55); opacity: 0.95; }
+          60%  { transform: translate(-50%, -50%) scale(1.25); opacity: 0.7;  }
+          100% { transform: translate(-50%, -50%) scale(1.55); opacity: 0;    }
+        }
+        @keyframes arrival-badge {
+          0%   { transform: translate(-50%, -50%) scale(0.6); opacity: 0; }
+          25%  { transform: translate(-50%, -50%) scale(1.08); opacity: 1; }
+          75%  { transform: translate(-50%, -50%) scale(1);    opacity: 1; }
+          100% { transform: translate(-50%, -50%) scale(0.9);  opacity: 0; }
+        }
+      `}</style>
+
+      {/* expanding ring */}
+      <div
+        style={{
+          position: "absolute",
+          left: "50%",
+          top: "50%",
+          width: 180,
+          height: 180,
+          borderRadius: "50%",
+          border: `3px solid ${color}`,
+          boxShadow: `0 0 24px ${color}aa, inset 0 0 18px ${color}66`,
+          animation: "arrival-ring 700ms ease-out forwards",
+        }}
+      />
+
+      {/* RECEIVED badge — sits dead center on the desk so the operator's
+          eye snaps right onto the receiver. */}
+      <div
+        style={{
+          position: "absolute",
+          left: "50%",
+          top: "50%",
+          padding: "3px 10px 3px 7px",
+          backgroundColor: color,
+          color: "#0a1228",
+          border: "2px solid #0a1228",
+          borderRadius: 3,
+          fontFamily: "ui-monospace, monospace",
+          fontSize: 10,
+          fontWeight: 800,
+          letterSpacing: "0.18em",
+          whiteSpace: "nowrap",
+          boxShadow: "0 4px 10px rgba(0,0,0,0.5)",
+          animation: "arrival-badge 700ms ease-out forwards",
+        }}
+      >
+        ✓ RECEIVED · {label}
+        {isDemo ? " · DEMO" : ""}
+      </div>
+    </div>
+  );
+}
+
 // Glowing spotlight sphere for the active agent — drawn separately so we
 // can position it in the same coord space as the desks.
 function ActiveSpotlight({ x, y, color }) {
@@ -212,12 +283,17 @@ export default function PixelOffice({
   factory = null,
   runners = [],
   onHandoff = null,
+  forceDemoHandoff = false,
 }) {
   const hostRef = useRef(null);
   const [scale, setScale] = useState(1);
   const [hostWidth, setHostWidth] = useState(0);
   const [routeBanner, setRouteBanner] = useState(null);
   const [isDemoFlow, setIsDemoFlow] = useState(false);
+  // {agentId, label, source, until} — non-null while the receiving
+  // desk should still flash a "RECEIVED" highlight.
+  const [arrivedAt, setArrivedAt] = useState(null);
+  const arriveTimerRef = useRef(null);
 
   useEffect(() => {
     const el = hostRef.current;
@@ -244,6 +320,25 @@ export default function PixelOffice({
 
   const handleBannerChange = useCallback((msg) => setRouteBanner(msg), []);
   const handleDemoChange = useCallback((flag) => setIsDemoFlow(flag), []);
+
+  // 700ms arrival highlight — long enough to register as a "received"
+  // signal without lingering past the courier's fade. Replacing an
+  // earlier highlight (back-to-back handoffs) just resets the timer.
+  const handleArrive = useCallback(({ agentId, label, source }) => {
+    if (!agentId) return;
+    if (arriveTimerRef.current) clearTimeout(arriveTimerRef.current);
+    setArrivedAt({ agentId, label, source });
+    arriveTimerRef.current = setTimeout(() => {
+      setArrivedAt(null);
+      arriveTimerRef.current = null;
+    }, 700);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (arriveTimerRef.current) clearTimeout(arriveTimerRef.current);
+    };
+  }, []);
 
   // Office is "narrow" once the host viewport collapses to phone size.
   // We use the host width here, not window.innerWidth, so the layout
@@ -283,35 +378,52 @@ export default function PixelOffice({
       </div>
 
       {/* live handoff banner — top-center, above the scaled stage so the
-          text stays sharp regardless of office scale. Empty when no
-          card is currently in transit. */}
-      {routeBanner && (
+          text stays sharp regardless of office scale. Stays mounted
+          even between cards when the URL forced the demo flow, so the
+          "DEMO HANDOFF FLOW" tag is always visible while the user is
+          waiting for the next walk. */}
+      {(routeBanner || forceDemoHandoff) && (
         <div
           className="pointer-events-none absolute z-30 flex items-center gap-2 px-3 py-1"
           style={{
             left: "50%",
             top: 12,
             transform: "translateX(-50%)",
-            maxWidth: "min(80%, 520px)",
-            backgroundColor: "#0a1228cc",
-            border: `1px solid ${isDemoFlow ? "#38bdf866" : "#34d39966"}`,
+            maxWidth: "min(86%, 560px)",
+            backgroundColor: "#0a1228e8",
+            border: `1px solid ${
+              isDemoFlow || forceDemoHandoff ? "#38bdf888" : "#34d39988"
+            }`,
             borderRadius: 3,
             fontFamily: "ui-monospace, monospace",
+            boxShadow:
+              isDemoFlow || forceDemoHandoff
+                ? "0 0 12px rgba(56,189,248,0.25)"
+                : "0 0 12px rgba(52,211,153,0.25)",
           }}
         >
           <span
             className="inline-block h-1.5 w-1.5"
-            style={{ backgroundColor: isDemoFlow ? "#38bdf8" : "#34d399" }}
+            style={{
+              backgroundColor:
+                isDemoFlow || forceDemoHandoff ? "#38bdf8" : "#34d399",
+            }}
           />
           <span className="truncate text-[10.5px] tracking-[0.15em] text-[#f5e9d3]">
-            {routeBanner}
+            {routeBanner ||
+              (forceDemoHandoff
+                ? "데모 핸드오프 흐름 — 곧 다음 작업이 전달됩니다."
+                : "")}
           </span>
-          {isDemoFlow && (
+          {(isDemoFlow || forceDemoHandoff) && (
             <span
               className="ml-1 rounded px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.25em] text-sky-300"
-              style={{ border: "1px solid #38bdf855", backgroundColor: "#0a1228" }}
+              style={{
+                border: "1px solid #38bdf888",
+                backgroundColor: "#0a1228",
+              }}
             >
-              DEMO FLOW
+              DEMO HANDOFF FLOW
             </span>
           )}
         </div>
@@ -395,21 +507,37 @@ export default function PixelOffice({
 
           {/* presence layer — small pip + status tag + ambient
               particles per desk. Sits between desks and couriers so
-              moving cards still draw on top of pips. */}
+              the walking courier still draws on top of pips. */}
           <AgentPresenceLayer
             agentStatuses={agentStatuses}
             activeAgentId={activeAgentId}
           />
 
-          {/* moving handoff cards — overlay rendered last so the paper
-              draws on top of desks while in flight. */}
-          <AgentRouteLayer
+          {/* arrival highlight — pulses on the receiving desk for
+              ~700ms when a courier completes its walk. Drawn under
+              the courier so the courier itself stays the focus. */}
+          {arrivedAt?.agentId && DESK_LAYOUT[arrivedAt.agentId] && (
+            <ArrivalHighlight
+              x={DESK_LAYOUT[arrivedAt.agentId].x}
+              y={DESK_LAYOUT[arrivedAt.agentId].y}
+              color={AGENTS[arrivedAt.agentId]?.color || "#34d399"}
+              label={arrivedAt.label}
+              isDemo={arrivedAt.source === "demo"}
+            />
+          )}
+
+          {/* big walking courier — replaces the old paper-only flying
+              card. AgentCourierLayer drives one HandoffCourier at a
+              time with the sender's look + the artifact in hand. */}
+          <AgentCourierLayer
             factory={factory}
             runners={runners}
+            forceDemo={forceDemoHandoff}
+            isMobile={isMobile}
             onBannerChange={handleBannerChange}
             onDemoChange={handleDemoChange}
             onHandoff={onHandoff}
-            isMobile={isMobile}
+            onArrive={handleArrive}
           />
         </div>
       </div>

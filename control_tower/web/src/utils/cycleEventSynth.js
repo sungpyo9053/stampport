@@ -210,9 +210,12 @@ export function makeHandoffEvent({ kind, from, to, label, banner, source }) {
   // between renders (they're event-shaped notifications, not state).
   handoffSeq -= 1;
   const phrase = KIND_TO_PHRASE[kind] || kind;
+  // Demo handoffs get a "[DEMO]" prefix so the operator can tell
+  // apart "AI team really moved this" from "demo loop is rotating".
+  const demoTag = source === "demo" ? "[DEMO] " : "";
   const message = banner
-    ? `${phrase} — ${banner}`
-    : `${phrase} — ${from} → ${to} (${label})`;
+    ? `${demoTag}${phrase} — ${banner}`
+    : `${demoTag}${phrase} — ${from} → ${to} (${label})`;
   return {
     id: handoffSeq,
     type: "agent_message",
@@ -224,6 +227,7 @@ export function makeHandoffEvent({ kind, from, to, label, banner, source }) {
       to,
       label,
       flow_source: source,
+      is_demo: source === "demo",
     },
     created_at: new Date().toISOString(),
     agent_id: null,
