@@ -1,12 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import HeaderStatusBar from "../components/HeaderStatusBar.jsx";
-import AgentOffice from "../components/AgentOffice.jsx";
-import EventFeed from "../components/EventFeed.jsx";
-import TaskBoard from "../components/TaskBoard.jsx";
-import ArtifactPanel from "../components/ArtifactPanel.jsx";
-import FactoryControlPanel from "../components/FactoryControlPanel.jsx";
+import PixelOffice from "../components/PixelOffice.jsx";
+import PingPongBoard from "../components/PingPongBoard.jsx";
+import ArtifactBoard from "../components/ArtifactBoard.jsx";
+import ControlDock from "../components/ControlDock.jsx";
 import PipelineTimeline from "../components/PipelineTimeline.jsx";
-import RunnerPanel from "../components/RunnerPanel.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -19,21 +16,26 @@ import {
 } from "../api/controlTowerApi.js";
 
 const POLL_MS = 1500;
-const FAST_POLL_MS = 800;        // when factory is actively running
-const BUBBLE_TTL_MS = 3200;
+const FAST_POLL_MS = 800;
+const BUBBLE_TTL_MS = 4500;
 
+// Stampport Control Tower — pixel-office layout.
+//
+// The office is the main stage. Pipeline is a thin chip up top,
+// ping-pong and cycle artifacts live as side panels, and a game-style
+// dock floats at the bottom. There is no factory/task/event table on
+// this page — those live inside the office (speech bubbles + artifact
+// board).
 export default function ControlTowerPage() {
   const [agents, setAgents] = useState([]);
-  const [tasks, setTasks] = useState([]);
+  const [, setTasks] = useState([]);
   const [events, setEvents] = useState([]);
   const [factory, setFactory] = useState(null);
   const [factoryEvents, setFactoryEvents] = useState([]);
   const [runners, setRunners] = useState([]);
   const [bubbles, setBubbles] = useState({});
-  const [handoffs, setHandoffs] = useState([]);
   const [isRunningDemo, setIsRunningDemo] = useState(false);
   const [apiError, setApiError] = useState(null);
-  const [showOffice, setShowOffice] = useState(false); // mobile default: collapsed
 
   const lastEventIdRef = useRef(0);
   const initializedRef = useRef(false);
@@ -58,15 +60,6 @@ export default function ControlTowerPage() {
           return next;
         });
       }, BUBBLE_TTL_MS);
-    } else if (
-      ev.type === "handoff" &&
-      ev.payload?.from_agent &&
-      ev.payload?.to_agent
-    ) {
-      setHandoffs((h) => [
-        ...h,
-        { id: ev.id, from: ev.payload.from_agent, to: ev.payload.to_agent },
-      ]);
     }
   }, []);
 
@@ -106,7 +99,6 @@ export default function ControlTowerPage() {
     }
   }, [processNewEvent]);
 
-  // Adaptive polling: fast while running, slow otherwise.
   useEffect(() => {
     tick();
     const interval = factory?.status === "running" ? FAST_POLL_MS : POLL_MS;
@@ -125,10 +117,8 @@ export default function ControlTowerPage() {
     setIsRunningDemo(true);
     try {
       await resetDemo();
-      setTasks([]);
       setEvents([]);
       setBubbles({});
-      setHandoffs([]);
       lastEventIdRef.current = 0;
       Object.values(bubbleTimers.current).forEach(clearTimeout);
       bubbleTimers.current = {};
@@ -143,84 +133,108 @@ export default function ControlTowerPage() {
     }
   };
 
-  const onHandoffDone = (id) => {
-    setHandoffs((h) => h.filter((x) => x.id !== id));
-  };
-
   const agentStatuses = Object.fromEntries(
     agents.map((a) => [a.id, a.status]),
   );
   const activeAgentId = agents.find((a) => a.status === "working")?.id || null;
 
   return (
-    <div className="flex min-h-screen flex-col">
-      <HeaderStatusBar
-        agents={agents}
-        tasks={tasks}
-        events={events}
-        onRunDemo={handleRunDemo}
-        isRunningDemo={isRunningDemo}
-      />
+    <div
+      className="flex min-h-screen flex-col gap-3 p-3 sm:p-4"
+      style={{ backgroundColor: "#050912" }}
+    >
+      {/* Top bar — pixel sign + demo button. Replaces HeaderStatusBar. */}
+      <header
+        className="flex flex-wrap items-center justify-between gap-3 px-3 py-2"
+        style={{
+          backgroundColor: "#0a1228",
+          border: "1.5px solid #0e4a3a",
+          borderRadius: 4,
+          fontFamily: "ui-monospace, monospace",
+        }}
+      >
+        <div className="flex items-center gap-3">
+          <div
+            className="grid h-9 w-9 place-items-center text-base font-bold"
+            style={{
+              backgroundColor: "#d4a843",
+              color: "#0a1228",
+              border: "2px solid #0e4a3a",
+              borderRadius: 3,
+            }}
+          >
+            ST
+          </div>
+          <div className="leading-tight">
+            <div className="text-[12.5px] font-bold tracking-[0.25em] text-[#d4a843]">
+              STAMPPORT CONTROL TOWER
+            </div>
+            <div className="text-[10px] tracking-[0.2em] text-slate-400">
+              스탬포트 · AI 에이전트 오피스
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={handleRunDemo}
+          disabled={isRunningDemo}
+          className="px-3 py-1.5 text-[11px] font-bold tracking-[0.2em] transition disabled:opacity-50"
+          style={{
+            backgroundColor: isRunningDemo ? "#1a2540" : "#0e4a3a",
+            color: isRunningDemo ? "#475569" : "#f5e9d3",
+            border: `1.5px solid ${isRunningDemo ? "#1a2540" : "#d4a843"}`,
+            borderRadius: 3,
+            cursor: isRunningDemo ? "not-allowed" : "pointer",
+            boxShadow: isRunningDemo ? "none" : "0 0 12px #d4a84355",
+          }}
+        >
+          {isRunningDemo ? "데모 실행 중..." : "▶ 데모 실행"}
+        </button>
+      </header>
 
       {apiError && (
-        <div className="border-b border-rose-500/40 bg-rose-500/10 px-4 py-1.5 text-[12px] text-rose-200">
-          ⚠ 컨트롤타워 API 연결 오류: {apiError}.
+        <div
+          className="px-3 py-1.5 text-[11px] tracking-wider"
+          style={{
+            backgroundColor: "#3d0a14",
+            border: "1px solid #8b2e3c",
+            color: "#fecaca",
+            borderRadius: 3,
+            fontFamily: "ui-monospace, monospace",
+          }}
+        >
+          ⚠ 컨트롤타워 API 연결 오류 · {apiError}
         </div>
       )}
 
-      {/* Mobile-first stacked layout. lg+ keeps the office visible. */}
-      <main className="flex flex-1 flex-col gap-3 p-3">
-        {/* Factory control + pipeline + runner — primary on iPhone */}
-        <div className="grid gap-3 lg:grid-cols-3">
-          <div className="lg:col-span-2 space-y-3">
-            <FactoryControlPanel factory={factory} onChanged={tick} />
-            <PipelineTimeline
-              factory={factory}
-              agentStatuses={agentStatuses}
-              factoryEvents={factoryEvents}
-            />
-          </div>
-          <div className="space-y-3">
-            <RunnerPanel runners={runners} onChanged={tick} />
-          </div>
+      {/* Pipeline chip — secondary status only */}
+      <PipelineTimeline
+        factory={factory}
+        agentStatuses={agentStatuses}
+        factoryEvents={factoryEvents}
+      />
+
+      {/* Main: pixel office on the left, ping-pong + artifact stack on the right.
+          On mobile/tablet the side rail collapses below. */}
+      <main className="grid flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <div
+          className="relative"
+          style={{ minHeight: 600 }}
+        >
+          <PixelOffice
+            agentStatuses={agentStatuses}
+            bubbles={bubbles}
+            activeAgentId={activeAgentId}
+          />
         </div>
 
-        {/* Office simulation. Always visible on desktop; collapsible on mobile. */}
-        <section className="rounded-2xl border border-slate-800 bg-slate-950/30">
-          <button
-            type="button"
-            onClick={() => setShowOffice((s) => !s)}
-            className="flex w-full items-center justify-between px-4 py-2 text-[12.5px] tracking-wide text-slate-300 lg:hidden"
-          >
-            <span>오피스 시뮬레이션</span>
-            <span className="text-slate-500">{showOffice ? "접기 ▲" : "펼치기 ▼"}</span>
-          </button>
-          <div
-            className={`${
-              showOffice ? "block" : "hidden"
-            } min-h-[650px] p-3 lg:block`}
-          >
-            <AgentOffice
-              agentStatuses={agentStatuses}
-              bubbles={bubbles}
-              handoffs={handoffs}
-              onHandoffDone={onHandoffDone}
-              activeAgentId={activeAgentId}
-            />
-          </div>
-        </section>
-
-        {/* Secondary panels */}
-        <div className="grid gap-3 md:grid-cols-2">
-          <TaskBoard tasks={tasks} />
-          <ArtifactPanel events={events} />
-        </div>
-
-        {/* Event feed — bottom on mobile, but full width regardless */}
-        <div className="h-[260px] sm:h-[300px]">
-          <EventFeed events={events} />
-        </div>
+        <aside className="flex flex-col gap-3">
+          <PingPongBoard events={events} />
+          <ArtifactBoard events={events} factory={factory} />
+        </aside>
       </main>
+
+      {/* Dock — bottom, full-width, game-style */}
+      <ControlDock factory={factory} runners={runners} onChanged={tick} />
     </div>
   );
 }

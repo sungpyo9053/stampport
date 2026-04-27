@@ -9,10 +9,21 @@ body,
 }
 
 body {
-  @apply bg-slate-950 text-slate-100 font-mono antialiased;
+  @apply text-slate-100 font-mono antialiased;
+  background-color: #050912;
   background-image:
-    radial-gradient(circle at 20% 0%, rgba(56, 189, 248, 0.08), transparent 40%),
-    radial-gradient(circle at 100% 100%, rgba(168, 85, 247, 0.06), transparent 50%);
+    radial-gradient(circle at 20% 0%, rgba(14, 74, 58, 0.18), transparent 40%),
+    radial-gradient(circle at 100% 100%, rgba(212, 168, 67, 0.08), transparent 50%);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.3; }
+  50%      { opacity: 1; }
+}
+
+@keyframes flicker {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
 }
 
 .scrollbar-thin::-webkit-scrollbar {

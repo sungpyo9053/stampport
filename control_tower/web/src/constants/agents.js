@@ -1,6 +1,41 @@
 export const OFFICE_WIDTH = 760;
 export const OFFICE_HEIGHT = 620;
 
+// Pixel-office stage. Bigger than the legacy AgentOffice diorama because
+// the new spatial layout puts every desk in view at once.
+export const PIXEL_OFFICE_WIDTH = 1080;
+export const PIXEL_OFFICE_HEIGHT = 760;
+
+// Desk grid for the pixel office. 3 columns × 3 rows; the bottom-right
+// cell is left empty so the Stampport HQ board can live there.
+//   Row 1 (Planner Lab):  PM | Planner | Designer  (planner ↔ designer ping-pong)
+//   Row 2 (Build Floor):  Frontend | Backend | AI Architect
+//   Row 3 (Ship Floor):   QA | Deploy | (HQ board)
+export const DESK_LAYOUT = {
+  pm:           { x: 200, y: 240, facing: "right" },
+  planner:      { x: 540, y: 240, facing: "right" },
+  designer:     { x: 880, y: 240, facing: "left"  },
+  frontend:     { x: 200, y: 460, facing: "right" },
+  backend:      { x: 540, y: 460, facing: "right" },
+  ai_architect: { x: 880, y: 460, facing: "left"  },
+  qa:           { x: 200, y: 660, facing: "right" },
+  deploy:       { x: 540, y: 660, facing: "right" },
+};
+
+// Default ambient lines shown in each agent's speech bubble when no
+// live `agent_message` event has arrived for them yet. Keeps the office
+// feeling alive even on a fresh page load.
+export const DEFAULT_BUBBLES = {
+  pm:           "이번 사이클 스코프를 정리 중이에요.",
+  planner:      "이번 사이클 후보 3개를 뽑고 있어요.",
+  designer:     "이 배지가 진짜 갖고 싶어 보이는지 검토 중이에요.",
+  frontend:     "스탬프 획득 카드 UI를 구현 중이에요.",
+  backend:      "stamp/badge 스키마를 다듬는 중이에요.",
+  ai_architect: "킥 포인트 추천 룰을 설계 중이에요.",
+  qa:           "수집욕/과시욕/성장욕 게이트를 검증 중이에요.",
+  deploy:       "다음 빌드를 기다리고 있어요.",
+};
+
 // Stampport Lab agent roster.
 //
 // `look` describes how to draw the small SD human:

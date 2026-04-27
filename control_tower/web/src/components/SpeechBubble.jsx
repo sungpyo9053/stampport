@@ -1,37 +1,66 @@
 import { motion } from "framer-motion";
 
-// Floats above the agent's head. The character's head sits roughly at
-// (agent.x, agent.y - 86) inside the office stage, so we anchor the
-// bubble's tail near agent.y - 95.
-export default function SpeechBubble({ agent, message }) {
+// Pixel-style speech balloon. Lives in flow positioning — the parent
+// AgentDesk wrapper places it directly above the avatar's head. Uses
+// hard-edged borders + a small triangle tail to match the pixel office.
+export default function SpeechBubble({ agent, message, idle = false }) {
   return (
     <motion.div
       key={`${agent.id}-${message}`}
-      initial={{ opacity: 0, y: 8, scale: 0.85 }}
+      initial={{ opacity: 0, y: 6, scale: 0.9 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: -6, scale: 0.85 }}
-      transition={{ type: "spring", stiffness: 320, damping: 22 }}
-      className="absolute z-30"
+      exit={{ opacity: 0, y: -4, scale: 0.9 }}
+      transition={{ type: "spring", stiffness: 300, damping: 22 }}
+      className="relative max-w-[200px]"
       style={{
-        left: agent.x,
-        top: agent.y - 95,
-        transform: "translate(-50%, -100%)",
+        backgroundColor: idle ? "#0e1a35" : "#0a1228",
+        border: `1.5px solid ${agent.color}`,
+        boxShadow: idle ? "none" : `0 0 12px ${agent.color}55`,
+        borderRadius: 4,
+        padding: "5px 8px",
+        fontFamily: "ui-monospace, monospace",
       }}
     >
-      <div className="relative max-w-[220px] rounded-xl border border-slate-700 bg-slate-900/95 px-3 py-2 text-[12px] leading-snug text-slate-100 shadow-lg backdrop-blur">
-        <div className="absolute -bottom-1 left-1/2 h-2 w-2 -translate-x-1/2 rotate-45 border-b border-r border-slate-700 bg-slate-900/95" />
-        <div
-          className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider"
-          style={{ color: agent.color }}
-        >
-          <span
-            className="inline-block h-1.5 w-1.5 rounded-full"
-            style={{ backgroundColor: agent.color }}
-          />
-          <span>{agent.name}</span>
-        </div>
-        <div className="mt-1 text-slate-200">{message}</div>
+      <div
+        className="text-[9px] font-bold uppercase tracking-widest"
+        style={{ color: agent.color }}
+      >
+        {agent.name}
       </div>
+      <div
+        className="mt-0.5 text-[11px] leading-snug"
+        style={{ color: idle ? "#94a3b8" : "#f5e9d3" }}
+      >
+        {message}
+      </div>
+
+      {/* tail — pixel triangle pointing down */}
+      <div
+        className="absolute"
+        style={{
+          left: "50%",
+          bottom: -6,
+          transform: "translateX(-50%)",
+          width: 0,
+          height: 0,
+          borderLeft: "5px solid transparent",
+          borderRight: "5px solid transparent",
+          borderTop: `6px solid ${agent.color}`,
+        }}
+      />
+      <div
+        className="absolute"
+        style={{
+          left: "50%",
+          bottom: -3,
+          transform: "translateX(-50%)",
+          width: 0,
+          height: 0,
+          borderLeft: "4px solid transparent",
+          borderRight: "4px solid transparent",
+          borderTop: `5px solid ${idle ? "#0e1a35" : "#0a1228"}`,
+        }}
+      />
     </motion.div>
   );
 }
