@@ -29,6 +29,84 @@ function _deployGuardActive() {
   return true;
 }
 
+// Local "queued" flag — tracks the brief gap between "user clicked
+// 배포" and "runner heartbeat reports command_received". Module-scoped
+// so it survives StrictMode's dev double-mount. Capped at 30s so we
+// don't get stuck if the runner went offline between the click and
+// the next poll.
+const DEPLOY_QUEUED_MS = 30_000;
+let _deployQueuedSince = 0;
+function _deployQueuedActive() {
+  if (!_deployQueuedSince) return false;
+  if (Date.now() - _deployQueuedSince > DEPLOY_QUEUED_MS) {
+    _deployQueuedSince = 0;
+    return false;
+  }
+  return true;
+}
+
+// Statuses considered "deploy is currently moving" — when any of
+// these are present, the button must stay disabled regardless of
+// runner.current_command (which clears the moment the handler returns
+// even though GitHub Actions is still building).
+const DEPLOY_INFLIGHT_STATUSES = new Set([
+  "queued",
+  "command_received",
+  "validating",
+  "committing",
+  "pushing",
+]);
+
+// Stepper definition. Order matters — the panel walks left to right
+// and marks each step pending / running / success / failed based on
+// the current deploy_progress.status (mapped through STATUS_TO_INDEX).
+const DEPLOY_STEPS = [
+  { key: "queued",            label: "배포 요청 전송" },
+  { key: "command_received",  label: "Runner 명령 수신" },
+  { key: "validating",        label: "검증 (Safety Gate / QA)" },
+  { key: "committing",        label: "git commit" },
+  { key: "pushing",           label: "git push origin main" },
+  { key: "actions_triggered", label: "GitHub Actions 트리거" },
+  { key: "deploying",         label: "서버 배포" },
+  { key: "completed",         label: "배포 완료" },
+];
+const STATUS_TO_INDEX = Object.fromEntries(
+  DEPLOY_STEPS.map((s, i) => [s.key, i]),
+);
+
+function _stepIndex(status) {
+  if (status == null) return -1;
+  if (status === "idle") return -1;
+  if (status === "failed") return -1;
+  return STATUS_TO_INDEX[status] ?? -1;
+}
+
+// Resolve the effective deploy status the stepper should render,
+// folding in two FE-only refinements:
+//   1. The user has just clicked but no heartbeat has confirmed
+//      command_received yet → show "queued".
+//   2. The runner reports actions_triggered but the 5-min Actions
+//      window has expired → optimistically display "completed".
+function computeDeployDisplay({ progress, queuedLocally, actionsInFlight }) {
+  const raw = progress?.status || "idle";
+  if (raw === "failed") {
+    return { effective: "failed", failedAtIdx: _stepIndex(progress?.failed_at_status) };
+  }
+  if (raw === "actions_triggered") {
+    return {
+      effective: actionsInFlight ? "deploying" : "completed",
+      failedAtIdx: -1,
+    };
+  }
+  if (
+    queuedLocally &&
+    (raw === "idle" || raw === "completed")
+  ) {
+    return { effective: "queued", failedAtIdx: -1 };
+  }
+  return { effective: raw, failedAtIdx: -1 };
+}
+
 // Window during which we treat a successful local push as "GitHub
 // Actions deploy is still running" — long enough to cover the SSH
 // build + healthcheck pass on the server, short enough to clear out
@@ -39,11 +117,13 @@ const ACTIONS_INFLIGHT_MS = 5 * 60_000;
 // metadata. Returns the enabled flag, button label, and a short reason
 // string for the disabled case so both the button and the explanation
 // strip render off the same source of truth.
-function computeDeployState({ runner, busy, guardActive }) {
+function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
   const lf = runner?.metadata_json?.local_factory || {};
   const publish = lf.publish || {};
   const blocker = lf.publish_blocker || {};
   const qa = lf.qa_gate || {};
+  const progress = publish.deploy_progress || null;
+  const progressStatus = progress?.status || "idle";
   const changedCount = publish.changed_count ?? 0;
   const dryRun = publish.dry_run !== false;
   const blocked = blocker.blocked === true;
@@ -71,10 +151,14 @@ function computeDeployState({ runner, busy, guardActive }) {
   let reason = "";
   let label = dryRun ? "배포 예행연습" : "배포";
 
-  if (busy === "deploy" || guardActive) {
+  if (busy === "deploy" || guardActive || queuedLocally) {
     enabled = false;
     label = "배포 중";
     reason = "배포 명령 진행 중";
+  } else if (DEPLOY_INFLIGHT_STATUSES.has(progressStatus)) {
+    enabled = false;
+    label = "배포 중";
+    reason = "배포 진행 중 — 단계: " + (progress?.current_step || progressStatus);
   } else if (!runner) {
     enabled = false;
     reason = "러너 오프라인";
@@ -87,9 +171,9 @@ function computeDeployState({ runner, busy, guardActive }) {
   } else if (qaFailed) {
     enabled = false;
     reason = "QA 실패";
-  } else if (actionsInFlight) {
+  } else if (actionsInFlight || progressStatus === "actions_triggered") {
     enabled = false;
-    reason = "배포 진행 중";
+    reason = "GitHub Actions 배포 진행 중";
   } else if (changedCount === 0) {
     enabled = false;
     reason = "배포할 변경 없음";
@@ -106,6 +190,9 @@ function computeDeployState({ runner, busy, guardActive }) {
     publish,
     blocker,
     qa,
+    progress,
+    progressStatus,
+    queuedLocally,
   };
 }
 
@@ -121,6 +208,232 @@ const QA_TAG = {
   failed:  { text: "실패", color: "#f87171" },
   skipped: { text: "스킵", color: "#94a3b8" },
 };
+
+// "배포 진행" stepper. Renders the 8 progressive steps from idle →
+// completed (or failed) so the user can see exactly where the deploy
+// is mid-flight without watching server logs. The panel is hidden
+// while progress is plain "idle" with no history — there's nothing
+// to show until the first deploy click.
+const STEP_STATE_COLOR = {
+  pending: "#475569",
+  running: "#fbbf24",
+  success: "#34d399",
+  failed:  "#f87171",
+};
+
+function _stepState({ index, currentIdx, effective, failedAtIdx }) {
+  if (effective === "failed") {
+    if (index < failedAtIdx) return "success";
+    if (index === failedAtIdx) return "failed";
+    return "pending";
+  }
+  if (effective === "completed") {
+    return index <= STATUS_TO_INDEX.completed ? "success" : "pending";
+  }
+  if (currentIdx < 0) return "pending";
+  if (index < currentIdx) return "success";
+  if (index === currentIdx) return "running";
+  return "pending";
+}
+
+function _formatLogTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function DeployProgressPanel({ deployState, queuedLocally }) {
+  const { progress, actionsInFlight } = deployState;
+  const { effective, failedAtIdx } = computeDeployDisplay({
+    progress,
+    queuedLocally,
+    actionsInFlight,
+  });
+
+  // Hide the panel entirely when there's no signal to show — nothing
+  // ever queued, runner reports a fresh idle progress block, no
+  // history. Once the first deploy fires, the panel stays visible so
+  // the last-completed/last-failed state is always there for context.
+  const hasSignal =
+    queuedLocally ||
+    (progress && progress.status && progress.status !== "idle") ||
+    (progress?.history && progress.history.length > 0);
+  if (!hasSignal) return null;
+
+  // Drive the stepper from `effective` so "actions_triggered" can be
+  // collapsed into "deploying" or "completed" depending on the 5-min
+  // Actions window (computeDeployDisplay handles that).
+  let currentIdx;
+  if (effective === "deploying") {
+    currentIdx = STATUS_TO_INDEX.deploying;
+  } else if (effective === "completed") {
+    currentIdx = STATUS_TO_INDEX.completed;
+  } else if (effective === "failed") {
+    currentIdx = -1;
+  } else {
+    currentIdx = STATUS_TO_INDEX[effective] ?? -1;
+  }
+
+  const history = (progress?.history || []).slice(-8).reverse();
+  const failedReason = progress?.failed_reason;
+  const startedAt = progress?.started_at;
+  const updatedAt = progress?.updated_at;
+  const completedAt = progress?.completed_at;
+
+  return (
+    <div
+      className="grid gap-2 px-1 pt-1"
+      style={{
+        borderTop: "1px solid #1a2540",
+      }}
+    >
+      <div className="flex flex-wrap items-center gap-2 text-[10px] tracking-[0.25em] text-[#d4a843]">
+        <span className="font-bold">▶ 배포 진행</span>
+        <span className="text-slate-500">·</span>
+        <span
+          className="text-[10px] font-bold"
+          style={{
+            color:
+              effective === "failed"
+                ? STEP_STATE_COLOR.failed
+                : effective === "completed"
+                  ? STEP_STATE_COLOR.success
+                  : "#fbbf24",
+          }}
+        >
+          {effective === "failed"
+            ? "실패"
+            : effective === "completed"
+              ? "완료"
+              : effective === "queued"
+                ? "요청 전송됨"
+                : effective === "deploying"
+                  ? "GitHub Actions 진행 중"
+                  : "진행 중"}
+        </span>
+        {progress?.current_step && effective !== "completed" && (
+          <span className="text-[10px] text-slate-400">
+            · {progress.current_step}
+          </span>
+        )}
+      </div>
+
+      {/* Stepper row */}
+      <div className="flex flex-wrap items-stretch gap-1">
+        {DEPLOY_STEPS.map((step, idx) => {
+          const state = _stepState({
+            index: idx,
+            currentIdx,
+            effective,
+            failedAtIdx,
+          });
+          const color = STEP_STATE_COLOR[state];
+          return (
+            <div
+              key={step.key}
+              className="flex min-w-[88px] flex-1 flex-col items-start gap-0.5 px-1.5 py-1"
+              style={{
+                backgroundColor:
+                  state === "running" ? "rgba(251, 191, 36, 0.08)" : "#0a1228",
+                border: `1px solid ${color}`,
+                borderRadius: 3,
+                fontFamily: "ui-monospace, monospace",
+              }}
+              title={`${step.label} · ${state}`}
+            >
+              <div
+                className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider"
+                style={{ color }}
+              >
+                <span
+                  className="inline-block h-1.5 w-1.5"
+                  style={{
+                    backgroundColor: color,
+                    borderRadius: state === "running" ? "50%" : 0,
+                    animation:
+                      state === "running" ? "pulse 1s infinite" : "none",
+                  }}
+                />
+                {String(idx + 1).padStart(2, "0")}
+              </div>
+              <div className="text-[10px] tracking-wider text-slate-200">
+                {step.label}
+              </div>
+              <div
+                className="text-[9px] tracking-wider"
+                style={{ color }}
+              >
+                {state === "pending"
+                  ? "대기"
+                  : state === "running"
+                    ? "진행 중"
+                    : state === "success"
+                      ? "완료"
+                      : "실패"}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Timestamps + failure detail */}
+      <div className="flex flex-wrap gap-x-3 text-[10px] text-slate-500">
+        {startedAt && <span>시작 · {_formatLogTime(startedAt)}</span>}
+        {updatedAt && <span>업데이트 · {_formatLogTime(updatedAt)}</span>}
+        {completedAt && <span>종료 · {_formatLogTime(completedAt)}</span>}
+        {effective !== "completed" &&
+          effective !== "failed" &&
+          progress?.actions_url && (
+            <a
+              href={progress.actions_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sky-400 hover:text-sky-300"
+            >
+              ▶ Actions에서 워크플로 보기
+            </a>
+          )}
+      </div>
+
+      {effective === "failed" && failedReason && (
+        <div
+          className="rounded px-2 py-1 text-[10px] tracking-wider"
+          style={{
+            backgroundColor: "#3d0a14",
+            border: "1px solid #8b2e3c",
+            color: "#fecaca",
+          }}
+        >
+          ⚠ {failedReason}
+        </div>
+      )}
+
+      {/* Recent transitions, newest first. Acts as a lightweight
+          system-log without needing a separate panel. */}
+      {history.length > 0 && (
+        <div
+          className="grid gap-0.5 rounded px-2 py-1 text-[10px] text-slate-300"
+          style={{ backgroundColor: "#0a1228", border: "1px solid #1a2540" }}
+        >
+          {history.map((h, i) => (
+            <div
+              key={`${h.at}-${i}`}
+              className="flex flex-wrap items-baseline gap-2"
+            >
+              <span className="text-slate-500">[{_formatLogTime(h.at)}]</span>
+              <span className="text-slate-400">{h.status}</span>
+              <span className="text-slate-200">· {h.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function DeployInfoStrip({ deployState }) {
   const { publish, blocker, qa, dryRun, changedCount, enabled, reason } = deployState;
@@ -440,10 +753,21 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
   };
 
   const deployGuardActive = _deployGuardActive();
+  // Clear the FE-only "queued" flag once the runner heartbeat reports
+  // any post-click status — command_received or deeper. After that,
+  // the stepper drives off real runner state.
+  const _hbStatus =
+    heartbeatRunner?.metadata_json?.local_factory?.publish?.deploy_progress
+      ?.status || "idle";
+  if (_deployQueuedActive() && _hbStatus !== "idle" && _hbStatus !== "queued") {
+    _deployQueuedSince = 0;
+  }
+  const queuedLocally = _deployQueuedActive();
   const deployState = computeDeployState({
     runner: heartbeatRunner,
     busy,
     guardActive: deployGuardActive,
+    queuedLocally,
   });
 
   // Deploy is special — it has a *module-level* guard so rapid
@@ -452,9 +776,16 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
   // local component `busy` is also set so the button greys out
   // visually.
   const onDeployClick = async () => {
-    if (busy) return;
-    if (_deployGuardActive()) {
-      alert("이미 배포가 진행 중입니다. 잠시 후 다시 시도하세요.");
+    if (busy) {
+      alert("배포가 이미 진행 중입니다. 완료 후 다시 시도하세요.");
+      return;
+    }
+    if (_deployGuardActive() || _deployQueuedActive()) {
+      alert("배포가 이미 진행 중입니다. 완료 후 다시 시도하세요.");
+      return;
+    }
+    if (DEPLOY_INFLIGHT_STATUSES.has(deployState.progressStatus)) {
+      alert("배포가 이미 진행 중입니다. 완료 후 다시 시도하세요.");
       return;
     }
     if (!runnerId) return;
@@ -464,6 +795,10 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
     if (!deployState.enabled) return;
     setBusy("deploy");
     _deployInflightSince = Date.now();
+    // Flip "queued" immediately so the stepper lights up step 01
+    // before the next heartbeat lands. Cleared above once the runner
+    // confirms command_received or deeper.
+    _deployQueuedSince = Date.now();
     // Refresh the disabled state every 2s so the lockout reflects the
     // module-level timeout in the UI even if no other state changes.
     if (deployTimerRef.current) clearInterval(deployTimerRef.current);
@@ -655,6 +990,11 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
       </div>
 
       <DeployInfoStrip deployState={deployState} />
+
+      <DeployProgressPanel
+        deployState={deployState}
+        queuedLocally={queuedLocally}
+      />
 
       {factory?.last_message && (
         <div className="px-1 text-[10.5px] tracking-wider text-slate-400">
