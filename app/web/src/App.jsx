@@ -1,122 +1,97 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useEffect } from 'react';
+import './App.css';
+import Header from './components/Header.jsx';
+import TabBar from './components/TabBar.jsx';
+import Landing from './screens/Landing.jsx';
+import Login from './screens/Login.jsx';
+import StampForm from './screens/StampForm.jsx';
+import StampResult from './screens/StampResult.jsx';
+import MyPassport from './screens/MyPassport.jsx';
+import Badges from './screens/Badges.jsx';
+import Quests from './screens/Quests.jsx';
+import Share from './screens/Share.jsx';
+import { useApp } from './context/appContext.js';
+import { useHashRoute } from './utils/router.js';
 
-function App() {
-  const [count, setCount] = useState(0)
+const PROTECTED_PREFIXES = ['/stamp', '/result', '/passport', '/badges', '/quests', '/share'];
 
-  return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+function isProtected(path) {
+  return PROTECTED_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`));
 }
 
-export default App
+function pickRoute(path) {
+  if (path === '/' || path === '/landing' || path === '') {
+    return { name: 'landing' };
+  }
+  if (path === '/login') return { name: 'login' };
+  if (path === '/stamp') return { name: 'stamp' };
+  if (path.startsWith('/result/')) {
+    return { name: 'result', stampId: path.slice('/result/'.length) };
+  }
+  if (path === '/passport') return { name: 'passport' };
+  if (path === '/badges') return { name: 'badges' };
+  if (path === '/quests') return { name: 'quests' };
+  if (path.startsWith('/share/')) {
+    return { name: 'share', stampId: path.slice('/share/'.length) };
+  }
+  return { name: 'landing' };
+}
+
+const HIDE_TABBAR = new Set(['landing', 'login', 'result', 'share']);
+
+export default function App() {
+  const { user } = useApp();
+  const { path, navigate } = useHashRoute();
+
+  useEffect(() => {
+    if (!user && isProtected(path)) {
+      navigate('/login', { replace: true });
+    }
+    if (user && (path === '/' || path === '' || path === '/landing')) {
+      navigate('/passport', { replace: true });
+    }
+  }, [user, path, navigate]);
+
+  const route = pickRoute(path);
+
+  let screen;
+  switch (route.name) {
+    case 'landing':
+      screen = <Landing navigate={navigate} />;
+      break;
+    case 'login':
+      screen = <Login navigate={navigate} />;
+      break;
+    case 'stamp':
+      screen = user ? <StampForm navigate={navigate} /> : null;
+      break;
+    case 'result':
+      screen = user ? <StampResult navigate={navigate} stampId={route.stampId} /> : null;
+      break;
+    case 'passport':
+      screen = user ? <MyPassport navigate={navigate} /> : null;
+      break;
+    case 'badges':
+      screen = user ? <Badges navigate={navigate} /> : null;
+      break;
+    case 'quests':
+      screen = user ? <Quests navigate={navigate} /> : null;
+      break;
+    case 'share':
+      screen = user ? <Share navigate={navigate} stampId={route.stampId} /> : null;
+      break;
+    default:
+      screen = <Landing navigate={navigate} />;
+  }
+
+  const showTabBar = user && !HIDE_TABBAR.has(route.name);
+  const fullBleed = route.name === 'landing' || route.name === 'login';
+
+  return (
+    <div className="app-shell">
+      <Header navigate={navigate} />
+      {fullBleed ? screen : <main className="app-main">{screen}</main>}
+      {showTabBar ? <TabBar path={path} navigate={navigate} /> : null}
+    </div>
+  );
+}
