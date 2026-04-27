@@ -29,6 +29,207 @@ function _deployGuardActive() {
   return true;
 }
 
+// Window during which we treat a successful local push as "GitHub
+// Actions deploy is still running" — long enough to cover the SSH
+// build + healthcheck pass on the server, short enough to clear out
+// once the workflow has actually finished.
+const ACTIONS_INFLIGHT_MS = 5 * 60_000;
+
+// Compute the deploy button's visible state from runner heartbeat
+// metadata. Returns the enabled flag, button label, and a short reason
+// string for the disabled case so both the button and the explanation
+// strip render off the same source of truth.
+function computeDeployState({ runner, busy, guardActive }) {
+  const lf = runner?.metadata_json?.local_factory || {};
+  const publish = lf.publish || {};
+  const blocker = lf.publish_blocker || {};
+  const qa = lf.qa_gate || {};
+  const changedCount = publish.changed_count ?? 0;
+  const dryRun = publish.dry_run !== false;
+  const blocked = blocker.blocked === true;
+  const qaFailed = qa.status === "failed";
+  const currentCommand = runner?.current_command || null;
+  const runnerBusy = runner?.status === "busy";
+  const lastPushStatus = publish.last_push_status;
+  const lastPushAt = publish.last_push_at;
+
+  // GitHub Actions in-flight heuristic: a real (non-dry-run) push
+  // succeeded recently and the working tree is clean → the workflow
+  // dispatched on the GitHub side is most likely still running.
+  let actionsInFlight = false;
+  if (lastPushStatus === "succeeded" && lastPushAt && changedCount === 0) {
+    const t = Date.parse(lastPushAt);
+    if (!Number.isNaN(t) && Date.now() - t < ACTIONS_INFLIGHT_MS) {
+      actionsInFlight = true;
+    }
+  }
+
+  // First-match wins. Order matches the user-facing priority — the
+  // local in-flight click guard outranks server state because it
+  // reflects "we just sent the command, server hasn't echoed yet".
+  let enabled = true;
+  let reason = "";
+  let label = dryRun ? "배포 예행연습" : "배포";
+
+  if (busy === "deploy" || guardActive) {
+    enabled = false;
+    label = "배포 중";
+    reason = "배포 명령 진행 중";
+  } else if (!runner) {
+    enabled = false;
+    reason = "러너 오프라인";
+  } else if (currentCommand || runnerBusy) {
+    enabled = false;
+    reason = "명령 실행 중";
+  } else if (blocked) {
+    enabled = false;
+    reason = "Release Safety Gate 차단";
+  } else if (qaFailed) {
+    enabled = false;
+    reason = "QA 실패";
+  } else if (actionsInFlight) {
+    enabled = false;
+    reason = "배포 진행 중";
+  } else if (changedCount === 0) {
+    enabled = false;
+    reason = "배포할 변경 없음";
+  }
+
+  return {
+    enabled,
+    label,
+    reason,
+    dryRun,
+    actionsInFlight,
+    changedCount,
+    currentCommand,
+    publish,
+    blocker,
+    qa,
+  };
+}
+
+const SAFETY_TAG = {
+  clean:   { text: "통과",                color: "#34d399" },
+  warning: { text: "경고 있음, 배포 가능", color: "#fbbf24" },
+  blocked: { text: "차단",                color: "#f87171" },
+};
+
+const QA_TAG = {
+  passed:  { text: "통과", color: "#34d399" },
+  warned:  { text: "경고", color: "#fbbf24" },
+  failed:  { text: "실패", color: "#f87171" },
+  skipped: { text: "스킵", color: "#94a3b8" },
+};
+
+function DeployInfoStrip({ deployState }) {
+  const { publish, blocker, qa, dryRun, changedCount, enabled, reason } = deployState;
+  const blockerStatus = blocker.status || "clean";
+  const qaStatus = qa.status || "skipped";
+  const safety = SAFETY_TAG[blockerStatus] || { text: blockerStatus, color: "#94a3b8" };
+  const qaTag = QA_TAG[qaStatus] || { text: qaStatus, color: "#94a3b8" };
+  const warningReasons = (blocker.warning_reasons || []).slice(0, 2);
+  const changedFiles = publish.changed_files || [];
+  const lastMessage = publish.last_publish_message;
+  const actionsUrl = publish.actions_url;
+
+  const hasAnything =
+    changedCount > 0 ||
+    publish.last_push_status ||
+    blocker.status ||
+    qa.status ||
+    actionsUrl ||
+    lastMessage;
+  if (!hasAnything) return null;
+
+  return (
+    <div className="grid gap-1 px-1 text-[10.5px] tracking-wider">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
+        <span>
+          변경 <span className="text-slate-200">{changedCount}개</span>
+        </span>
+        <span>
+          안전게이트 ·{" "}
+          <span style={{ color: safety.color }}>{safety.text}</span>
+        </span>
+        <span>
+          QA · <span style={{ color: qaTag.color }}>{qaTag.text}</span>
+        </span>
+        {dryRun && (
+          <span
+            className="rounded px-1.5 py-0.5 text-[9.5px] uppercase"
+            style={{
+              backgroundColor: "rgba(56, 189, 248, 0.15)",
+              color: "#7dd3fc",
+              border: "1px solid #38bdf855",
+            }}
+          >
+            DRY-RUN
+          </span>
+        )}
+        {actionsUrl && (
+          <a
+            href={actionsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sky-400 hover:text-sky-300"
+          >
+            ▶ Actions에서 배포 보기
+          </a>
+        )}
+      </div>
+
+      {warningReasons.length > 0 && (
+        <div className="text-[10px] text-amber-300/90">
+          ⚠ {warningReasons.join(" · ")}
+        </div>
+      )}
+
+      {changedFiles.length > 0 && (
+        <div className="line-clamp-2 text-[10px] text-slate-300">
+          {changedFiles.slice(0, 8).map((p, i) => (
+            <span key={p}>
+              {i > 0 && ", "}
+              <code
+                className="rounded px-1 text-slate-200"
+                style={{ backgroundColor: "#0a1228" }}
+              >
+                {p}
+              </code>
+            </span>
+          ))}
+          {changedFiles.length > 8 && (
+            <span className="text-slate-500">
+              {" "}
+              · 외 {changedFiles.length - 8}개
+            </span>
+          )}
+        </div>
+      )}
+
+      {lastMessage && (
+        <div className="line-clamp-2 text-[10px] text-slate-500">
+          마지막 메시지 · {lastMessage}
+        </div>
+      )}
+
+      {/* Manual redeploy slot — placeholder only. workflow_dispatch
+          API call lands in a follow-up PR. */}
+      {changedCount === 0 && (
+        <div className="text-[10px] text-slate-500">
+          수동 재배포 (예정) · 재배포는 Actions 수동 실행으로 가능
+        </div>
+      )}
+
+      {!enabled && reason && (
+        <div className="text-[10px] tracking-wider text-amber-300">
+          ▸ 배포 비활성: {reason}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Game-style control dock. Floats at the bottom of the office. Each
 // command is a square pixel button with a pictogram and a label that
 // fades in on hover. Big gray button rows are intentionally avoided.
@@ -205,6 +406,13 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
 
   const onlineRunner = runners.find((r) => r.status === "online");
   const runnerId = onlineRunner?.id;
+  // For the deploy info strip we want to read metadata from any
+  // runner whose heartbeat is still alive — including a `busy` one
+  // mid-publish — so the dashboard keeps showing publish/qa state
+  // while a command is in flight. The deploy *click* still requires
+  // an idle online runner.
+  const heartbeatRunner =
+    onlineRunner || runners.find((r) => r.status !== "offline") || null;
 
   // Clear any outstanding deploy guard timer when this dock unmounts
   // so we don't tick a stale setState.
@@ -231,6 +439,13 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
     }
   };
 
+  const deployGuardActive = _deployGuardActive();
+  const deployState = computeDeployState({
+    runner: heartbeatRunner,
+    busy,
+    guardActive: deployGuardActive,
+  });
+
   // Deploy is special — it has a *module-level* guard so rapid
   // remounts (StrictMode dev double-mount, or a panel re-render mid
   // click) cannot enqueue a second deploy_to_server command. The
@@ -243,6 +458,10 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
       return;
     }
     if (!runnerId) return;
+    // Belt-and-braces: even if the button somehow stays clickable
+    // (race between heartbeat polls), refuse to enqueue when the
+    // computed gate says we shouldn't.
+    if (!deployState.enabled) return;
     setBusy("deploy");
     _deployInflightSince = Date.now();
     // Refresh the disabled state every 2s so the lockout reflects the
@@ -272,8 +491,6 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
       setDeployTick((n) => n + 1);
     }
   };
-  const deployGuardActive = _deployGuardActive();
-
   const canStart = ["idle", "stopped", "completed", "failed"].includes(status);
   const canPause = status === "running";
   const canResume = status === "paused";
@@ -421,20 +638,23 @@ export default function ControlDock({ factory, runners = [], onChanged }) {
           />
           <DockButton
             icon="deploy"
-            label={busy === "deploy" || deployGuardActive ? "배포 중" : "배포"}
+            label={deployState.label}
             tone="success"
-            disabled={!runnerId || !!busy || deployGuardActive}
+            disabled={!runnerId || !!busy || !deployState.enabled}
             busy={busy === "deploy" || deployGuardActive}
             title={
-              noRunnerNote ||
-              (deployGuardActive
-                ? "이미 배포가 진행 중입니다 — 완료 후 다시 시도"
-                : "서버 배포 (publish + SSH 빌드 + 헬스체크)")
+              deployState.enabled
+                ? deployState.dryRun
+                  ? "배포 예행연습 (dry-run · 실제 push 없이 검증)"
+                  : "서버 배포 (publish + SSH 빌드 + 헬스체크)"
+                : `배포 비활성: ${deployState.reason || "조건 미충족"}`
             }
             onClick={onDeployClick}
           />
         </div>
       </div>
+
+      <DeployInfoStrip deployState={deployState} />
 
       {factory?.last_message && (
         <div className="px-1 text-[10.5px] tracking-wider text-slate-400">
