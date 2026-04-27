@@ -1247,44 +1247,70 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
             _record_failure("qa_gate", blocked_msg)
             return False, f"publish failed at qa_gate: {blocked_msg}"
         else:
-            # missing / skipped / stale → run on-demand
+            # missing / skipped / stale → run on-demand QA Gate. Run
+            # only the validations relevant to what actually changed
+            # (npm build for the touched web tree, py_compile for the
+            # touched python area) so a docs-only deploy doesn't pay
+            # for a 60-second full revalidate.
             _progress(
                 "validating",
-                step="QA Gate 미실행 → 즉시 실행 중",
+                step="QA Gate 미실행 — 즉시 검증 중",
                 log_message=(
-                    f"QA Gate missing — running on-demand "
+                    f"QA Gate missing — 즉시 검증 시작 "
                     f"({qa_kind}: {qa_reason})."
                 ),
             )
+            plan = _qa_targeted_command_plan(allowed)
+            plan_summary = ", ".join(s["label"] for s in plan) or "screen/flow/domain only"
             _progress(
                 "validating",
-                step="QA Gate started (on-demand)",
-                log_message=(
-                    "QA Gate started: build_artifact / api_health / "
-                    "screen_presence / flow_presence / domain_profile."
-                ),
+                step="QA Gate started — 검증 명령 실행 중",
+                log_message=f"QA Gate started: {plan_summary}",
             )
-            ok, ondemand_msg, qa_dict = _run_on_demand_qa_gate()
+            ok, ondemand_msg, qa_dict, step_results = _run_targeted_qa_gate(allowed)
             revalidate_already_ran = True
             if ok:
                 qa_msg = ondemand_msg
                 _progress(
                     "validating",
-                    step="QA Gate passed → publish continued",
+                    step="검증 통과 — commit 단계로 진행",
                     log_message=(
-                        f"QA Gate passed (on-demand). publish continued. "
-                        f"{ondemand_msg}"
+                        f"QA Gate passed → publish continued — "
+                        f"{ondemand_msg or 'all targeted checks ok'}"
                     ),
                 )
             else:
+                # Build failure detail from BOTH the structured QA
+                # categories AND the targeted step that actually
+                # tripped — operators want to see the exact command
+                # and the stderr tail, not just a category name.
+                failed_step = next(
+                    (r for r in step_results if not r["ok"]),
+                    None,
+                )
                 detail = _format_qa_failure_detail(qa_dict, ondemand_msg)
                 cats_text = ", ".join(detail["categories"]) or "unknown"
+                cmd_text = (
+                    failed_step["command"] if failed_step else "(stage_qa_gate)"
+                )
+                cwd_text = (
+                    failed_step["cwd"] if failed_step and failed_step.get("cwd")
+                    else str(REPO_ROOT)
+                )
+                stderr_text = (
+                    failed_step["stderr_tail"] if failed_step
+                    else (detail["reason"] or "")
+                )
                 file_text = detail["file"] or "(파일 미식별)"
                 failure_lines = [
-                    "QA Gate failed (on-demand) → publish blocked",
+                    "QA Gate failed → publish blocked",
+                    f"실패 단계: qa_gate ({failed_step['key'] if failed_step else 'stage_qa_gate'})",
+                    f"실패 명령: {cmd_text}",
+                    f"실행 위치: {cwd_text}",
                     f"실패 카테고리: {cats_text}",
                     f"실패 파일: {file_text}",
-                    f"이유: {detail['reason']}",
+                    "stderr tail:",
+                    (stderr_text or "(no stderr captured)"),
                     f"권장 조치: {detail['suggested_action']}",
                 ]
                 failed_msg = "\n".join(failure_lines)
@@ -1294,8 +1320,8 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                     failed_reason=failed_msg[:280],
                     log_message=failed_msg,
                 )
-                _record_failure("qa_gate", failed_msg[:600])
-                return False, f"publish failed at qa_gate: {failed_msg[:600]}"
+                _record_failure("qa_gate", failed_msg[:1200])
+                return False, f"publish failed at qa_gate: {failed_msg[:1200]}"
 
     # 5. Re-run the correctness gate before we touch git history.
     # Skipped when an on-demand QA Gate already executed the same
