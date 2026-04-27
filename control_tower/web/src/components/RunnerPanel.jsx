@@ -203,9 +203,14 @@ function PublishBlockerRow({ factory }) {
   const autoRestored = blocker.auto_restored_count ?? 0;
   const autoDeleted = blocker.auto_deleted_count ?? 0;
   const allowedCode = blocker.allowed_code_count ?? 0;
-  const manualReq = blocker.manual_required_count ?? 0;
+  // manual_required is now the *warning* bucket — counts as "주의
+  // 깊게 보면 좋은" change, not a blocker.
+  const warningCount = blocker.manual_required_count ?? 0;
   const hardRisky = blocker.hard_risky_count ?? 0;
-  const manualFiles = blocker.manual_required_files || [];
+  const conflictMarkers = blocker.conflict_markers || [];
+  const conflictCount = conflictMarkers.length;
+  const warningReasons = blocker.warning_reasons || [];
+  const warningFiles = blocker.manual_required_files || [];
   const hardRiskyBn = blocker.hard_risky_basenames || [];
   const autoRestoredFiles = blocker.auto_restored_files || [];
   const autoDeletedFiles = blocker.auto_deleted_files || [];
@@ -225,19 +230,27 @@ function PublishBlockerRow({ factory }) {
     autoRestored === 0 &&
     autoDeleted === 0 &&
     allowedCode === 0 &&
-    manualReq === 0 &&
+    warningCount === 0 &&
+    warningReasons.length === 0 &&
+    conflictCount === 0 &&
     hardRisky === 0 &&
     !message
   ) {
     return null;
   }
 
-  // Status chip — 3 states map to color tones.
+  // Status chip — 4 states map to color tones. Warning is the new
+  // "passed with warnings" state; blocked covers true blockers only
+  // (secret leak / conflict marker).
+  const isRealBlocker = hardRisky > 0 || conflictCount > 0;
   let label;
   let chipColor;
-  if (status === "blocked" || hardRisky > 0 || manualReq > 0) {
+  if (status === "blocked" || isRealBlocker) {
     label = "blocked";
     chipColor = "text-rose-400";
+  } else if (status === "warning" || warningCount > 0 || warningReasons.length > 0) {
+    label = "passed with warnings";
+    chipColor = "text-amber-300";
   } else if (status === "resolved" || autoRestored > 0 || autoDeleted > 0) {
     label = "resolved";
     chipColor = "text-emerald-400";
@@ -249,7 +262,7 @@ function PublishBlockerRow({ factory }) {
   return (
     <div className="text-slate-500">
       <div>
-        Blocker · <span className={chipColor}>{label}</span>
+        Release Safety Gate · <span className={chipColor}>{label}</span>
       </div>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5">
         {autoRestored > 0 && (
@@ -270,37 +283,63 @@ function PublishBlockerRow({ factory }) {
             <span className="text-slate-300">{allowedCode}개</span>
           </span>
         )}
-        {manualReq > 0 && (
+        {warningCount > 0 && (
           <span>
-            수동 확인 ·{" "}
-            <span className="text-rose-300">{manualReq}개</span>
+            warning ·{" "}
+            <span className="text-amber-300">{warningCount}개</span>
+          </span>
+        )}
+        {conflictCount > 0 && (
+          <span>
+            conflict ·{" "}
+            <span className="text-rose-400">{conflictCount}개</span>
           </span>
         )}
         {hardRisky > 0 && (
           <span>
-            위험 ·{" "}
+            secret ·{" "}
             <span className="text-rose-400">{hardRisky}개</span>
           </span>
         )}
       </div>
 
-      {/* Manual files — show first 3 with full path for the human */}
-      {manualFiles.slice(0, 3).map((p) => (
-        <div key={`m-${p}`} className="text-rose-200/90">
-          manual ·{" "}
+      {/* Warning reasons — surface the human-readable category list */}
+      {warningReasons.slice(0, 3).map((r, i) => (
+        <div key={`wr-${i}`} className="text-amber-200/90">
+          사유 · {r}
+        </div>
+      ))}
+      {warningReasons.length > 3 && (
+        <div className="text-slate-500">
+          외 {warningReasons.length - 3}건 — 리포트에서 전체 확인
+        </div>
+      )}
+
+      {/* Warning files — show first 3 with full path for the human */}
+      {warningFiles.slice(0, 3).map((p) => (
+        <div key={`m-${p}`} className="text-amber-200/80">
+          warning ·{" "}
+          <code className="rounded bg-slate-800 px-1 text-amber-200">{p}</code>
+        </div>
+      ))}
+      {warningFiles.length > 3 && (
+        <div className="text-slate-500">
+          외 {warningFiles.length - 3}건 — 리포트에서 전체 확인
+        </div>
+      )}
+
+      {/* Conflict markers — absolutely a blocker */}
+      {conflictMarkers.slice(0, 3).map((p) => (
+        <div key={`c-${p}`} className="text-rose-300">
+          conflict ·{" "}
           <code className="rounded bg-slate-800 px-1 text-rose-200">{p}</code>
         </div>
       ))}
-      {manualFiles.length > 3 && (
-        <div className="text-slate-500">
-          외 {manualFiles.length - 3}건 — 리포트에서 전체 확인
-        </div>
-      )}
 
       {/* Hard-risky — basenames ONLY. The runner never ships full paths. */}
       {hardRiskyBn.slice(0, 3).map((bn) => (
         <div key={`r-${bn}`} className="text-rose-300">
-          위험 ·{" "}
+          secret ·{" "}
           <code className="rounded bg-slate-800 px-1 text-rose-200">{bn}</code>{" "}
           <span className="text-slate-600">(전체 경로 미노출)</span>
         </div>
@@ -337,14 +376,25 @@ function PublishBlockerRow({ factory }) {
         </div>
       )}
 
-      {blocked && (
+      {isRealBlocker && (
         <div className="mt-1 rounded border border-rose-900/60 bg-rose-950/40 p-1.5 text-[11px] text-rose-200">
           {hardRisky > 0
-            ? "위험 파일이 남아 있어 신규 기능 개발을 중단했습니다."
-            : "수동 확인 파일이 남아 있어 신규 기능 개발을 중단했습니다."}
+            ? "Secret 패턴이 감지되어 배포를 중단했습니다."
+            : "Git conflict marker가 남아 있어 배포를 중단했습니다."}
         </div>
       )}
-      {message && !blocked && (
+      {!isRealBlocker && (warningCount > 0 || warningReasons.length > 0) && (
+        <div className="mt-1 rounded border border-amber-900/60 bg-amber-950/30 p-1.5 text-[11px] text-amber-200">
+          Release Safety Gate: passed with warnings
+          {warningReasons.length > 0 && (
+            <>
+              {" — "}사유: {warningReasons.slice(0, 2).join(", ")}
+            </>
+          )}
+          {" — "}결과: build/health 통과로 배포 허용
+        </div>
+      )}
+      {message && !isRealBlocker && warningCount === 0 && warningReasons.length === 0 && (
         <div className="text-slate-400">{message}</div>
       )}
     </div>
@@ -1100,7 +1150,7 @@ function FactoryDetail({ factory }) {
       )}
       {risky.length > 0 && (
         <div className="mt-2 rounded border border-rose-900/60 bg-rose-950/40 p-2 text-[11px] text-rose-200">
-          ⚠️ 위험 파일 {risky.length}개 감지 — 자동 commit 비활성화
+          ⚠️ Secret 패턴 파일 {risky.length}개 감지 — 자동 commit 비활성화
           <ul className="ml-4 list-disc">
             {risky.slice(0, 5).map((p) => (
               <li key={p}>{p}</li>

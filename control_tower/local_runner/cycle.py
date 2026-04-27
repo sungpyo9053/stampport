@@ -109,16 +109,17 @@ def _load_agent_collab_text() -> str:
     except OSError:
         return ""
 
+# Working-tree "위험 파일" pattern — used by stage_git_check and the
+# post-apply revalidation. Only actual secret-shaped paths count.
+# Cache/build artifact patterns (.runtime/, node_modules/, dist/,
+# .venv/, __pycache__/) used to be in this list; they're now handled
+# by the auto_delete bucket in publish_blocker_resolve and never
+# treated as a publish blocker.
 RISKY_PATTERNS: tuple[str, ...] = (
     ".env",
     ".pem",
     ".key",
     ".db",
-    ".runtime/",
-    "node_modules/",
-    "dist/",
-    ".venv/",
-    "__pycache__/",
 )
 
 
@@ -151,15 +152,23 @@ FORBIDDEN_APPLY_PATTERNS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Publish blocker policy
+# Release Safety Gate policy
 #
-# When the working tree contains files that the publish step (in
-# runner.py) would refuse, we should NOT keep generating new feature
-# work — the user will end up with a queue of unmergeable proposals
-# stacked on top of the same blocker. So before any new development
-# stage we (a) detect blockers, (b) auto-clean a small allowlist of
-# "obviously safe" generated junk, and (c) fail the cycle with a
-# manual-review message for anything else.
+# Stampport 자동화 공장은 *변경을 만들기 위한* 시스템이다. 변경 파일이
+# 있다는 사실 자체는 차단 사유가 아니다. 그래서 게이트는 두 종류의
+# 신호를 분리해 추적한다:
+#
+#   blocker  — 정말 배포를 멈춰야 하는 사고(시크릿 노출, 충돌 마커,
+#              빌드/문법/health 실패). 사람이 손대기 전에 push 하면
+#              안 되는 사고.
+#   warning  — "주의 깊게 보면 좋겠다" 수준의 신호(cycle.py 변경,
+#              runner.py 변경, deploy script 변경, nginx template
+#              변경, 큰 diff 등). build/health/secret이 통과했다면
+#              이 신호는 차단 사유가 아니다.
+#
+# 결과적으로 publish_blocked는 hard_risky 또는 conflict_marker가
+# 검출됐을 때만 True가 된다. manual_required(=warning)는 더 이상
+# publish를 막지 않는다.
 # ---------------------------------------------------------------------------
 
 
@@ -168,22 +177,25 @@ FORBIDDEN_APPLY_PATTERNS: tuple[str, ...] = (
 #   auto_delete    — generated/cache junk; safe to remove outright
 #   allowed_code   — ordinary source/code change; passes through to QA Gate
 #                    + publish (subject to QA pass + secret scan)
-#   manual_required — deploy/CI/build-config; not publishable without human
+#   manual_required — deploy/CI/build-config 등 *주의 깊게 보면 좋은*
+#                    카테고리. publish 차단 사유가 아니라 warning 으로
+#                    리포트에만 표기한다.
 #   hard_risky     — secret/credential pattern; NEVER read content, NEVER log
 #
 # Verdict precedence (first match wins, top → bottom):
 #   1. hard_risky pattern in path  → 'hard_risky'
-#   2. manual_required pattern     → 'manual_required'
+#   2. manual_required pattern     → 'manual_required'  (warning, not blocker)
 #   3. exact-match auto_restore    → 'auto_restore'
 #   4. auto_delete pattern         → 'auto_delete'
 #   5. allowed_code prefix         → 'allowed_code'
-#   6. anything else (top-level CHANGELOG.md, docs/, etc.) → 'manual_required'
+#   6. anything else (top-level CHANGELOG.md, docs/, etc.) → 'allowed_code'
 #
-# We pick precedence so a `.env` under app/api/ never accidentally falls
-# through to allowed_code, and a `__pycache__/foo` under app/web/dist/
-# never gets manual_required because it matched a directory prefix
-# first. Hard-risky has the highest priority so a stray secret never
-# leaks into auto_delete or allowed_code.
+# Hard-risky has the highest priority so a stray secret never leaks
+# into auto_delete or allowed_code. The fallback used to be
+# manual_required ("better safe than sorry") — that was the source of
+# the false-positive deploy block. The new fallback is allowed_code:
+# we trust the secret/conflict/build/health gates downstream and don't
+# block on path shape alone.
 
 
 # Hard-risky path/name patterns. Any substring match → never even open
@@ -239,20 +251,26 @@ PUBLISH_ALLOWED_CODE_PREFIXES: tuple[str, ...] = (
     "control_tower/api/",
     "control_tower/web/",
     "control_tower/local_runner/",
-    "scripts/local_factory_",
-    "scripts/notify_",
+    "scripts/",
+    "deploy/",
+    "config/",
+    "docs/",
+    ".github/",
 )
 
-# Anything in these dirs needs a human reviewing before push.
+# These dirs USED to force manual review before push. They are now
+# warning-only: the publish path's secret-scan + build/health gates
+# decide whether the change actually ships, not the directory name.
 PUBLISH_MANUAL_ROOTS: tuple[str, ...] = (
     "deploy/",
     ".github/",
 )
 
-# File-name patterns that ALWAYS require manual review (build/CI/infra
-# config — not secret-shaped, but a wrong tweak here can break the
-# whole deployment). Distinct from hard_risky because we WILL read /
-# log the path; just refuse to auto-publish.
+# File-name patterns that produce a *warning* (build/CI/infra config —
+# not secret-shaped, but a wrong tweak here can break the whole
+# deployment). Distinct from hard_risky because we WILL read / log the
+# path; the report flags them so a human can eyeball the diff. They
+# are NOT publish blockers — build/health/secret gates are.
 PUBLISH_MANUAL_PATTERNS: tuple[str, ...] = (
     "package.json",
     "package-lock.json",
@@ -261,6 +279,30 @@ PUBLISH_MANUAL_PATTERNS: tuple[str, ...] = (
     "docker-compose",
     "systemd",
     "nginx",
+)
+
+
+# Conflict-marker scan. We treat the presence of git conflict markers
+# in any tracked text file as a hard publish blocker — pushing a half-
+# resolved merge produces a guaranteed broken main branch. Only the
+# three canonical 7-character marker lines count, and we only scan
+# files inside ALLOWED_APPLY_DIRS so we never accidentally open a
+# `.env` or a binary asset.
+CONFLICT_MARKER_TOKENS: tuple[str, ...] = (
+    "<<<<<<<",
+    "=======",
+    ">>>>>>>",
+)
+# Files larger than this (bytes) are skipped during conflict-marker
+# scanning — keeps the gate fast and avoids slurping binaries.
+CONFLICT_SCAN_MAX_BYTES = 512 * 1024  # 512 KB
+
+# File-name extensions that are textual enough to scan for conflict
+# markers. Anything else is skipped — markers don't appear in PNGs.
+CONFLICT_SCAN_TEXT_EXTS: tuple[str, ...] = (
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".yaml",
+    ".yml", ".toml", ".sh", ".css", ".html", ".conf", ".cfg", ".ini",
+    ".txt", ".sql", ".env.example",
 )
 
 # Each stage name maps to (label_in_korean, weight_for_progress).
@@ -397,13 +439,22 @@ class CycleState:
     #   hard_risky      — secret/credential; cycle stays blocked,
     #                     contents NEVER opened, basenames only
     publish_blocked: bool = False
-    publish_blocker_status: str = "clean"  # clean | resolved | blocked
+    # publish_blocker_status:
+    #   clean    — no blockers, no warnings, no auto-cleanup activity
+    #   resolved — auto-cleanup ran and the tree is now clean
+    #   warning  — Release Safety Gate passed with warnings (the *new*
+    #              non-blocking state for cycle.py/runner.py/deploy
+    #              script/nginx/large-diff style changes)
+    #   blocked  — actual blocker (hard_risky or conflict_marker)
+    publish_blocker_status: str = "clean"
     auto_resolved_files: list[str] = field(default_factory=list)   # back-compat alias
     auto_restored_files: list[str] = field(default_factory=list)
     auto_deleted_files: list[str] = field(default_factory=list)
     allowed_code_files: list[str] = field(default_factory=list)
-    manual_required_files: list[str] = field(default_factory=list)
+    manual_required_files: list[str] = field(default_factory=list)  # WARNING bucket
     hard_risky_files: list[str] = field(default_factory=list)
+    conflict_marker_files: list[str] = field(default_factory=list)
+    warning_reasons: list[str] = field(default_factory=list)
     publish_blocker_message: str | None = None
     publish_blocker_report_path: str | None = None
     publish_blocker_recurring: dict[str, int] = field(default_factory=dict)
@@ -477,6 +528,8 @@ class CycleState:
             "allowed_code_files": list(self.allowed_code_files),
             "manual_required_files": list(self.manual_required_files),
             "hard_risky_files": list(self.hard_risky_files),
+            "conflict_marker_files": list(self.conflict_marker_files),
+            "warning_reasons": list(self.warning_reasons),
             "publish_blocker_message": self.publish_blocker_message,
             "publish_blocker_report_path": self.publish_blocker_report_path,
             "publish_blocker_recurring": dict(self.publish_blocker_recurring),
@@ -730,27 +783,34 @@ def stage_syntax_check(state: CycleState) -> StageResult:
 
 def _classify_publish_blocker(path: str) -> str:
     """Return one of: 'hard_risky' | 'manual_required' | 'auto_restore'
-    | 'auto_delete' | 'allowed_code' | 'manual_required'.
+    | 'auto_delete' | 'allowed_code'.
+
+    NOTE: 'manual_required' is now a *warning* category — it does not
+    block publish. Only 'hard_risky' (secret patterns) blocks. The
+    bucket name is preserved for back-compat with state.json consumers.
 
     Verdict precedence (top → bottom, first match wins):
 
       1. hard_risky  — secret/credential pattern. NEVER read content.
       2. manual_required — package.json / requirements / deploy / .github / nginx / systemd.
+                         (warning-only, surfaced for human eyeball)
       3. auto_restore — exact match in PUBLISH_AUTO_RESTORE_FILES.
       4. auto_delete — substring match in PUBLISH_AUTO_DELETE_PATTERNS.
       5. allowed_code — under one of PUBLISH_ALLOWED_CODE_PREFIXES.
-      6. manual_required (fallback) — anything else (top-level docs,
-         README tweaks, etc.). Better safe than sorry.
+      6. allowed_code (fallback) — anything else (top-level docs, README
+         tweaks, CLAUDE.md, etc.). The publish step still runs the
+         secret-scan + build/health gates, so an unknown path is no
+         longer a blocker — just a regular change that rides along.
     """
     if not path:
-        return "manual_required"
+        return "allowed_code"
 
     # 1. Hard-risky wins — even an `.env` under app/api/.
     for pat in PUBLISH_HARD_RISKY_PATTERNS:
         if pat in path:
             return "hard_risky"
 
-    # 2. Build/CI/infra config — manual.
+    # 2. Build/CI/infra config — manual *warning*.
     for pat in PUBLISH_MANUAL_PATTERNS:
         if pat in path:
             return "manual_required"
@@ -772,9 +832,117 @@ def _classify_publish_blocker(path: str) -> str:
         if path.startswith(prefix):
             return "allowed_code"
 
-    # 6. Conservative default. A top-level CHANGELOG.md or unknown
-    # path is treated as manual-review until someone opts it in.
-    return "manual_required"
+    # 6. Liberal default — anything else (top-level CHANGELOG.md,
+    # README.md, CLAUDE.md, an ad-hoc note) is treated as ordinary
+    # publishable code. The secret/conflict/build/health gates
+    # downstream catch the actually unsafe stuff.
+    return "allowed_code"
+
+
+# ---------------------------------------------------------------------------
+# Warning classifier — non-blocking signals worth surfacing.
+#
+# These categories are about "주의 깊게 보면 좋은" diffs, not blockers.
+# They feed `state.warning_reasons` so the report and dashboard can
+# render the new "Release Safety Gate: passed with warnings" message
+# with concrete reasons instead of a generic "위험 파일 변경 감지".
+# ---------------------------------------------------------------------------
+
+
+# Diff-volume thresholds for "many files" / "large diff" warnings.
+WARNING_MANY_FILES_THRESHOLD = 25
+WARNING_BIG_FE_FILES_THRESHOLD = 12
+
+
+def _classify_warning_reasons(paths: list[str]) -> list[str]:
+    """Return human-readable warning reasons (Korean) describing the
+    *kind* of change in `paths`. Pure presentation: callers MUST NOT
+    use these to block publish. Empty list = no warnings.
+
+    The categories mirror the user-facing spec for "주의 깊게 보면
+    좋은" signals (cycle.py 변경, runner.py 변경, deploy script 변경,
+    nginx template 변경, 큰 diff 등).
+    """
+    reasons: list[str] = []
+    if not paths:
+        return reasons
+
+    has = lambda needle: any(needle in p for p in paths)  # noqa: E731
+
+    if has("control_tower/local_runner/cycle.py"):
+        reasons.append("cycle.py 변경됨")
+    if has("control_tower/local_runner/runner.py"):
+        reasons.append("runner.py 변경됨")
+    deploy_script_hits = [
+        p for p in paths
+        if p.startswith("scripts/server_")
+        or p.startswith("scripts/deploy_")
+        or p.startswith("deploy/")
+    ]
+    if deploy_script_hits:
+        reasons.append("deploy script 변경됨")
+    nginx_hits = [p for p in paths if "nginx" in p]
+    if nginx_hits:
+        reasons.append("nginx template 변경됨")
+    api_contract_hits = [
+        p for p in paths
+        if p.startswith("app/api/")
+        and (p.endswith("schemas.py") or "/schemas/" in p or p.endswith("main.py"))
+    ]
+    if api_contract_hits:
+        reasons.append("API 계약 변경 추정")
+    if len(paths) >= WARNING_MANY_FILES_THRESHOLD:
+        reasons.append(f"많은 파일 변경 ({len(paths)}건)")
+    fe_app = [p for p in paths if p.startswith("app/web/src/")]
+    if len(fe_app) >= WARNING_BIG_FE_FILES_THRESHOLD:
+        reasons.append(f"app/web/src 대규모 변경 ({len(fe_app)}건)")
+    fe_ct = [p for p in paths if p.startswith("control_tower/web/src/")]
+    if len(fe_ct) >= WARNING_BIG_FE_FILES_THRESHOLD:
+        reasons.append(f"control_tower/web/src 대규모 변경 ({len(fe_ct)}건)")
+    return reasons
+
+
+def _scan_conflict_markers(paths: list[str]) -> list[str]:
+    """Return the subset of `paths` that contain a git conflict marker.
+
+    We only open files under ALLOWED_APPLY_DIRS with a CONFLICT_SCAN_TEXT_EXTS
+    extension, capped at CONFLICT_SCAN_MAX_BYTES. Hard-risky paths are
+    NEVER opened — the caller is responsible for filtering them out
+    before passing to us.
+    """
+    hits: list[str] = []
+    for rel in paths:
+        if not any(rel.startswith(d) for d in ALLOWED_APPLY_DIRS):
+            continue
+        # Hard-risky always wins — never read.
+        if any(pat in rel for pat in PUBLISH_HARD_RISKY_PATTERNS):
+            continue
+        if not rel.lower().endswith(CONFLICT_SCAN_TEXT_EXTS):
+            continue
+        full = REPO_ROOT / rel
+        try:
+            if not full.is_file():
+                continue
+            if full.stat().st_size > CONFLICT_SCAN_MAX_BYTES:
+                continue
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Require all three markers to appear on their own lines so a
+        # source file describing the syntax (this very file, for
+        # instance) does not produce a false positive.
+        marker_lines = {
+            line for line in text.splitlines()
+            if line.startswith(("<<<<<<< ", "<<<<<<<\t", "<<<<<<<"))
+            and line.startswith("<<<<<<<") and len(line) >= 7
+        }
+        has_lt = any(line == "<<<<<<<" or line.startswith("<<<<<<< ") for line in text.splitlines())
+        has_eq = any(line == "=======" for line in text.splitlines())
+        has_gt = any(line == ">>>>>>>" or line.startswith(">>>>>>> ") for line in text.splitlines())
+        del marker_lines  # only used for clarity above
+        if has_lt and has_eq and has_gt:
+            hits.append(rel)
+    return sorted(set(hits))
 
 
 def _safe_basename(path: str) -> str:
@@ -906,6 +1074,8 @@ def _save_blocker_state(state: CycleState) -> None:
         # full path. A secret leak via state file is exactly the
         # category of mistake this whole stage exists to prevent.
         "hard_risky": [_safe_basename(p) for p in state.hard_risky_files],
+        "conflict_markers": list(state.conflict_marker_files),
+        "warning_reasons": list(state.warning_reasons),
         "blocked_reason": state.publish_blocker_message,
         "updated_at": utc_now_iso(),
     }
@@ -952,18 +1122,29 @@ def _write_blocker_resolve_report(state: CycleState, *, recurring: dict) -> None
             lines.append(f"- … 외 {len(state.allowed_code_files) - 50}건")
     else:
         lines.append("- (없음)")
-    lines += ["", "## 수동 확인 필요 파일"]
-    if state.manual_required_files:
-        for p in state.manual_required_files:
-            lines.append(f"- `{p}`")
+    lines += ["", "## Warning — 주의 깊게 보면 좋은 변경"]
+    if state.warning_reasons:
+        for r in state.warning_reasons:
+            lines.append(f"- {r}")
     else:
         lines.append("- (없음)")
-    lines += ["", "## 위험 파일 (hard_risky)"]
+    if state.manual_required_files:
+        lines.append("")
+        lines.append("관련 파일:")
+        for p in state.manual_required_files[:20]:
+            lines.append(f"- `{p}`")
+    lines += ["", "## 위험 파일 (hard_risky · 차단)"]
     if state.hard_risky_files:
         # Basenames only. The ".env" → ".env" mapping is intentional;
         # a "deploy/secrets/foo.env" → "foo.env" mapping is the point.
         for p in state.hard_risky_files:
             lines.append(f"- `{_safe_basename(p)}` (전체 경로 미노출)")
+    else:
+        lines.append("- (없음)")
+    lines += ["", "## Conflict marker (차단)"]
+    if state.conflict_marker_files:
+        for p in state.conflict_marker_files:
+            lines.append(f"- `{p}`")
     else:
         lines.append("- (없음)")
 
@@ -991,16 +1172,23 @@ def _write_blocker_resolve_report(state: CycleState, *, recurring: dict) -> None
             lines.append(
                 "- 위험 파일이 감지됨. .gitignore 확인 + 파일을 워킹 트리에서 제거하세요."
             )
-        if state.manual_required_files:
+        if state.conflict_marker_files:
             lines.append(
-                "- 수동 확인 필요 파일은 사람이 직접 검토 후 선별 commit 하세요."
+                "- Git conflict marker가 남아 있는 파일이 있습니다. 충돌을 해소한 뒤 다시 시도하세요."
             )
         lines.append(
-            "- 신규 기능 개발은 중단되었습니다. 위 항목을 먼저 정리한 뒤 다음 사이클을 시작하세요."
+            "- 위 차단 항목을 정리한 뒤 다음 사이클을 시작하세요. (build/health/secret 게이트는 통과해야 합니다.)"
         )
+    elif state.publish_blocker_status == "warning":
+        lines.append(
+            "- Release Safety Gate: passed with warnings. build/health/secret 게이트가 통과하면 배포가 허용됩니다."
+        )
+        for r in state.warning_reasons[:5]:
+            lines.append(f"  - 사유: {r}")
+        lines.append("  - 결과: build/health 통과로 배포 허용 (변경은 다음 사이클에서 점검 가능).")
     elif state.publish_blocker_status == "resolved":
         lines.append(
-            "- 자동 복구로 모든 차단이 해결되었습니다. publish_changes 가능 (QA Gate 통과 시)."
+            "- 자동 복구로 임시 드리프트가 해소되었습니다. publish_changes 가능 (QA Gate 통과 시)."
         )
     else:
         lines.append("- 차단 파일 없음. publish_changes 가능 (QA Gate 통과 시).")
@@ -1160,29 +1348,46 @@ def stage_publish_blocker_check(state: CycleState) -> StageResult:
             set(state.auto_deleted_files + proactive_deleted)
         )
 
-    has_blocker = bool(state.manual_required_files or state.hard_risky_files)
+    # Conflict-marker scan over allowed_code + manual_required (the
+    # buckets we're about to consider for publish). Hard-risky paths
+    # are *never* opened — already filtered by the helper.
+    scan_paths = list(state.allowed_code_files) + list(state.manual_required_files)
+    state.conflict_marker_files = _scan_conflict_markers(scan_paths)
+
+    # Warning reasons cover the "주의 깊게 보면 좋은" categories.
+    state.warning_reasons = _classify_warning_reasons(
+        state.allowed_code_files + state.manual_required_files
+    )
+
+    has_real_blocker = bool(state.hard_risky_files or state.conflict_marker_files)
+    has_warning = bool(state.manual_required_files or state.warning_reasons)
     has_auto_candidates = bool(
         state.auto_restored_files or state.auto_deleted_files
     )
 
-    if not (has_blocker or has_auto_candidates or state.allowed_code_files):
+    if not (has_real_blocker or has_warning or has_auto_candidates or state.allowed_code_files):
         state.publish_blocked = False
         state.publish_blocker_status = "clean"
-        state.publish_blocker_message = "배포 차단 파일 없음"
+        state.publish_blocker_message = "변경 없음 · Release Safety Gate clean"
         _save_blocker_state(state)
         sr.status = "passed"
-        sr.message = "배포 차단 파일 없음 · 변경 0건"
+        sr.message = "변경 없음 · Release Safety Gate clean"
         return sr
 
     # Provisional verdict — resolve stage flips it after cleanup.
-    if has_blocker:
+    if has_real_blocker:
         state.publish_blocked = True
         state.publish_blocker_status = "blocked"
     elif has_auto_candidates:
-        state.publish_blocked = True
-        state.publish_blocker_status = "blocked"  # cleared by resolve
+        # Drift to clean up. Resolve stage will flip to 'resolved' or
+        # 'warning' depending on what's left.
+        state.publish_blocked = False
+        state.publish_blocker_status = "blocked"  # provisional; resolve sets final
+    elif has_warning:
+        state.publish_blocked = False
+        state.publish_blocker_status = "warning"
     else:
-        # only allowed_code — not blocked, just a list-for-the-human
+        # only allowed_code — pure clean.
         state.publish_blocked = False
         state.publish_blocker_status = "clean"
 
@@ -1194,7 +1399,9 @@ def stage_publish_blocker_check(state: CycleState) -> StageResult:
     if state.allowed_code_files:
         parts.append(f"정상 코드 {len(state.allowed_code_files)}건")
     if state.manual_required_files:
-        parts.append(f"수동 확인 {len(state.manual_required_files)}건")
+        parts.append(f"warning {len(state.manual_required_files)}건")
+    if state.conflict_marker_files:
+        parts.append(f"conflict marker {len(state.conflict_marker_files)}건")
     if state.hard_risky_files:
         parts.append(f"위험 {len(state.hard_risky_files)}건")
     state.publish_blocker_message = "변경 분류: " + ", ".join(parts)
@@ -1216,11 +1423,19 @@ def stage_publish_blocker_check(state: CycleState) -> StageResult:
         detail_lines += [f"- {p}" for p in state.allowed_code_files[:20]]
     if state.manual_required_files:
         if detail_lines: detail_lines.append("")
-        detail_lines.append("[manual_required]")
+        detail_lines.append("[warning · manual_required]")
         detail_lines += [f"- {p}" for p in state.manual_required_files[:20]]
+    if state.warning_reasons:
+        if detail_lines: detail_lines.append("")
+        detail_lines.append("[warning reasons]")
+        detail_lines += [f"- {r}" for r in state.warning_reasons[:10]]
+    if state.conflict_marker_files:
+        if detail_lines: detail_lines.append("")
+        detail_lines.append("[conflict_marker · 차단]")
+        detail_lines += [f"- {p}" for p in state.conflict_marker_files[:20]]
     if state.hard_risky_files:
         if detail_lines: detail_lines.append("")
-        detail_lines.append("[hard_risky] (basenames only)")
+        detail_lines.append("[hard_risky · 차단] (basenames only)")
         detail_lines += [f"- {_safe_basename(p)}" for p in state.hard_risky_files[:20]]
     sr.detail = "\n".join(detail_lines)[-1800:]
     return sr
@@ -1306,12 +1521,30 @@ def stage_publish_blocker_resolve(state: CycleState) -> StageResult:
     # allowed_code is informational and unaffected by cleanup.
     state.allowed_code_files = allowed if not state.allowed_code_files else state.allowed_code_files
 
+    # Recompute warning reasons + conflict markers against the post-
+    # cleanup tree so the verdict reflects what publish_changes will see.
+    state.conflict_marker_files = _scan_conflict_markers(
+        list(state.allowed_code_files) + list(state.manual_required_files)
+    )
+    state.warning_reasons = _classify_warning_reasons(
+        state.allowed_code_files + state.manual_required_files
+    )
+
     # 5. Decide final verdict.
+    #
+    # blocker  — hard_risky 또는 conflict_marker가 남아있는 경우.
+    # warning  — manual_required(=주의 카테고리) 또는 warning_reasons만
+    #            남은 경우. publish는 허용.
+    # resolved — 자동 정리 활동이 있었고, 남은 차단/경고 모두 없음.
+    # clean    — 변경 자체가 없음.
     leftover_auto = [
         p for p in (initial_restore + initial_delete)
         if p not in actually_restored and p not in actually_deleted
     ]
-    if state.hard_risky_files or state.manual_required_files or failed or leftover_auto:
+    has_real_blocker = bool(state.hard_risky_files or state.conflict_marker_files)
+    has_warning = bool(state.manual_required_files or state.warning_reasons)
+
+    if has_real_blocker or failed or leftover_auto:
         state.publish_blocked = True
         state.publish_blocker_status = "blocked"
         msg_parts: list[str] = []
@@ -1321,15 +1554,27 @@ def stage_publish_blocker_resolve(state: CycleState) -> StageResult:
             msg_parts.append(f"자동 삭제 {len(actually_deleted)}건")
         if state.hard_risky_files:
             msg_parts.append(f"위험 {len(state.hard_risky_files)}건")
-        if state.manual_required_files:
-            msg_parts.append(f"수동 확인 {len(state.manual_required_files)}건")
+        if state.conflict_marker_files:
+            msg_parts.append(f"conflict marker {len(state.conflict_marker_files)}건")
         if failed:
             msg_parts.append(f"자동 정리 실패 {len(failed)}건")
         state.publish_blocker_message = (
             "; ".join(msg_parts)
-            + " — 배포 차단 파일 해결이 우선입니다. 신규 기능 개발을 중단했습니다."
+            + " — 배포를 중단했습니다. (secret/conflict/cleanup 차단)"
         )
         sr.status = "failed"
+        sr.message = state.publish_blocker_message
+    elif has_warning:
+        state.publish_blocked = False
+        state.publish_blocker_status = "warning"
+        reason_summary = ", ".join(state.warning_reasons[:3]) or (
+            f"warning 파일 {len(state.manual_required_files)}건"
+        )
+        state.publish_blocker_message = (
+            f"Release Safety Gate: passed with warnings — 사유: {reason_summary} — "
+            "결과: build/health 통과로 배포 허용"
+        )
+        sr.status = "passed"
         sr.message = state.publish_blocker_message
     elif actually_restored or actually_deleted:
         state.publish_blocked = False
@@ -1343,7 +1588,7 @@ def stage_publish_blocker_resolve(state: CycleState) -> StageResult:
     else:
         state.publish_blocked = False
         state.publish_blocker_status = "clean"
-        state.publish_blocker_message = "배포 차단 파일 없음"
+        state.publish_blocker_message = "변경 없음 · Release Safety Gate clean"
         sr.status = "skipped"
         sr.message = "정리할 차단 파일 없음 — clean"
 
@@ -1785,7 +2030,7 @@ def stage_product_planning(state: CycleState) -> StageResult:
     # work — fixing the deploy state has to happen first.
     if state.publish_blocked:
         return _skip(
-            "배포 차단 파일이 남아 있어 신규 개발을 중단했습니다."
+            "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
     enabled = os.environ.get("FACTORY_PRODUCT_PLANNER_MODE", "").strip().lower()
@@ -2058,7 +2303,7 @@ def stage_claude_propose(state: CycleState) -> StageResult:
     # to propose new code on top of an unpublishable working tree.
     if state.publish_blocked:
         return _skip(
-            "배포 차단 파일이 남아 있어 신규 개발을 중단했습니다."
+            "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
     # Pre-condition 1: opt-in. Default OFF — never run unless explicitly
@@ -2376,7 +2621,8 @@ def _revalidate_after_apply() -> tuple[bool, list[str]]:
             break
 
     # 5. Risky-file scan (post-apply view of git status — Claude must
-    # not have created secrets, build artifacts, or runtime files).
+    # not have created secrets). Cache/build artifact patterns are no
+    # longer in RISKY_PATTERNS, so this fires only on actual secrets.
     ok, out = _run(["git", "-C", str(REPO_ROOT), "status", "--short"], timeout=15)
     if ok:
         for line in out.splitlines():
@@ -2563,7 +2809,7 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     # an unpushable mixed change set.
     if state.publish_blocked:
         return _skip(
-            "배포 차단 파일이 남아 있어 신규 개발을 중단했습니다."
+            "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
     # Pre-condition 1: opt-in. Default OFF.
@@ -3464,7 +3710,7 @@ def stage_qa_fix_propose(state: CycleState) -> StageResult:
     if state.qa_status != "failed":
         return _skip("QA 실패 아님 — 수정 제안 불필요")
     if state.publish_blocked:
-        return _skip("배포 차단 상태 — QA 수정 제안 미실행")
+        return _skip("차단 사유(secret/conflict) 잔존 — QA 수정 제안 미실행")
     if state.qa_fix_attempt >= state.qa_fix_max_attempts:
         return _skip(
             f"QA 수정 재시도 한도 초과 ({state.qa_fix_attempt}/{state.qa_fix_max_attempts})"
@@ -3555,7 +3801,7 @@ def stage_qa_fix_apply(state: CycleState) -> StageResult:
     if state.qa_fix_propose_status != "passed":
         return _skip("qa_fix_propose가 통과하지 않음 — 적용 스킵")
     if state.publish_blocked:
-        return _skip("배포 차단 상태 — QA 수정 적용 미실행")
+        return _skip("차단 사유(secret/conflict) 잔존 — QA 수정 적용 미실행")
 
     # Force-enable apply for this single call by setting the env var
     # in the child env override. We reuse stage_claude_apply but
@@ -3669,52 +3915,65 @@ def _write_report(state: CycleState) -> None:
 
     summary_lines += [
         "",
-        "## 위험 파일 검사",
+        "## 위험 파일 검사 (secret 패턴)",
     ]
     if state.risky_files:
-        summary_lines.append("⚠️  다음 파일이 자동 commit 금지 패턴과 일치합니다:")
+        summary_lines.append("⚠️  다음 파일이 secret 패턴과 일치합니다:")
         for f in state.risky_files:
             summary_lines.append(f"- `{f}`")
         summary_lines.append("")
-        summary_lines.append("→ 이번 사이클에서는 자동 commit/push가 비활성화됩니다.")
+        summary_lines.append("→ 자동 commit/push가 비활성화됩니다.")
     else:
         summary_lines.append("위험 파일 없음.")
 
-    # Publish blocker section. Always emitted so the dashboard / human
-    # reviewer can see exactly why a cycle stopped at the gate (or
-    # confirm there was no blocker).
+    # Release Safety Gate section. Always emitted so the dashboard /
+    # human reviewer can see whether the gate passed cleanly, passed
+    # with warnings, or actually blocked.
     summary_lines += [
         "",
-        "## 배포 차단 검사",
+        "## Release Safety Gate",
         f"- 상태: {state.publish_blocker_status}",
     ]
     if state.publish_blocker_message:
         summary_lines.append(f"- 메시지: {state.publish_blocker_message}")
+    if state.warning_reasons:
+        summary_lines.append(
+            f"- Warning 사유 ({len(state.warning_reasons)}건):"
+        )
+        for r in state.warning_reasons[:10]:
+            summary_lines.append(f"  - {r}")
     if state.auto_resolved_files:
         summary_lines.append(
             f"- 자동 정리 파일 ({len(state.auto_resolved_files)}건):"
         )
         for f in state.auto_resolved_files[:20]:
             summary_lines.append(f"  - `{f}`")
-    else:
-        summary_lines.append("- 자동 정리 파일: 없음")
     if state.manual_required_files:
         summary_lines.append(
-            f"- 수동 확인 필요 파일 ({len(state.manual_required_files)}건):"
+            f"- Warning 관련 파일 ({len(state.manual_required_files)}건):"
         )
         for f in state.manual_required_files[:20]:
             summary_lines.append(f"  - `{f}`")
-    else:
-        summary_lines.append("- 수동 확인 필요 파일: 없음")
+    if state.conflict_marker_files:
+        summary_lines.append(
+            f"- Conflict marker 파일 ({len(state.conflict_marker_files)}건):"
+        )
+        for f in state.conflict_marker_files[:10]:
+            summary_lines.append(f"  - `{f}`")
     if state.publish_blocked:
         summary_lines.append(
-            "- 신규 개발 진행 여부: ❌ 중단 — 배포 차단 파일 해결이 우선입니다."
+            "- 결과: ❌ 차단 — secret/conflict 등 배포 차단 사유가 있습니다."
         )
         summary_lines.append(
             "  이번 사이클은 신규 기능 개발을 수행하지 않았습니다."
         )
+    elif state.publish_blocker_status == "warning":
+        summary_lines.append(
+            "- 결과: ✅ Release Safety Gate: passed with warnings — "
+            "build/health 통과로 배포 허용."
+        )
     else:
-        summary_lines.append("- 신규 개발 진행 여부: ✅ 진행 가능")
+        summary_lines.append("- 결과: ✅ 진행 가능 (build/health/secret 통과 시 배포).")
 
     summary_lines += [
         "",
@@ -4032,7 +4291,7 @@ def main() -> int:
         # dashboard surfaces the "신규 개발 중단" reason.
         state.status = "failed"
         state.last_message = (
-            "배포 차단 파일이 남아 있어 신규 개발을 중단했습니다."
+            "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
     elif failed:
         state.status = "failed"

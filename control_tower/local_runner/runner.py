@@ -101,52 +101,48 @@ ACTIONS_URL = f"https://github.com/{GITHUB_REPO}/actions"
 # so the dashboard can decide whether to enable the deploy button).
 # ---------------------------------------------------------------------------
 
-# Roots whose contents may be auto-committed wholesale.
+# Roots whose contents may be auto-committed wholesale. Stampport의
+# 자동화 공장은 *변경을 만들기 위한* 시스템이라, deploy/CI/scripts
+# 변경도 publish 대상이다. 차단은 secret/conflict/build/health 게이트가
+# 책임진다.
 ALLOWED_PUBLISH_DIR_ROOTS: tuple[str, ...] = (
     "app/",
     "control_tower/",
+    "scripts/",
+    "deploy/",
+    "config/",
+    "docs/",
+    ".github/",
 )
-# Specific files that may be auto-committed even though they live outside
-# the allowed roots above. Anything else under scripts/ is rejected.
+# Specific top-level files that may be auto-committed.
 ALLOWED_PUBLISH_FILES: frozenset[str] = frozenset({
-    "scripts/local_factory_start.sh",
-    "scripts/local_factory_stop.sh",
-    "scripts/local_factory_status.sh",
+    "CLAUDE.md",
+    "README.md",
+    "CHANGELOG.md",
+    ".gitignore",
 })
-# Filename prefixes (relative path) that are allowed even outside the
-# allowed dir roots — e.g. user-defined notify_*.py helpers.
-ALLOWED_PUBLISH_FILE_PREFIXES: tuple[str, ...] = (
-    "scripts/notify_",
-)
+# Filename prefixes are no longer needed — the dir roots cover them.
+ALLOWED_PUBLISH_FILE_PREFIXES: tuple[str, ...] = ()
 
 # Anything in the change set matching one of these substrings makes
-# publish refuse outright. Same shape as cycle.py's RISKY_PATTERNS, plus
-# the local Claude settings file the user often has unstaged.
+# publish refuse outright. Restricted to secret-shaped paths only —
+# cache/build artifacts (.runtime/, node_modules/, dist/, .venv/,
+# __pycache__/) are gitignored and shouldn't appear; if they do, they
+# are NOT a publish blocker. Same logic as cycle.py's RISKY_PATTERNS.
 RISKY_PUBLISH_PATTERNS: tuple[str, ...] = (
     ".env",
     ".pem",
     ".key",
     ".db",
-    ".runtime/",
-    "node_modules/",
-    "dist/",
-    ".venv/",
-    "__pycache__/",
     ".claude/settings.local.json",
 )
 
-# Paths that we never auto-publish even when they look "normal" — these
-# are deploy/CI/infra files that need a human reviewing them.
-BLOCKED_PUBLISH_PATTERNS: tuple[str, ...] = (
-    "deploy/",
-    ".github/",
-    "package.json",
-    "package-lock.json",
-    "requirements.txt",
-    "scripts/server_",
-    "systemd",
-    "nginx",
-)
+# Used to block publish on deploy/CI/infra changes. The Stampport
+# automation factory now treats these as warnings — build/health/
+# secret gates decide whether the change actually ships. Empty by
+# design; we keep the constant so the classifier signature stays
+# stable for back-compat callers.
+BLOCKED_PUBLISH_PATTERNS: tuple[str, ...] = ()
 
 
 # Strict secret-blob markers. Substring presence in any added line is
@@ -633,13 +629,15 @@ def _qa_gate_allows_publish(cycle_state: dict) -> tuple[bool, str]:
 
 
 def _publish_blocker_preflight() -> tuple[bool, str]:
-    """Before any publish work, run cycle's 5-bucket blocker pass:
-    auto-restore drift files, auto-delete cache junk, and refuse if
-    anything in `manual_required` or `hard_risky` remains.
+    """Run cycle's Release Safety Gate against the working tree:
+    auto-restore drift files, auto-delete cache junk, then refuse only
+    if a real blocker (hard_risky secret OR git conflict marker)
+    remains. manual_required (cycle.py / runner.py / deploy script /
+    nginx 등) is treated as a *warning*, not a publish blocker.
 
-    Returns (ok, message). On failure the message uses the exact
-    spec wording so the dashboard / operator sees the same copy
-    everywhere ("위험 파일이 남아 있어 배포를 중단했습니다." etc.).
+    Returns (ok, message). The message is shown verbatim on the
+    dashboard, so the warning path uses the new "Release Safety Gate:
+    passed with warnings" copy.
     """
     try:
         from . import cycle as _cycle
@@ -657,16 +655,26 @@ def _publish_blocker_preflight() -> tuple[bool, str]:
         _cycle.stage_publish_blocker_check(state)
         _cycle.stage_publish_blocker_resolve(state)
     except Exception as e:  # noqa: BLE001
-        # If the stage itself crashes, fall back to the legacy
-        # _classify_publish_files check. We never want a blocker bug
-        # to permanently lock the publish path.
+        # If the stage itself crashes, do not lock publish forever.
         return True, f"preflight crashed (계속 진행): {e}"
 
     if state.hard_risky_files:
-        return False, "위험 파일이 남아 있어 배포를 중단했습니다."
-    if state.manual_required_files:
-        return False, "수동 확인 파일이 남아 있어 배포를 중단했습니다."
-    return True, "publish blocker preflight clean"
+        return False, "위험 파일(secret 패턴)이 남아 있어 배포를 중단했습니다."
+    if state.conflict_marker_files:
+        return (
+            False,
+            f"Git conflict marker가 남아 있는 파일 {len(state.conflict_marker_files)}건 — 배포를 중단했습니다.",
+        )
+    if state.publish_blocker_status == "warning":
+        reason_summary = ", ".join(state.warning_reasons[:3]) or (
+            f"warning 파일 {len(state.manual_required_files)}건"
+        )
+        return (
+            True,
+            f"Release Safety Gate: passed with warnings — 사유: {reason_summary} — "
+            "결과: build/health 통과로 배포 허용",
+        )
+    return True, "Release Safety Gate clean"
 
 
 def _revalidate_for_publish() -> tuple[bool, list[str]]:
@@ -784,16 +792,22 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
         })
         return True, "publish skipped: no changes to publish"
 
-    # 3. Classify into buckets.
+    # 3. Classify into buckets. Risky (secret-shaped) blocks; "blocked"
+    # is now an empty bucket — deploy/CI/infra files ride along.
     allowed, blocked, risky = _classify_publish_files(changed)
     if risky:
         msg = f"risky files in change set ({len(risky)}건): " + ", ".join(risky[:3])
         _record_failure("risky_check", msg)
         return False, f"publish failed at risky_check: {msg}"
+    # Anything that would historically have landed in `blocked` (deploy
+    # script, package.json, nginx, etc.) is now folded into `allowed`
+    # by the classifier. We keep the variable for telemetry but never
+    # block on it.
     if blocked:
-        msg = f"blocked paths ({len(blocked)}건): " + ", ".join(blocked[:3])
-        _record_failure("blocked_check", msg)
-        return False, f"publish failed at blocked_check: {msg}"
+        # Defensive: a future patch to BLOCKED_PUBLISH_PATTERNS should
+        # not start blocking here without an explicit code change.
+        allowed = sorted(set(allowed) | set(blocked))
+        blocked = []
     if not allowed:
         _record_failure("allowed_check", "no allowed files in change set")
         return False, "publish failed at allowed_check: no allowed files in change set"
@@ -1729,6 +1743,9 @@ def _build_publish_blocker_meta(state: dict) -> dict:
 
     hard_risky_basenames = sorted({_bn(p) for p in hard_risky_paths})
 
+    conflict_markers = state.get("conflict_marker_files") or []
+    warning_reasons = state.get("warning_reasons") or []
+
     return {
         "blocked": bool(state.get("publish_blocked")),
         "status": state.get("publish_blocker_status") or "clean",
@@ -1738,6 +1755,7 @@ def _build_publish_blocker_meta(state: dict) -> dict:
         "allowed_code_count": len(allowed_code),
         "manual_required_count": len(manual_required),
         "hard_risky_count": len(hard_risky_basenames),
+        "conflict_marker_count": len(conflict_markers),
         # Lists — for "show details" expansion. We cap each list at
         # 30 to keep the heartbeat payload small.
         "auto_restored_files": auto_restored[:30],
@@ -1745,6 +1763,8 @@ def _build_publish_blocker_meta(state: dict) -> dict:
         "allowed_code_files": allowed_code[:30],
         "manual_required_files": manual_required[:30],
         "hard_risky_basenames": hard_risky_basenames[:30],
+        "conflict_markers": conflict_markers[:30],
+        "warning_reasons": warning_reasons[:10],
         "message": state.get("publish_blocker_message"),
         "report_path": report_path,
         "report_exists": report_exists,
@@ -1880,7 +1900,8 @@ def _build_publish_meta(cycle_state: dict) -> dict:
     ]
 
     # Compute readiness — first reason wins so the UI can show
-    # something concrete.
+    # something concrete. Note: deploy/CI/infra path-shape is no
+    # longer a blocker (only secret-shaped paths are).
     blocked_reason: str | None = None
     if branch is None:
         blocked_reason = "git 브랜치를 확인할 수 없음"
@@ -1894,12 +1915,12 @@ def _build_publish_meta(cycle_state: dict) -> dict:
         blocked_reason = f"위험 파일 {len(risky_files_state)}건 (최근 사이클)"
     elif risky:
         blocked_reason = f"git 변경 중 위험 파일 {len(risky)}건"
-    elif blocked:
-        blocked_reason = f"금지 경로 {len(blocked)}건"
     elif not changed:
         blocked_reason = "변경 파일 없음"
     elif not allowed:
         blocked_reason = "허용된 파일이 없음"
+    # blocked (deploy/CI/infra path shape) is no longer a blocker —
+    # publish ships them, build/health/secret gates decide actual safety.
 
     ready = blocked_reason is None
 
