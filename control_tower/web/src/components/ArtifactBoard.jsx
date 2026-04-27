@@ -12,18 +12,25 @@ import {
 // artifacts — the goal is "what did the team produce this cycle", not a
 // comprehensive log.
 
-const MAX_CARDS = 6;
+// Bumped from 6 → 9 once the planner ↔ designer ping-pong landed —
+// otherwise the 5-step chain (proposal → critique → revision → final
+// review → PM decision) crowds out frontend/backend/QA/deploy cards.
+const MAX_CARDS = 9;
 
 const ROLE_LABEL = {
-  product_brief:    "기획",
-  planner_proposal: "기획",
-  designer_critique:"디자인",
-  wireframe:        "디자인",
-  api_spec:         "백엔드",
-  frontend_code:    "프론트",
-  agent_design:     "AI",
-  test_cases:       "QA",
-  deploy_log:       "배포",
+  product_brief:         "PM",
+  planner_proposal:      "기획",
+  designer_critique:     "디자인",
+  planner_revision:      "기획",
+  designer_final_review: "디자인",
+  pm_decision:           "PM",
+  desire_scorecard:      "디자인",
+  wireframe:             "디자인",
+  api_spec:              "백엔드",
+  frontend_code:         "프론트",
+  agent_design:          "AI",
+  test_cases:            "QA",
+  deploy_log:            "배포",
 };
 
 function Pin({ color }) {

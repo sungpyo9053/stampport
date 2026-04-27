@@ -231,10 +231,18 @@ export const TASK_STATUS_LABEL = {
 };
 
 // Korean-localized labels for backend artifact types (ArtifactPanel).
+//
+// The planner ↔ designer ping-pong adds five ordered artifacts on top
+// of the legacy roster — they map to docs/agent-collaboration.md and
+// drive the PingPongBoard layout.
 export const ARTIFACT_TYPE_LABEL = {
   product_brief: "제품 브리프",
-  planner_proposal: "신규 장치 후보",
-  designer_critique: "감성 비판/개선",
+  planner_proposal: "기획자 원안",
+  designer_critique: "디자이너 반박",
+  planner_revision: "기획자 수정안",
+  designer_final_review: "디자이너 최종 평가",
+  pm_decision: "PM 결정",
+  desire_scorecard: "욕구 점수표",
   wireframe: "감성 와이어프레임",
   api_spec: "API 명세",
   frontend_code: "프론트 골격",

@@ -50,6 +50,19 @@ APPLY_DIFF_FILE = RUNTIME / "claude_apply.diff"
 # template (LLM need, data storage, MVP scope, success criteria) and
 # is the canonical artifact going forward.
 PRODUCT_PLANNER_FILE = RUNTIME / "product_planner_report.md"
+
+# Planner ↔ Designer ping-pong artifacts (opt-in via
+# FACTORY_PLANNER_DESIGNER_PINGPONG=true). Each step writes its own
+# file so the dashboard's PingPongBoard / ArtifactBoard can render
+# distinct cards instead of one rolling document. The desire scorecard
+# is JSON so the gate logic + dashboard can read scores without
+# Markdown parsing.
+PLANNER_PROPOSAL_FILE       = RUNTIME / "planner_proposal.md"
+DESIGNER_CRITIQUE_FILE      = RUNTIME / "designer_critique.md"
+PLANNER_REVISION_FILE       = RUNTIME / "planner_revision.md"
+DESIGNER_FINAL_REVIEW_FILE  = RUNTIME / "designer_final_review.md"
+PM_DECISION_FILE            = RUNTIME / "pm_decision.md"
+DESIRE_SCORECARD_FILE       = RUNTIME / "desire_scorecard.json"
 # QA Gatekeeper artifacts. qa_report.md is always (re)written by
 # stage_qa_gate; qa_feedback.md is written ONLY when a check fails so
 # the next cycle's qa_fix_propose stage has a precise repro/instruction
@@ -325,6 +338,15 @@ STAGES: list[tuple[str, str, int]] = [
     # consumes verbatim. Runs only when FACTORY_PRODUCT_PLANNER_MODE is
     # on, so cost stays bounded.
     ("product_planning",         "제품 기획",              0),
+    # Planner ↔ Designer ping-pong (opt-in via
+    # FACTORY_PLANNER_DESIGNER_PINGPONG). Runs only after a clean
+    # product_planning result. Each stage writes its own .runtime/
+    # artifact and the desire scorecard gate decides whether the
+    # cycle advances to claude_propose or stalls for rework.
+    ("designer_critique",        "디자이너 반박",           0),
+    ("planner_revision",         "기획자 수정안",           0),
+    ("designer_final_review",    "디자이너 재평가",         0),
+    ("pm_decision",              "PM 최종 결정",            0),
     ("build_app",                "app/web 빌드",           25),
     ("build_control",            "control_tower/web 빌드",  25),
     ("syntax_check",             "문법 검사",              25),
@@ -421,6 +443,44 @@ class CycleState:
     product_planner_message: str | None = None
     product_planner_skipped_reason: str | None = None
     product_planner_gate_failures: list[str] = field(default_factory=list)
+    # Planner ↔ Designer ping-pong state. Each stage tracks its own
+    # status / artifact path / one-line message so the dashboard can
+    # render the 5-step ping-pong (planner proposal → designer
+    # critique → planner revision → designer final review → PM
+    # decision) plus the 6-axis desire scorecard.
+    designer_critique_status: str = "skipped"   # generated|skipped|failed
+    designer_critique_path: str | None = None
+    designer_critique_at: str | None = None
+    designer_critique_message: str | None = None
+    designer_critique_skipped_reason: str | None = None
+    planner_revision_status: str = "skipped"
+    planner_revision_path: str | None = None
+    planner_revision_at: str | None = None
+    planner_revision_message: str | None = None
+    planner_revision_skipped_reason: str | None = None
+    planner_revision_selected_feature: str | None = None
+    designer_final_review_status: str = "skipped"
+    designer_final_review_path: str | None = None
+    designer_final_review_at: str | None = None
+    designer_final_review_message: str | None = None
+    designer_final_review_skipped_reason: str | None = None
+    designer_final_review_verdict: str | None = None  # pass|revise|reject
+    pm_decision_status: str = "skipped"
+    pm_decision_path: str | None = None
+    pm_decision_at: str | None = None
+    pm_decision_message: str | None = None
+    pm_decision_skipped_reason: str | None = None
+    pm_decision_ship_ready: bool = False
+    # Desire scorecard (1~5 each, total /30). ship_ready is True only
+    # when the threshold gate (≥24 total, visual_desire ≥4, share ≥4,
+    # revisit ≥4) passes. rework_required lists the axis ids that
+    # tripped a re-work rule so the dashboard can show "디자이너 재작업"
+    # / "공유 카드 개선 필요" / "기획자 재작업" badges.
+    desire_scorecard: dict[str, int] = field(default_factory=dict)
+    desire_scorecard_total: int = 0
+    desire_scorecard_path: str | None = None
+    desire_scorecard_ship_ready: bool = False
+    desire_scorecard_rework: list[str] = field(default_factory=list)
     # Claude apply status — applied / rolled_back / failed / noop / skipped.
     claude_apply_status: str = "skipped"
     claude_apply_at: str | None = None
@@ -509,6 +569,34 @@ class CycleState:
             "product_planner_message": self.product_planner_message,
             "product_planner_skipped_reason": self.product_planner_skipped_reason,
             "product_planner_gate_failures": list(self.product_planner_gate_failures),
+            "designer_critique_status": self.designer_critique_status,
+            "designer_critique_path": self.designer_critique_path,
+            "designer_critique_at": self.designer_critique_at,
+            "designer_critique_message": self.designer_critique_message,
+            "designer_critique_skipped_reason": self.designer_critique_skipped_reason,
+            "planner_revision_status": self.planner_revision_status,
+            "planner_revision_path": self.planner_revision_path,
+            "planner_revision_at": self.planner_revision_at,
+            "planner_revision_message": self.planner_revision_message,
+            "planner_revision_skipped_reason": self.planner_revision_skipped_reason,
+            "planner_revision_selected_feature": self.planner_revision_selected_feature,
+            "designer_final_review_status": self.designer_final_review_status,
+            "designer_final_review_path": self.designer_final_review_path,
+            "designer_final_review_at": self.designer_final_review_at,
+            "designer_final_review_message": self.designer_final_review_message,
+            "designer_final_review_skipped_reason": self.designer_final_review_skipped_reason,
+            "designer_final_review_verdict": self.designer_final_review_verdict,
+            "pm_decision_status": self.pm_decision_status,
+            "pm_decision_path": self.pm_decision_path,
+            "pm_decision_at": self.pm_decision_at,
+            "pm_decision_message": self.pm_decision_message,
+            "pm_decision_skipped_reason": self.pm_decision_skipped_reason,
+            "pm_decision_ship_ready": self.pm_decision_ship_ready,
+            "desire_scorecard": dict(self.desire_scorecard),
+            "desire_scorecard_total": self.desire_scorecard_total,
+            "desire_scorecard_path": self.desire_scorecard_path,
+            "desire_scorecard_ship_ready": self.desire_scorecard_ship_ready,
+            "desire_scorecard_rework": list(self.desire_scorecard_rework),
             "claude_proposal_status": self.claude_proposal_status,
             "claude_proposal_path": self.claude_proposal_path,
             "claude_proposal_at": self.claude_proposal_at,
@@ -1653,10 +1741,16 @@ PRODUCT_PLANNER_PROMPT_TEMPLATE = """\
 Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모으는 로컬 취향 RPG 서비스다.
 스탬프, EXP, 레벨, 뱃지, 칭호, 주간 퀘스트, 킥 포인트, 내 여권, 감성 공유 카드가 핵심 자산이다.
 
-⚠️ 너의 임무는 단순한 요구사항 정리가 아니다.
-- 너는 매 사이클 새로운 보상/장치/루프를 발굴한다.
-- 사용자의 수집욕/과시욕/성장욕/재방문 욕구를 한 단계 더 자극할 새 장치를 직접 제안한다.
-- 디자이너 에이전트가 다음 사이클에 반드시 ‘갖고 싶은가/자랑하고 싶은가’ 관점에서 반박할 것임을 전제로 작성한다.
+⚠️ 너의 임무는 단순한 요구사항 정리가 아니다. 너는 **욕구 루프 설계자**다.
+- 매 사이클 새로운 보상/장치/루프를 발굴해 사용자의 다음 5개 욕구 중 최소 2개를
+  자극하는 장치를 직접 제안한다:
+    1. 수집욕 (collection)
+    2. 과시욕 (show-off / share)
+    3. 성장욕 (progression)
+    4. 희소성 욕구 (rarity)
+    5. 재방문 욕구 (revisit)
+- 디자이너 에이전트가 다음 사이클에 반드시 ‘갖고 싶은가/자랑하고 싶은가’ 관점에서
+  반박할 것임을 전제로 작성한다.
 - 사용자가 해결책을 정해주지 않았다고 가정하라. 기존 코드/UI의 가장 큰 병목을 직접 찾아라.
 
 === Stampport Domain Profile (config/domain_profiles/stampport.json 일부) ===
@@ -1683,9 +1777,17 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 
 1. 현재 코드/UI를 직접 읽고, 수집/과시/성장/재방문 중 ‘가장 약한 동기 1개’를 찾는다.
    - 추상적이지 않게 한 문장으로 구체화. `path:line` 인용으로 근거를 댄다.
-2. 그 약점을 해결할 신규 장치 후보를 3개 이상 제안한다.
-   - 각 후보는 서로 다른 동기를 자극해야 한다 (예: 후보1=수집욕, 후보2=과시욕, 후보3=재방문).
-   - 동일 패턴의 변형 3개는 허용되지 않는다.
+2. 그 약점을 해결할 신규 장치 후보를 **3개 이상** 제안한다.
+   - 각 후보는 위 5개 욕구 중 **최소 2개 이상**을 자극해야 한다.
+     예) 후보1 = 수집욕 + 과시욕, 후보2 = 성장욕 + 희소성, 후보3 = 재방문 + 과시욕.
+   - 동일 패턴의 변형 3개(같은 보상의 색만 바꾼 3개)는 허용되지 않는다.
+   - 각 후보는 아래 6개 항목을 **모두** 포함해야 한다:
+       a) 기능명 (Stampport 톤의 고유 이름)
+       b) 사용자 욕구 (자극하는 욕구 2개 이상)
+       c) 핵심 루프 (방문→스탬프→보상→다음 방문 흐름)
+       d) MVP 구현 범위 (3~5 bullet)
+       e) 기대 행동 변화 (ship 후 사용자 행동이 어떻게 달라지나)
+       f) 디자이너에게 던질 질문 (3개)
 3. 각 후보를 ‘갖고 싶은가/자랑하고 싶은가/다음 방문을 만드는가’로 평가한다.
 4. 이번 사이클에서 만들 장치 1개를 선택한다 (추상명 금지, Stampport 톤의 고유 이름).
 5. 가장 작은 출하 단위로 자른다 (3~5 bullet).
@@ -1720,11 +1822,41 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 
 ## 신규 장치 아이디어 후보
 
-| 장치 | 자극하는 동기 | 사용자 가치 | 구현 난이도 | 제품 임팩트 | 리스크 |
+| 장치 | 자극하는 욕구(2개 이상) | 사용자 가치 | 구현 난이도 | 제품 임팩트 | 리스크 |
 |---|---|---|---|---|---|
-| 후보1 | 수집/과시/성장/재방문 중 1 | ... | 낮/중/높 | 낮/중/높 | ... |
-| 후보2 | 다른 동기 | ... | ... | ... | ... |
-| 후보3 | 또 다른 동기 | ... | ... | ... | ... |
+| 후보1 | 예: 수집욕 + 과시욕 | ... | 낮/중/높 | 낮/중/높 | ... |
+| 후보2 | 다른 조합 | ... | ... | ... | ... |
+| 후보3 | 또 다른 조합 | ... | ... | ... | ... |
+
+## 후보 상세
+각 후보마다 아래 6개 항목을 빠짐없이 포함하라.
+
+### 후보 1: <기능명>
+- 사용자 욕구: <수집욕/과시욕/성장욕/희소성/재방문 중 2개 이상 + 자극 이유>
+- 핵심 루프: <방문→스탬프→보상→다음 방문>
+- MVP 구현 범위:
+  - bullet 1
+  - bullet 2
+  - bullet 3
+- 기대 행동 변화: <ship 후 사용자 행동이 어떻게 달라지나>
+- 디자이너에게 던질 질문:
+  1. ...
+  2. ...
+  3. ...
+
+### 후보 2: <기능명>
+- 사용자 욕구: ...
+- 핵심 루프: ...
+- MVP 구현 범위: ...
+- 기대 행동 변화: ...
+- 디자이너에게 던질 질문: ...
+
+### 후보 3: <기능명>
+- 사용자 욕구: ...
+- 핵심 루프: ...
+- MVP 구현 범위: ...
+- 기대 행동 변화: ...
+- 디자이너에게 던질 질문: ...
 
 ## 이번 사이클 선정 장치
 선정한 장치명 한 줄. Stampport 톤의 고유 이름.
@@ -2009,6 +2141,48 @@ def _validate_planner_report(body: str) -> list[str]:
     if n_candidates >= 3 and copy_signal >= n_candidates:
         fails.append("기능 후보가 대부분 문구/라벨 개선에 집중됨")
 
+    # Desire-loop per-candidate fields. The new ping-pong protocol
+    # requires each candidate to spell out: 사용자 욕구 (≥2 desires) /
+    # 핵심 루프 / MVP 구현 범위 / 기대 행동 변화 / 디자이너에게 던질
+    # 질문. We check the "## 후보 상세" section for ≥3 sub-cards and
+    # the presence of these labels per sub-card. Tolerated when the
+    # legacy table-only format is used — we only fail if the planner
+    # did include a "후보 상세" block but skipped fields.
+    detail = _extract_md_section(body, "후보 상세")
+    if detail:
+        sub_blocks = re.split(r"^###\s+후보\s*\d+\b", detail, flags=re.MULTILINE)
+        # First chunk is the section preamble; real candidate blocks
+        # are everything after.
+        sub_blocks = [s.strip() for s in sub_blocks[1:] if s.strip()]
+        if len(sub_blocks) < 3:
+            fails.append(
+                f"후보 상세 sub-card 3개 미만 ({len(sub_blocks)}개)"
+            )
+        REQUIRED_FIELDS = (
+            "사용자 욕구",
+            "핵심 루프",
+            "MVP 구현 범위",
+            "기대 행동 변화",
+            "디자이너에게 던질 질문",
+        )
+        for i, block in enumerate(sub_blocks, start=1):
+            for f in REQUIRED_FIELDS:
+                if f not in block:
+                    fails.append(f"후보{i} 상세에 필수 항목 '{f}' 없음")
+            # 사용자 욕구는 최소 2개 이상이어야 한다.
+            desires = ("수집욕", "과시욕", "성장욕", "희소성", "재방문")
+            need_line = ""
+            for line in block.splitlines():
+                if line.lstrip("-* ").startswith("사용자 욕구"):
+                    need_line = line
+                    break
+            if need_line:
+                hits = sum(1 for d in desires if d in need_line)
+                if hits < 2:
+                    fails.append(
+                        f"후보{i} 사용자 욕구가 2개 미만 (자극 욕구: {hits}개)"
+                    )
+
     return fails
 
 
@@ -2114,6 +2288,16 @@ def stage_product_planning(state: CycleState) -> StageResult:
         return sr
 
     PRODUCT_PLANNER_FILE.write_text(body + "\n", encoding="utf-8")
+    # Ping-pong protocol uses planner_proposal.md as the canonical
+    # name for the planner's "원안". Keep the legacy
+    # product_planner_report.md write so existing readers (claude_propose,
+    # heartbeat metadata) keep working, and mirror the same content
+    # under the new name so the dashboard / designer stages can read
+    # a stable file path.
+    try:
+        PLANNER_PROPOSAL_FILE.write_text(body + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
     bottleneck = _extract_bottleneck(body)
     selected = _extract_selected_feature(body)
@@ -2162,6 +2346,663 @@ def stage_product_planning(state: CycleState) -> StageResult:
         + (f", 선정: {selected}" if selected else "")
         + ")"
     )
+    return sr
+
+
+# ---------------------------------------------------------------------------
+# Planner ↔ Designer ping-pong (opt-in via FACTORY_PLANNER_DESIGNER_PINGPONG)
+#
+# Five sequential stages (designer_critique → planner_revision →
+# designer_final_review → pm_decision) that consume the planner's
+# proposal artifact and produce one .runtime/ Markdown each. The
+# designer_final_review stage also writes a structured JSON scorecard
+# (.runtime/desire_scorecard.json) which feeds the shipment gate.
+#
+# All four stages share the same shape: opt-in env check, prerequisite
+# artifact present, run claude with Read/Glob/Grep, validate the output
+# header, persist the artifact, update CycleState, surface a one-line
+# message. Failures or skips never raise — they log a stage row and
+# move on so the cycle still produces a report.
+# ---------------------------------------------------------------------------
+
+
+PINGPONG_ENV_FLAG = "FACTORY_PLANNER_DESIGNER_PINGPONG"
+
+
+def _pingpong_enabled() -> bool:
+    """Honor the same true/1/yes/on convention the rest of cycle.py uses."""
+    return os.environ.get(PINGPONG_ENV_FLAG, "").strip().lower() in {
+        "true", "1", "yes", "on",
+    }
+
+
+def _read_artifact(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _ping_pong_skip(
+    sr: StageResult, t0: float, reason: str, *, status_field: str, state: CycleState
+) -> StageResult:
+    sr.status = "skipped"
+    sr.message = reason
+    sr.duration_sec = round(time.time() - t0, 3)
+    setattr(state, status_field, "skipped")
+    setattr(state, status_field.replace("_status", "_skipped_reason"), reason)
+    return sr
+
+
+DESIGNER_CRITIQUE_PROMPT_TEMPLATE = """\
+너는 Stampport의 디자이너(Designer) 에이전트다.
+
+너는 단순한 UI 장식 담당이 아니다. 너는 **욕구 비평가**다.
+- 기획자가 제안한 후보가 ‘갖고 싶다 / 자랑하고 싶다’를 만드는지 심사한다.
+- 약하면 반드시 push back 한다. 침묵은 실패다.
+- 일반 리뷰앱 / 관리자 대시보드 톤이면 즉시 반박한다.
+
+=== Stampport Domain Profile ===
+{domain_profile}
+=== END Domain Profile ===
+
+=== Agent Collaboration Doctrine ===
+{collab_doc}
+=== END Doctrine ===
+
+=== 기획자 원안 (planner_proposal.md) ===
+{planner_proposal}
+=== END 원안 ===
+
+심사 기준 (각 후보마다 모두 점검):
+1. 일반 리뷰앱처럼 보이지 않는가?
+2. 관리자 대시보드처럼 보이지 않는가?
+3. 도장 / 여권 / RPG 감성이 살아 있는가?
+4. 공유 카드로 올리고 싶은가?
+5. 배지나 칭호가 진짜 갖고 싶어 보이는가?
+
+도구는 Read, Glob, Grep만. 어떤 파일도 수정하지 마라.
+
+출력은 다음 정확한 Markdown 구조만 사용한다. preamble/설명 금지:
+
+# Stampport Designer Critique
+
+## 전체 인상
+원안이 Stampport(로컬 취향 RPG / 여권 / 도장) 정체성을 살리고 있는지 1~2문단.
+
+## 후보별 비판
+### 후보 1
+- 디자인 비판: <어떤 부분이 약한가, 왜 갖고 싶지 않은가>
+- 개선 방향: <어떻게 바꿔야 갖고 싶어지나>
+- Figma식 UI 설명: <레이아웃/계층/간격/모션>
+- 색상/레이아웃/카드/아이콘/문구 지침: <구체 토큰>
+- 공유 욕구 점수: <1~5>
+- 최종 판단: pass / revise / reject
+
+### 후보 2
+(같은 형식)
+
+### 후보 3
+(같은 형식)
+
+## 다시 묻고 싶은 질문
+기획자에게 추가로 묻고 싶은 3가지. 욕구 자극 관점에서.
+
+## 추천 선정 후보
+이 중 무엇을 revise해서 1개로 가져가야 하는지 + 이유 한 문단.
+"""
+
+
+def _build_designer_critique_prompt(planner_md: str) -> str:
+    profile = _load_stampport_profile_text()
+    collab = _load_agent_collab_text()
+    return DESIGNER_CRITIQUE_PROMPT_TEMPLATE.format(
+        domain_profile=profile or "(stampport.json 미존재)",
+        collab_doc=collab or "(agent-collaboration.md 미존재)",
+        planner_proposal=planner_md.strip(),
+    )
+
+
+def _run_pingpong_claude(
+    prompt: str, expected_header: str, *, env_timeout_key: str = "FACTORY_CLAUDE_PINGPONG_TIMEOUT_SEC"
+) -> tuple[bool, str]:
+    """Common claude-CLI invocation for the four ping-pong stages.
+    Returns (ok, body). On success the body starts at the expected
+    header so callers can persist verbatim."""
+    claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+    if not claude_bin:
+        return False, "claude CLI 미설치"
+    model = os.environ.get("FACTORY_CLAUDE_MODEL", "sonnet").strip() or "sonnet"
+    budget_usd = os.environ.get("FACTORY_CLAUDE_BUDGET_USD", "1.0").strip() or "1.0"
+    timeout_sec = float(os.environ.get(env_timeout_key, "600"))
+
+    argv = [
+        claude_bin,
+        "-p", prompt,
+        "--allowed-tools", "Read,Glob,Grep",
+        "--output-format", "text",
+        "--model", model,
+        "--max-budget-usd", budget_usd,
+    ]
+    ok, out = _run(argv, cwd=REPO_ROOT, timeout=timeout_sec)
+    if not ok:
+        return False, f"claude CLI 실행 실패: {(out or '')[-400:]}"
+    body = (out or "").strip()
+    if not body:
+        return False, "claude 응답이 비어있음"
+    idx = body.find(expected_header)
+    if idx == -1:
+        return False, f"응답에 예상 헤더({expected_header}) 없음"
+    return True, body[idx:].rstrip()
+
+
+def stage_designer_critique(state: CycleState) -> StageResult:
+    label = next(lab for n, lab, _ in STAGES if n == "designer_critique")
+    sr = StageResult(name="designer_critique", label=label, status="running")
+    t0 = time.time()
+
+    if state.publish_blocked:
+        return _ping_pong_skip(
+            sr, t0, "차단 사유(secret/conflict)가 남아 있어 ping-pong 중단.",
+            status_field="designer_critique_status", state=state,
+        )
+    if not _pingpong_enabled():
+        return _ping_pong_skip(
+            sr, t0, f"{PINGPONG_ENV_FLAG} 미설정 — 기본 OFF (스킵)",
+            status_field="designer_critique_status", state=state,
+        )
+    if state.product_planner_status != "generated":
+        return _ping_pong_skip(
+            sr, t0, "기획자 제안이 없어 디자이너 반박을 건너뜀",
+            status_field="designer_critique_status", state=state,
+        )
+    planner_md = _read_artifact(PLANNER_PROPOSAL_FILE) or _read_artifact(PRODUCT_PLANNER_FILE)
+    if not planner_md:
+        return _ping_pong_skip(
+            sr, t0, "planner_proposal.md를 읽지 못함",
+            status_field="designer_critique_status", state=state,
+        )
+
+    prompt = _build_designer_critique_prompt(planner_md)
+    ok, body = _run_pingpong_claude(prompt, "# Stampport Designer Critique")
+    sr.duration_sec = round(time.time() - t0, 3)
+    if not ok:
+        sr.status = "failed"
+        sr.message = body[:200]
+        state.designer_critique_status = "failed"
+        state.designer_critique_message = sr.message
+        return sr
+
+    DESIGNER_CRITIQUE_FILE.write_text(body + "\n", encoding="utf-8")
+    state.designer_critique_status = "generated"
+    state.designer_critique_path = str(DESIGNER_CRITIQUE_FILE)
+    state.designer_critique_at = utc_now_iso()
+    state.designer_critique_message = _first_meaningful_line(
+        _extract_md_section(body, "전체 인상"), max_chars=160,
+    )
+    sr.status = "passed"
+    sr.message = (
+        f"디자이너 비판 생성 ({len(body)} chars)"
+        + (f": {state.designer_critique_message[:80]}" if state.designer_critique_message else "")
+    )
+    return sr
+
+
+PLANNER_REVISION_PROMPT_TEMPLATE = """\
+너는 Stampport의 기획자(Product Planner) 에이전트다. 디자이너 에이전트가
+원안을 강하게 반박했다. 이번 사이클에서 ship 할 후보 **1개**를 선택해
+디자이너 비판을 모두 반영한 수정안을 작성한다.
+
+=== 기획자 원안 (planner_proposal.md) ===
+{planner_proposal}
+=== END 원안 ===
+
+=== 디자이너 비판 (designer_critique.md) ===
+{designer_critique}
+=== END 비판 ===
+
+규칙:
+- 원안의 후보 중 1개를 선택한다 (디자이너의 추천 + 자체 판단).
+- 디자이너의 push back을 모두 흡수해 다시 쓴다.
+- 같은 5개 욕구 중 최소 2개 이상을 자극해야 한다.
+- 라벨/문구만 바꾸는 변경은 금지.
+
+도구는 Read, Glob, Grep만 사용. 어떤 파일도 수정하지 마라.
+
+출력은 다음 정확한 Markdown 구조만 사용한다. preamble/설명 금지:
+
+# Stampport Planner Revision
+
+## 선정 후보
+<기능명 한 줄 — Stampport 톤의 고유 이름>
+
+## 디자이너 비판 반영 요약
+- 비판 1 → 어떻게 반영했는가
+- 비판 2 → ...
+- 비판 3 → ...
+
+## 사용자 욕구 (2개 이상)
+<자극하는 욕구와 그 이유>
+
+## 핵심 루프
+방문 → 스탬프 → 보상 → 다음 방문이 어떻게 이어지는지.
+
+## MVP 구현 범위
+- bullet 1
+- bullet 2
+- bullet 3
+
+## 기대 행동 변화
+ship 후 사용자 행동이 어떻게 달라지는지.
+
+## 디자이너에게 다시 던질 질문
+1. ...
+2. ...
+3. ...
+"""
+
+
+def _build_planner_revision_prompt(planner_md: str, critique_md: str) -> str:
+    return PLANNER_REVISION_PROMPT_TEMPLATE.format(
+        planner_proposal=planner_md.strip(),
+        designer_critique=critique_md.strip(),
+    )
+
+
+def stage_planner_revision(state: CycleState) -> StageResult:
+    label = next(lab for n, lab, _ in STAGES if n == "planner_revision")
+    sr = StageResult(name="planner_revision", label=label, status="running")
+    t0 = time.time()
+
+    if state.publish_blocked:
+        return _ping_pong_skip(
+            sr, t0, "차단 사유로 ping-pong 중단",
+            status_field="planner_revision_status", state=state,
+        )
+    if not _pingpong_enabled():
+        return _ping_pong_skip(
+            sr, t0, f"{PINGPONG_ENV_FLAG} 미설정 — 스킵",
+            status_field="planner_revision_status", state=state,
+        )
+    if state.designer_critique_status != "generated":
+        return _ping_pong_skip(
+            sr, t0, "디자이너 비판이 없어 수정안을 작성할 수 없음",
+            status_field="planner_revision_status", state=state,
+        )
+    planner_md = _read_artifact(PLANNER_PROPOSAL_FILE) or _read_artifact(PRODUCT_PLANNER_FILE) or ""
+    critique_md = _read_artifact(DESIGNER_CRITIQUE_FILE) or ""
+    if not planner_md or not critique_md:
+        return _ping_pong_skip(
+            sr, t0, "ping-pong 입력 아티팩트가 비어 있음",
+            status_field="planner_revision_status", state=state,
+        )
+
+    prompt = _build_planner_revision_prompt(planner_md, critique_md)
+    ok, body = _run_pingpong_claude(prompt, "# Stampport Planner Revision")
+    sr.duration_sec = round(time.time() - t0, 3)
+    if not ok:
+        sr.status = "failed"
+        sr.message = body[:200]
+        state.planner_revision_status = "failed"
+        state.planner_revision_message = sr.message
+        return sr
+
+    PLANNER_REVISION_FILE.write_text(body + "\n", encoding="utf-8")
+    state.planner_revision_status = "generated"
+    state.planner_revision_path = str(PLANNER_REVISION_FILE)
+    state.planner_revision_at = utc_now_iso()
+    state.planner_revision_selected_feature = _first_meaningful_line(
+        _extract_md_section(body, "선정 후보"), max_chars=120,
+    ) or None
+    state.planner_revision_message = state.planner_revision_selected_feature or "수정안 생성"
+    sr.status = "passed"
+    sr.message = (
+        f"기획자 수정안 생성 ({len(body)} chars)"
+        + (f": {state.planner_revision_selected_feature[:80]}"
+           if state.planner_revision_selected_feature else "")
+    )
+    return sr
+
+
+DESIGNER_FINAL_REVIEW_PROMPT_TEMPLATE = """\
+너는 Stampport의 디자이너(Designer) 에이전트다. 기획자의 수정안을
+최종 심사한다. 욕구 점수표 6축을 1~5점으로 평가하고 각 점수의 이유를
+한 줄로 적는다. 점수는 후한 인상 점수가 아니라 **냉정한 비평**이다.
+
+=== 기획자 수정안 (planner_revision.md) ===
+{planner_revision}
+=== END 수정안 ===
+
+=== 디자이너 원 비판 (designer_critique.md) ===
+{designer_critique}
+=== END 비판 ===
+
+도구는 Read, Glob, Grep만. 어떤 파일도 수정하지 마라.
+
+출력은 다음 정확한 Markdown 구조만 사용한다. preamble/설명 금지:
+
+# Stampport Designer Final Review
+
+## 첫인상
+1~2문단으로 ‘갖고 싶은가 / 자랑하고 싶은가’ 관점에서.
+
+## 욕구 점수표
+| 축 | 점수 (1~5) | 이유 |
+|---|---|---|
+| Collection Score | <int> | 더 모으고 싶은 욕구를 만드는가 |
+| Share Score | <int> | 인스타 스토리에 올리고 싶은가 |
+| Progression Score | <int> | EXP/레벨/칭호 진행이 다음 방문을 자극하는가 |
+| Rarity Score | <int> | 빈 슬롯/미획득 뱃지가 다음 행동을 자극하는가 |
+| Revisit Score | <int> | 킥 포인트가 다음 방문지를 명확히 제시하는가 |
+| Visual Desire Score | <int> | 도장/뱃지/카드가 진짜 갖고 싶어 보이는가 |
+
+## 약점
+한두 문단. 어디가 여전히 약한가.
+
+## 개선 지침
+- 색상/레이아웃 지침
+- 카드/아이콘 지침
+- 문구 지침
+
+## 최종 판단
+pass / revise / reject 중 하나만 선택. 한 문장 이유.
+"""
+
+
+def _build_designer_final_prompt(revision_md: str, critique_md: str) -> str:
+    return DESIGNER_FINAL_REVIEW_PROMPT_TEMPLATE.format(
+        planner_revision=revision_md.strip(),
+        designer_critique=critique_md.strip(),
+    )
+
+
+# Map the 6 score-table row labels (case-insensitive substring match) to
+# the canonical axis ids used in CycleState + dashboard. Stored once so
+# both the parser and the gate logic share the same source of truth.
+_SCORE_AXIS_LABELS: list[tuple[str, str]] = [
+    ("collection score",     "collection"),
+    ("share score",          "share"),
+    ("progression score",    "progression"),
+    ("rarity score",         "rarity"),
+    ("revisit score",        "revisit"),
+    ("visual desire",        "visual_desire"),
+]
+
+
+def _parse_desire_scorecard(body: str) -> dict[str, int]:
+    """Parse the 6-axis score table out of designer_final_review.md.
+    Tolerates extra whitespace / surrounding text. Returns {} on
+    failure rather than raising — the caller treats that as a gate
+    fail (no-score)."""
+    section = _extract_md_section(body, "욕구 점수표")
+    if not section:
+        return {}
+    out: dict[str, int] = {}
+    for line in section.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or not s.endswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        label_low = cells[0].lower()
+        # Skip header / separator rows.
+        if "축" in cells[0] or "axis" in label_low or set(cells[0]) <= {"-", " "}:
+            continue
+        # Find a numeric score in the second column. Tolerate "4점", "4 / 5".
+        m = re.search(r"\b([1-5])\b", cells[1])
+        if not m:
+            continue
+        score = int(m.group(1))
+        for needle, axis_id in _SCORE_AXIS_LABELS:
+            if needle in label_low:
+                out[axis_id] = score
+                break
+    return out
+
+
+def _evaluate_desire_gate(scores: dict[str, int]) -> tuple[int, bool, list[str]]:
+    """Return (total, ship_ready, rework_axes) based on the documented
+    thresholds. ship_ready collapses *all* gate checks; rework_axes
+    enumerates which specific axes tripped a re-work rule so the
+    dashboard can render targeted badges."""
+    if not scores:
+        return 0, False, ["no_score"]
+    total = sum(scores.values())
+    rework: list[str] = []
+    if scores.get("visual_desire", 0) < 4:
+        rework.append("visual_desire")
+    if scores.get("share", 0) <= 3:
+        rework.append("share")
+    if scores.get("revisit", 0) <= 3:
+        rework.append("revisit")
+    if total < 24:
+        rework.append("total_below_24")
+    ship_ready = (total >= 24) and not rework
+    # If the only "rework" trigger was total_below_24 the rework field
+    # still includes it — that's intentional, since both planner and
+    # designer would need to push the loop to ≥24.
+    return total, ship_ready, rework
+
+
+def _extract_verdict(body: str) -> str | None:
+    section = _extract_md_section(body, "최종 판단")
+    if not section:
+        return None
+    head = section.lower()
+    for kw in ("pass", "revise", "reject"):
+        if kw in head:
+            return kw
+    return None
+
+
+def stage_designer_final_review(state: CycleState) -> StageResult:
+    label = next(lab for n, lab, _ in STAGES if n == "designer_final_review")
+    sr = StageResult(name="designer_final_review", label=label, status="running")
+    t0 = time.time()
+
+    if state.publish_blocked:
+        return _ping_pong_skip(
+            sr, t0, "차단 사유로 ping-pong 중단",
+            status_field="designer_final_review_status", state=state,
+        )
+    if not _pingpong_enabled():
+        return _ping_pong_skip(
+            sr, t0, f"{PINGPONG_ENV_FLAG} 미설정 — 스킵",
+            status_field="designer_final_review_status", state=state,
+        )
+    if state.planner_revision_status != "generated":
+        return _ping_pong_skip(
+            sr, t0, "수정안이 없어 재평가를 건너뜀",
+            status_field="designer_final_review_status", state=state,
+        )
+
+    revision_md = _read_artifact(PLANNER_REVISION_FILE) or ""
+    critique_md = _read_artifact(DESIGNER_CRITIQUE_FILE) or ""
+    if not revision_md:
+        return _ping_pong_skip(
+            sr, t0, "planner_revision.md를 읽지 못함",
+            status_field="designer_final_review_status", state=state,
+        )
+
+    prompt = _build_designer_final_prompt(revision_md, critique_md)
+    ok, body = _run_pingpong_claude(prompt, "# Stampport Designer Final Review")
+    sr.duration_sec = round(time.time() - t0, 3)
+    if not ok:
+        sr.status = "failed"
+        sr.message = body[:200]
+        state.designer_final_review_status = "failed"
+        state.designer_final_review_message = sr.message
+        return sr
+
+    DESIGNER_FINAL_REVIEW_FILE.write_text(body + "\n", encoding="utf-8")
+    scores = _parse_desire_scorecard(body)
+    total, ship_ready, rework = _evaluate_desire_gate(scores)
+    verdict = _extract_verdict(body)
+
+    state.designer_final_review_status = "generated"
+    state.designer_final_review_path = str(DESIGNER_FINAL_REVIEW_FILE)
+    state.designer_final_review_at = utc_now_iso()
+    state.designer_final_review_verdict = verdict
+    state.desire_scorecard = dict(scores)
+    state.desire_scorecard_total = total
+    state.desire_scorecard_ship_ready = ship_ready
+    state.desire_scorecard_rework = rework
+
+    # Persist the structured scorecard so the PM stage + dashboard can
+    # consume it without re-parsing Markdown.
+    try:
+        DESIRE_SCORECARD_FILE.write_text(
+            json.dumps(
+                {
+                    "scores": scores,
+                    "total": total,
+                    "ship_ready": ship_ready,
+                    "rework": rework,
+                    "verdict": verdict,
+                    "generated_at": state.designer_final_review_at,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        state.desire_scorecard_path = str(DESIRE_SCORECARD_FILE)
+    except OSError:
+        state.desire_scorecard_path = None
+
+    score_summary = (
+        f"총점 {total}/30"
+        + (f", verdict={verdict}" if verdict else "")
+        + (f", rework={','.join(rework)}" if rework else ", ship-ready")
+    )
+    state.designer_final_review_message = score_summary
+    sr.status = "passed"
+    sr.message = f"디자이너 재평가 완료 ({score_summary})"
+    return sr
+
+
+PM_DECISION_PROMPT_TEMPLATE = """\
+너는 Stampport의 PM 에이전트다. 기획자–디자이너 ping-pong이 끝났다.
+욕구 점수표 결과를 토대로 이번 사이클에 ship 할지 여부와 출하 단위를 결정한다.
+
+=== 기획자 수정안 (planner_revision.md) ===
+{planner_revision}
+=== END 수정안 ===
+
+=== 디자이너 최종 평가 (designer_final_review.md) ===
+{designer_final_review}
+=== END 평가 ===
+
+=== Desire Scorecard (JSON) ===
+{scorecard_json}
+=== END Scorecard ===
+
+출하 기준 (반드시 준수):
+- 총점 ≥ 24 → ship 후보
+- Visual Desire Score ≥ 4 → 통과 (미달 시 디자이너 재작업)
+- Share Score ≥ 4 → 통과 (3 이하면 공유 카드 개선 필요)
+- Revisit Score ≥ 4 → 통과 (3 이하면 기획자 재작업)
+
+도구는 Read, Glob, Grep만. 어떤 파일도 수정하지 마라.
+
+출력은 다음 정확한 Markdown 구조만 사용한다. preamble/설명 금지:
+
+# Stampport PM Decision
+
+## 출하 결정
+ship / hold (재작업 후 다음 사이클) 중 하나만.
+
+## 결정 이유
+욕구 점수표 결과를 토대로 한 문단.
+
+## 출하 단위 (가장 작은)
+- bullet 1
+- bullet 2
+- bullet 3
+
+## 다음 단계 담당
+- 디자이너: <re-work 필요 시 어떤 부분을 다시 그리나, 아니면 'N/A'>
+- 기획자: <revisit/share rework 필요 시 무엇을 다시 설계, 아니면 'N/A'>
+- 프론트/백엔드: <ship 결정일 때만 작업 지시. 그 외 'N/A'>
+
+## QA가 추가로 점검할 것
+- 기능 게이트 외 욕구 점수 검증 항목 1~3개
+"""
+
+
+def _build_pm_decision_prompt(
+    revision_md: str, final_review_md: str, scorecard: dict
+) -> str:
+    return PM_DECISION_PROMPT_TEMPLATE.format(
+        planner_revision=revision_md.strip(),
+        designer_final_review=final_review_md.strip(),
+        scorecard_json=json.dumps(scorecard, ensure_ascii=False, indent=2),
+    )
+
+
+def stage_pm_decision(state: CycleState) -> StageResult:
+    label = next(lab for n, lab, _ in STAGES if n == "pm_decision")
+    sr = StageResult(name="pm_decision", label=label, status="running")
+    t0 = time.time()
+
+    if state.publish_blocked:
+        return _ping_pong_skip(
+            sr, t0, "차단 사유로 ping-pong 중단",
+            status_field="pm_decision_status", state=state,
+        )
+    if not _pingpong_enabled():
+        return _ping_pong_skip(
+            sr, t0, f"{PINGPONG_ENV_FLAG} 미설정 — 스킵",
+            status_field="pm_decision_status", state=state,
+        )
+    if state.designer_final_review_status != "generated":
+        return _ping_pong_skip(
+            sr, t0, "디자이너 재평가가 없어 PM 결정을 건너뜀",
+            status_field="pm_decision_status", state=state,
+        )
+
+    revision_md = _read_artifact(PLANNER_REVISION_FILE) or ""
+    final_review_md = _read_artifact(DESIGNER_FINAL_REVIEW_FILE) or ""
+    scorecard = {
+        "scores": dict(state.desire_scorecard),
+        "total": state.desire_scorecard_total,
+        "ship_ready": state.desire_scorecard_ship_ready,
+        "rework": list(state.desire_scorecard_rework),
+        "verdict": state.designer_final_review_verdict,
+    }
+    prompt = _build_pm_decision_prompt(revision_md, final_review_md, scorecard)
+    ok, body = _run_pingpong_claude(prompt, "# Stampport PM Decision")
+    sr.duration_sec = round(time.time() - t0, 3)
+    if not ok:
+        sr.status = "failed"
+        sr.message = body[:200]
+        state.pm_decision_status = "failed"
+        state.pm_decision_message = sr.message
+        return sr
+
+    PM_DECISION_FILE.write_text(body + "\n", encoding="utf-8")
+    decision_section = _extract_md_section(body, "출하 결정").lower()
+    ship_word = "ship" in decision_section
+    hold_word = "hold" in decision_section
+    # PM is the final word: ship requires both the gate (ship_ready)
+    # AND the explicit "ship" verdict. If either says hold, we hold.
+    pm_ship = ship_word and not hold_word and state.desire_scorecard_ship_ready
+
+    state.pm_decision_status = "generated"
+    state.pm_decision_path = str(PM_DECISION_FILE)
+    state.pm_decision_at = utc_now_iso()
+    state.pm_decision_ship_ready = pm_ship
+    summary = (
+        ("SHIP" if pm_ship else "HOLD")
+        + f" (총점 {state.desire_scorecard_total}/30"
+        + (f", rework={','.join(state.desire_scorecard_rework)}"
+           if state.desire_scorecard_rework else "")
+        + ")"
+    )
+    state.pm_decision_message = summary
+    sr.status = "passed"
+    sr.message = f"PM 결정 완료 — {summary}"
     return sr
 
 
@@ -4214,6 +5055,15 @@ def main() -> int:
     run_stage("publish_blocker_check", lambda: stage_publish_blocker_check(state))
     run_stage("publish_blocker_resolve", lambda: stage_publish_blocker_resolve(state))
     run_stage("product_planning", lambda: stage_product_planning(state))
+    # Planner ↔ Designer ping-pong. Each stage no-ops (skipped) when
+    # FACTORY_PLANNER_DESIGNER_PINGPONG is unset, so existing flows
+    # are unaffected. When enabled, the four stages produce the
+    # designer_critique / planner_revision / designer_final_review /
+    # pm_decision artifacts and populate the desire scorecard.
+    run_stage("designer_critique",     lambda: stage_designer_critique(state))
+    run_stage("planner_revision",      lambda: stage_planner_revision(state))
+    run_stage("designer_final_review", lambda: stage_designer_final_review(state))
+    run_stage("pm_decision",           lambda: stage_pm_decision(state))
     run_stage(
         "build_app",
         lambda: stage_web_build(state, web_dir=REPO_ROOT / "app" / "web", name="build_app"),

@@ -105,29 +105,86 @@
   "button_language_avoid": ["등록하기", "제출하기", "리뷰 쓰기"],
   "agent_collaboration": {
     "core_pair": ["planner", "designer"],
-    "philosophy": "기획자 에이전트와 디자이너 에이전트의 ping-pong이 공장의 핵심이다.",
+    "philosophy": "기획자 에이전트(욕구 루프 설계자)와 디자이너 에이전트(욕구 비평가)의 ping-pong이 공장의 핵심이다.",
+    "planner_role": "단순 기능 제안자가 아니라 욕구 루프 설계자. 매 사이클 사용자의 수집/과시/성장/희소성/재방문 욕구를 자극할 신규 장치를 제안한다.",
+    "designer_role": "단순 UI 장식 담당이 아니라 갖고 싶고 자랑하고 싶은지 심사하는 욕구 비평가. 약하면 반드시 반박한다.",
+    "desires": [
+      {"id": "collection", "ko": "수집욕"},
+      {"id": "show_off",   "ko": "과시욕"},
+      {"id": "progression","ko": "성장욕"},
+      {"id": "rarity",     "ko": "희소성 욕구"},
+      {"id": "revisit",    "ko": "재방문 욕구"}
+    ],
     "planner_must_propose": [
-      "새 보상 / 새 뱃지 / 새 칭호",
-      "새 수집 루프",
-      "새 퀘스트",
-      "새 여권 슬롯",
-      "스탬프 카드 진화",
-      "재방문을 끌어내는 작은 장치"
+      "매 사이클 신규 기능 후보 3개 이상",
+      "각 후보는 위 욕구 중 최소 2개 이상을 자극해야 함",
+      "동일 패턴 변형(같은 보상의 색만 바꾼 3개)은 거부됨",
+      "라벨/문구/주석만 바꾸는 제안 금지"
+    ],
+    "planner_proposal_required_fields": [
+      "기능명",
+      "사용자 욕구",
+      "핵심 루프",
+      "MVP 구현 범위",
+      "기대 행동 변화",
+      "디자이너에게 던질 질문"
     ],
     "designer_must_challenge": [
-      "이 뱃지/칭호가 정말 갖고 싶게 보이는가",
-      "이 카드가 인스타 스토리에 자랑하고 싶게 생겼는가",
-      "이 빈 슬롯이 다음 방문 욕구를 만드는가",
-      "이 도장이 실제 여권 도장처럼 느껴지는가",
-      "이 화면이 RPG/취향 컬렉션처럼 보이는가"
+      "일반 리뷰앱처럼 보이지 않는가",
+      "관리자 대시보드처럼 보이지 않는가",
+      "도장 / 여권 / RPG 감성이 살아 있는가",
+      "공유 카드로 올리고 싶은가",
+      "배지나 칭호가 진짜 갖고 싶어 보이는가"
+    ],
+    "designer_output_required_fields": [
+      "디자인 비판",
+      "개선 방향",
+      "Figma식 UI 설명",
+      "색상/레이아웃/카드/아이콘/문구 지침",
+      "공유 욕구 점수",
+      "최종 판단"
     ],
     "ping_pong_rules": [
-      "기획자는 매 사이클 3개 이상의 후보를 제안한다.",
-      "디자이너는 각 후보의 수집욕/과시욕/소유욕을 비판한다.",
-      "PM은 합의된 1개를 가장 작은 출하 단위로 자른다.",
-      "개발자는 합의된 단위만 구현한다.",
-      "QA는 기능 동작 + 감정 루프를 같이 검증한다."
+      "1. 기획자 제안 (3개 이상 후보 + 필수 필드)",
+      "2. 디자이너 반박 (약한 후보 반드시 push back)",
+      "3. 기획자 수정안 (1개 선정 + 디자이너 비판 반영)",
+      "4. 디자이너 재평가 (욕구 점수표 6축 1~5점)",
+      "5. PM 최종 결정 (출하 단위 1개)",
+      "6. 개발자는 PM 결정 이후에만 작업한다",
+      "7. QA는 기능 + 욕구 루프를 같이 검증한다"
+    ],
+    "ping_pong_artifacts": [
+      "planner_proposal",
+      "designer_critique",
+      "planner_revision",
+      "designer_final_review",
+      "pm_decision",
+      "desire_scorecard"
     ]
+  },
+  "desire_scorecard": {
+    "axes": [
+      {"id": "collection",     "ko": "Collection Score",  "question": "더 모으고 싶은 욕구를 만드는가"},
+      {"id": "share",          "ko": "Share Score",       "question": "인스타 스토리에 올리고 싶은가"},
+      {"id": "progression",    "ko": "Progression Score", "question": "EXP/레벨/칭호 진행이 다음 방문을 자극하는가"},
+      {"id": "rarity",         "ko": "Rarity Score",      "question": "빈 슬롯/미획득 뱃지가 다음 행동을 자극하는가"},
+      {"id": "revisit",        "ko": "Revisit Score",     "question": "킥 포인트가 다음 방문지를 명확히 제시하는가"},
+      {"id": "visual_desire",  "ko": "Visual Desire Score","question": "이 도장/뱃지/카드가 진짜 갖고 싶어 보이는가"}
+    ],
+    "scale": "1~5 (정수)",
+    "max_total": 30,
+    "ship_thresholds": {
+      "min_total": 24,
+      "min_visual_desire": 4,
+      "min_share_to_skip_rework": 4,
+      "min_revisit_to_skip_rework": 4,
+      "rework_rules": [
+        "총점 < 24 → 구현 후보 아님 (planner/designer 재작업)",
+        "Visual Desire Score < 4 → 디자이너 재작업",
+        "Share Score ≤ 3 → 공유 카드 개선 필요",
+        "Revisit Score ≤ 3 → 기획자 재작업"
+      ]
+    }
   },
   "qa_emotional_checks": [
     "수집욕: 더 모으고 싶은 욕구를 만드는가",

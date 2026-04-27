@@ -114,34 +114,82 @@ DEMO_WORKFLOW: list[AgentScript] = [
     ),
     AgentScript(
         agent_id="planner",
-        task_title="신규 보상/장치 후보 3개 제안",
+        task_title="신규 보상/장치 후보 3개 제안 (원안)",
         task_description="스탬프·EXP·뱃지·칭호·여권·퀘스트·공유카드 라인업에 새 장치를 제안합니다.",
         messages=[
             "사용자 동기를 한 단계 더 끌어올릴 보상 후보 3가지를 정리하고 있어요.",
-            "각 후보마다 수집욕/과시욕/성장욕 자극 포인트를 서로 다르게 설계하고 있어요.",
+            "각 후보마다 수집/과시/성장/희소성/재방문 욕구 중 2개 이상을 자극하도록 설계하고 있어요.",
             "디자이너에게 ‘진짜 갖고 싶은가’ 질문할 준비를 하고 있어요.",
         ],
         artifact_type="planner_proposal",
-        artifact_title="신규 장치 후보 v0.1",
+        artifact_title="신규 장치 후보 v0.1 (원안)",
         artifact_content=(
-            "후보1 Local Visa 뱃지, 후보2 Taste Title 진화, 후보3 Passport 빈 슬롯. "
-            "각 후보의 동기 자극 포인트와 최소 출하 범위를 함께 제시한다."
+            "후보1 Local Visa 뱃지(수집+과시), 후보2 Taste Title 진화(성장+과시), "
+            "후보3 Passport 빈 슬롯(희소+재방문). 각 후보에 기능명/사용자 욕구/"
+            "핵심 루프/MVP 범위/기대 행동 변화/디자이너 질문을 담아 제출."
         ),
     ),
     AgentScript(
         agent_id="designer",
-        task_title="기획 후보 감성 검증과 개선",
+        task_title="기획 후보 감성 반박 (1차 비판)",
         task_description="각 후보가 실제로 갖고 싶고 자랑하고 싶은지 반박합니다.",
         messages=[
-            "이 뱃지가 인스타 스토리에 자랑하고 싶게 보이는지 점검하고 있어요.",
+            "이 뱃지가 일반 리뷰앱처럼 보이지 않는지, 여권 비자처럼 느껴지는지 점검하고 있어요.",
             "여권 빈 슬롯이 다음 방문 욕구를 만드는지 검증하고 있어요.",
-            "최종 1개 후보를 갖고 싶은 형태로 다듬어 PM에게 넘기고 있어요.",
+            "최종 1개 후보를 갖고 싶은 형태로 다듬어 기획자에게 push back 보내고 있어요.",
         ],
-        artifact_type="wireframe",
-        artifact_title="감성 와이어프레임 v0.1",
+        artifact_type="designer_critique",
+        artifact_title="디자이너 감성 비판 v0.1",
         artifact_content=(
-            "선정 장치를 도장/뱃지/공유카드 톤으로 재해석한 와이어프레임. "
-            "deep green / cream / gold / burgundy / navy 팔레트 사용."
+            "뱃지가 평범한 리스트 카드처럼 보임. 도장+발급도시+발급일자가 들어간 비자형 "
+            "레이아웃으로 다시 그려야 자랑하고 싶음. 빈 슬롯도 회색 사각형이 아니라 "
+            "발급 대기 도장 자국으로 재해석 필요."
+        ),
+    ),
+    AgentScript(
+        agent_id="planner",
+        task_title="디자이너 비판 반영한 수정안",
+        task_description="비판을 흡수해 ship 후보 1개로 좁히고 다시 작성합니다.",
+        messages=[
+            "디자이너 비판 3개를 모두 반영해 후보 1개로 좁히고 있어요.",
+            "수정안의 핵심 루프와 MVP 범위를 다시 다듬고 있어요.",
+        ],
+        artifact_type="planner_revision",
+        artifact_title="기획자 수정안 v0.1",
+        artifact_content=(
+            "Local Visa 뱃지 1개로 좁힘. 수집욕+과시욕+희소성을 모두 자극. "
+            "MVP: 비자 카드 컴포넌트, 발급일/도시/도장 슬롯, 공유 카드 진화."
+        ),
+    ),
+    AgentScript(
+        agent_id="designer",
+        task_title="수정안 최종 평가 + 욕구 점수표",
+        task_description="6축 욕구 점수(1~5)를 매겨 ship 가능 여부를 판단합니다.",
+        messages=[
+            "Visual Desire / Share / Revisit 점수가 ship 기준을 통과하는지 보고 있어요.",
+            "총점 24점 이상이고 Visual Desire가 4점 이상이면 통과 사인을 보낼게요.",
+        ],
+        artifact_type="designer_final_review",
+        artifact_title="디자이너 최종 평가 v0.1",
+        artifact_content=(
+            "Collection 5 / Share 4 / Progression 4 / Rarity 4 / Revisit 4 / "
+            "Visual Desire 5 = 총 26/30. ship 통과. 단 공유 카드의 발급일 폰트는 "
+            "더 두껍게 가야 자랑성이 살아남."
+        ),
+    ),
+    AgentScript(
+        agent_id="pm",
+        task_title="PM 최종 출하 결정",
+        task_description="욕구 점수표를 토대로 가장 작은 출하 단위 1개를 확정합니다.",
+        messages=[
+            "총점 26/30, Visual Desire 5 — ship 결정으로 정리하고 있어요.",
+            "프론트/백엔드/QA 작업 범위를 가장 작은 한 칸으로 잘라 전달하고 있어요.",
+        ],
+        artifact_type="pm_decision",
+        artifact_title="PM 출하 결정 v0.1",
+        artifact_content=(
+            "ship 결정. 출하 단위: Local Visa 뱃지 컴포넌트 + 공유 카드 도장 진화. "
+            "QA는 기능 게이트 외 수집/과시/재방문 욕구 점검을 함께 수행."
         ),
     ),
     AgentScript(
