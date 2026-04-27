@@ -251,6 +251,14 @@ ALLOWED_COMMANDS: tuple[str, ...] = (
     # *_request variant never touches git history.
     "operator_fix_request",
     "operator_fix_and_publish",
+    # Operator Request — autonomous "Claude에게 작업 지시" channel
+    # used by OperatorCommandPanel. Unlike operator_fix_*, this hands
+    # full edit + validate + commit + push authority to Claude via
+    # LOCAL_RUNNER_CLAUDE_COMMAND. The runner writes the prompt to
+    # .runtime/operator_request.md and Claude itself is responsible
+    # for refusing to commit/push on validation/secret/conflict
+    # failures. The dashboard sends payload {prompt, auto_commit_push}.
+    "operator_request",
 )
 
 

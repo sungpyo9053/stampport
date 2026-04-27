@@ -4,6 +4,8 @@ import PingPongBoard from "../components/PingPongBoard.jsx";
 import ArtifactBoard from "../components/ArtifactBoard.jsx";
 import ControlDock from "../components/ControlDock.jsx";
 import PipelineTimeline from "../components/PipelineTimeline.jsx";
+import OperatorCommandPanel from "../components/OperatorCommandPanel.jsx";
+import SystemLogPanel from "../components/SystemLogPanel.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -212,6 +214,15 @@ export default function ControlTowerPage() {
         agentStatuses={agentStatuses}
         factoryEvents={factoryEvents}
       />
+
+      {/* Operations row: OperatorCommandPanel on the right, SystemLog
+          on the left taking the wide column. On mobile both stack
+          (Operator first so a phone tap on a small screen lands on
+          the input field). */}
+      <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <SystemLogPanel events={events} />
+        <OperatorCommandPanel runners={runners} onSent={tick} />
+      </section>
 
       {/* Main: pixel office on the left, ping-pong + artifact stack on the right.
           On mobile/tablet the side rail collapses below. */}

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import ssl
 import subprocess
@@ -551,6 +552,92 @@ def _save_publish_state(updates: dict) -> None:
     )
 
 
+# Deploy progress — fine-grained per-stage state the dashboard's
+# "배포 진행" stepper consults so a user can see exactly where a
+# deploy is mid-flight (received → validating → committing → pushing
+# → actions_triggered → completed/failed). Persisted under the
+# publish_state row so a single _save_publish_state write is enough.
+DEPLOY_PROGRESS_HISTORY_CAP = 40
+DEPLOY_PROGRESS_TERMINAL = {"completed", "failed", "actions_triggered"}
+
+
+def _new_deploy_progress(now: str) -> dict:
+    return {
+        "status": "idle",
+        "current_step": None,
+        "started_at": None,
+        "updated_at": now,
+        "completed_at": None,
+        "failed_reason": None,
+        "failed_at_status": None,
+        "actions_url": ACTIONS_URL,
+        "history": [],
+    }
+
+
+def _set_deploy_progress(
+    status: str,
+    *,
+    current_step: str | None = None,
+    failed_reason: str | None = None,
+    log_message: str | None = None,
+    reset: bool = False,
+) -> None:
+    """Update the deploy progress block under publish_state.
+
+    Each call appends a history entry so the dashboard can render a
+    timestamped log without the FE having to keep its own buffer
+    across reloads. History is capped at DEPLOY_PROGRESS_HISTORY_CAP
+    to keep the heartbeat payload small.
+    """
+    cur = _read_publish_state()
+    prev = cur.get("deploy_progress")
+    if not isinstance(prev, dict):
+        prev = {}
+    now = _utc_now_z()
+    progress = {
+        "status": prev.get("status") or "idle",
+        "current_step": prev.get("current_step"),
+        "started_at": prev.get("started_at"),
+        "updated_at": prev.get("updated_at") or now,
+        "completed_at": prev.get("completed_at"),
+        "failed_reason": prev.get("failed_reason"),
+        "failed_at_status": prev.get("failed_at_status"),
+        "actions_url": ACTIONS_URL,
+        "history": list(prev.get("history") or [])[-DEPLOY_PROGRESS_HISTORY_CAP:],
+    }
+    if reset:
+        progress["started_at"] = now
+        progress["completed_at"] = None
+        progress["failed_reason"] = None
+        progress["failed_at_status"] = None
+    prior_status = progress["status"]
+    progress["status"] = status
+    progress["updated_at"] = now
+    if current_step is not None:
+        progress["current_step"] = current_step
+    if status == "command_received" and not progress["started_at"]:
+        progress["started_at"] = now
+    if status in {"completed", "failed"}:
+        progress["completed_at"] = now
+    if status == "failed":
+        if failed_reason is not None:
+            progress["failed_reason"] = failed_reason
+        # Pin the in-flight stage where the failure happened so the
+        # stepper can mark exactly that step red.
+        progress["failed_at_status"] = (
+            prior_status if prior_status not in ("idle", "failed") else "command_received"
+        )
+    entry_msg = log_message or current_step or status
+    progress["history"].append({
+        "at": now,
+        "status": status,
+        "message": entry_msg,
+    })
+    progress["history"] = progress["history"][-DEPLOY_PROGRESS_HISTORY_CAP:]
+    _save_publish_state({"deploy_progress": progress})
+
+
 def _publish_is_dry_run() -> bool:
     """Default ON. Only flipping `LOCAL_RUNNER_PUBLISH_DRY_RUN=false`
     explicitly disables dry-run mode."""
@@ -764,6 +851,17 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     state_at_start = _read_factory_state() or {}
     started_at = _utc_now_z()
 
+    # Only the dashboard's deploy_to_server flow asks us to surface
+    # per-stage progress to the heartbeat. Operator-fix and direct
+    # publish_changes calls leave the deploy_progress block alone so
+    # the stepper doesn't light up out-of-band.
+    track_progress = bool((_payload or {}).get("__track_deploy_progress"))
+
+    def _progress(status: str, *, step: str, fail: str | None = None) -> None:
+        if not track_progress:
+            return
+        _set_deploy_progress(status, current_step=step, failed_reason=fail)
+
     def _record_failure(stage: str, message: str) -> None:
         """Persist enough for the heartbeat/UI to show why we refused."""
         _save_publish_state({
@@ -773,6 +871,14 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
             "last_failed_stage": stage,
             "last_attempt_started_at": started_at,
         })
+        if track_progress:
+            _set_deploy_progress(
+                "failed",
+                current_step=f"{stage} 실패",
+                failed_reason=message[:280],
+            )
+
+    _progress("validating", step="브랜치 / Release Safety Gate 확인 중")
 
     # 1. Must be on main.
     branch = _git_current_branch()
@@ -836,6 +942,7 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     # code compiles. Override is possible via
     # LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true (emergency only),
     # but never overrides risky/secret refusals above.
+    _progress("validating", step="QA Gate 검증 중")
     qa_ok, qa_msg = _qa_gate_allows_publish(state_at_start)
     if not qa_ok:
         _record_failure("qa_gate", qa_msg)
@@ -882,6 +989,7 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
         return True, msg
 
     # 7. Real publish path. git add ONLY the allowed files (never `.`).
+    _progress("committing", step="git commit 생성 중")
     ok, out = _git("add", "--", *allowed, timeout=60)
     if not ok:
         _record_failure("git_add", out[-300:])
@@ -902,6 +1010,7 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     commit_hash = commit_hash.strip() if ok else "unknown"
 
     # 9. Push.
+    _progress("pushing", step="git push origin main 진행 중")
     ok, push_out = _git("push", "origin", "main", timeout=120)
     if not ok:
         _save_publish_state({
@@ -1204,6 +1313,11 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
         "last_failed_stage": None,
         "last_actions_url": ACTIONS_URL,
     })
+    _set_deploy_progress(
+        "command_received",
+        current_step="Runner가 deploy_to_server 명령 수신",
+        reset=True,
+    )
 
     try:
         # 3. Run the publish pipeline. _h_publish_changes does its own
@@ -1211,7 +1325,9 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
         # push. A noop (no changes to publish) is reported as ok=True
         # but no commit/push happens — we surface that distinctly so
         # the operator knows GitHub Actions did NOT trigger.
-        publish_ok, publish_msg = _h_publish_changes(payload or {})
+        publish_payload = dict(payload or {})
+        publish_payload["__track_deploy_progress"] = True
+        publish_ok, publish_msg = _h_publish_changes(publish_payload)
         finished = _utc_now_z()
         if not publish_ok:
             _save_deploy_state({
@@ -1221,6 +1337,8 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
                 "last_message": f"publish 실패: {publish_msg[:280]}",
                 "last_failed_stage": "publish",
             })
+            # _h_publish_changes already wrote a failed deploy_progress
+            # entry via _record_failure; nothing more to do here.
             return False, f"deploy failed at publish: {publish_msg}"
 
         # 4. Distinguish "pushed" vs "noop" so the dashboard message is
@@ -1234,16 +1352,28 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
                 "변경 파일 없음 — main에 새 commit이 없으므로 GitHub Actions 배포는 트리거되지 않습니다. "
                 f"서버를 강제 재배포하려면 deploy.yml workflow_dispatch를 사용하세요. ({ACTIONS_URL})"
             )
+            _set_deploy_progress(
+                "completed",
+                current_step="변경 없음 — 배포 스킵",
+            )
         elif is_dry_run:
             handoff_msg = (
                 f"publish dry-run 완료 — 실제 push 미수행이라 GitHub Actions도 트리거되지 않습니다. "
                 f"실제 배포는 LOCAL_RUNNER_PUBLISH_DRY_RUN=false + LOCAL_RUNNER_ALLOW_PUBLISH=true 후 다시 시도. "
                 f"detail: {publish_msg}"
             )
+            _set_deploy_progress(
+                "completed",
+                current_step="dry-run 완료 — 실제 배포 미수행",
+            )
         else:
             handoff_msg = (
                 f"published — main push 성공. GitHub Actions(deploy.yml)가 서버 배포를 이어받습니다. "
                 f"진행 상황: {ACTIONS_URL} · publish: {publish_msg}"
+            )
+            _set_deploy_progress(
+                "actions_triggered",
+                current_step="GitHub Actions Deploy Stampport 트리거됨",
             )
 
         _save_deploy_state({
@@ -1261,6 +1391,13 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
         # dashboard's existing "마지막 배포 결과" chip shows it.
         _save_publish_state({"last_publish_message": handoff_msg})
         return True, handoff_msg
+    except Exception as e:  # noqa: BLE001
+        _set_deploy_progress(
+            "failed",
+            current_step="deploy_to_server 핸들러 예외",
+            failed_reason=str(e)[:280],
+        )
+        raise
     finally:
         _deploy_lock_release()
 
@@ -1678,6 +1815,269 @@ def _h_operator_fix_and_publish(payload: dict) -> tuple[bool, str]:
     return _operator_fix_pipeline(p, allow_publish=True)
 
 
+# ---------------------------------------------------------------------------
+# operator_request — autonomous "Claude에게 작업 지시" channel
+#
+# Distinct from operator_fix_*: this hands FULL agency (Edit / Write /
+# Bash + git commit + git push) to a user-configured Claude CLI. The
+# operator's expectation is "type a request on my phone, and ten
+# minutes later it's deployed". We rely on:
+#
+#   1. The Claude prompt explicitly forbidding commit/push on validation
+#      failure / secret leak / merge-conflict marker.
+#   2. The user-supplied LOCAL_RUNNER_CLAUDE_COMMAND (e.g. with
+#      `--dangerously-skip-permissions` or `--permission-mode
+#      bypassPermissions`) — only run on a private operator machine.
+#   3. The factory-cycle running guard so we don't race a cycle.
+#
+# The prompt and the in-band instructions are the security boundary —
+# there is no Bash sandbox here. That is intentional and matches the
+# user's request: Claude must be able to run the build, run QA, and
+# commit/push autonomously.
+# ---------------------------------------------------------------------------
+
+OPERATOR_REQUEST_MAX_CHARS = 6000
+
+
+def _resolve_claude_command() -> list[str]:
+    """Parse LOCAL_RUNNER_CLAUDE_COMMAND into argv. Empty/missing →
+    the resolved `claude` binary (PATH lookup) or the literal string
+    `claude`. shlex.split handles both `claude` and longer forms like
+    `claude --dangerously-skip-permissions` or
+    `claude --permission-mode bypassPermissions`. Returns at least
+    one element."""
+    raw = os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND", "").strip()
+    if raw:
+        try:
+            parts = shlex.split(raw)
+        except ValueError as e:
+            sys.stderr.write(
+                f"[runner] LOCAL_RUNNER_CLAUDE_COMMAND parse error: {e}\n"
+            )
+            parts = []
+        if parts:
+            return parts
+    fallback = shutil.which("claude") or "claude"
+    return [fallback]
+
+
+OPERATOR_REQUEST_PROMPT_TEMPLATE = """\
+당신은 Stampport 프로젝트의 자동 운영 Claude Code 에이전트입니다.
+
+아이폰/맥북에서 운영자가 요청을 보냈고, 이 맥북 runner가 당신을 호출했습니다.
+요청을 끝까지 자동으로 처리하세요. 검증 통과 시에는 commit + push까지 직접
+수행해도 됩니다 — main에 push되면 GitHub Actions Deploy Stampport workflow가
+서버 자동 배포까지 이어갑니다.
+
+Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모으는 로컬 취향 RPG 서비스다.
+지도/리뷰/관리자 대시보드/할 일 앱 톤으로 흐트러뜨리지 마세요.
+
+=== 요청 본문 (자동 마스킹 적용 후) ===
+{request}
+=== 요청 본문 끝 ===
+
+작업 흐름 (반드시 이 순서):
+
+1. 요청 의도를 정확히 파악하고, 가장 작은 변경 단위만 수행하세요.
+2. 다음 디렉터리만 수정 가능합니다:
+     app/**, control_tower/**, scripts/local_factory_*.sh, scripts/notify_*.*
+3. 다음은 어떤 경우에도 만들거나 수정하거나 삭제하지 마세요:
+     .env*, .key, .pem, .db, .runtime/, node_modules/, dist/, .venv/,
+     package.json, package-lock.json, requirements.txt,
+     deploy/nginx-stampport.conf, .github/workflows/deploy.yml, systemd 관련.
+4. 검증을 직접 실행하세요:
+     - 변경이 app/web 또는 control_tower/web에 있다면 해당 디렉터리에서
+       `npm run build` (또는 동등한 빌드)를 실행해 통과를 확인.
+     - 변경이 .py 파일을 건드리면 `python3 -m py_compile <파일>` 통과 확인.
+     - QA 흐름이 의심되면 관련 단위/문법 점검도 직접 실행.
+5. 검증이 모두 통과했고, 다음 모두 만족할 때만 commit + push를 실행하세요:
+     - secret 패턴 (BEGIN PRIVATE KEY, AWS_SECRET 등) 노출 없음
+     - merge conflict marker `<<<<<<<`, `=======`, `>>>>>>>` 없음
+     - .env, .pem, .key, .db, package-lock.json 변경 없음
+     - 현재 브랜치가 main
+     - 변경된 파일이 위 허용 디렉터리 안에 있음
+6. commit 메시지는 한국어 1줄 + 빈 줄 + 본문(선택). 추가로 마지막 줄에:
+     "Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+   를 포함하세요.
+7. push는 `git push origin main` 만 허용. force push / 다른 브랜치 push 금지.
+8. 검증 실패 / secret 노출 / conflict marker 발견 / 위반 가능성이 조금이라도
+   있으면 commit / push 를 절대 하지 마세요. 변경을 그대로 working tree에
+   남겨두고 운영자에게 사유를 보고하세요. (`git restore` 같은 파괴적 명령으로
+   되돌리지도 마세요 — 운영자가 직접 결정합니다.)
+
+자동 commit 허용 플래그: {auto_commit_push}
+(false면 commit/push 금지. 변경만 만들고 종료하세요.)
+
+작업이 끝나면 마지막 응답에 다음 Markdown만 출력하세요. preamble/잡담 금지:
+
+# Operator Request 결과
+
+## 상태
+applied | committed | pushed | aborted | failed
+
+## 요약
+한 줄 요약.
+
+## 변경 파일
+- `path/to/file1.jsx` — 한 줄 설명
+- `path/to/file2.py` — 한 줄 설명
+
+(파일을 변경하지 않았다면 위 항목 대신 "변경 없음" 한 줄.)
+
+## commit / push
+- commit hash: <짧은 7자리 hash 또는 N/A>
+- pushed to main: yes | no
+- 거부 사유 (있으면): ...
+
+## 다음 단계
+운영자가 무엇을 확인해야 하는지 1~2줄.
+"""
+
+
+def _h_operator_request(payload: dict) -> tuple[bool, str]:
+    """Autonomous operator-request handler. Persists the request to
+    .runtime/operator_request.md and hands it off to Claude Code via
+    LOCAL_RUNNER_CLAUDE_COMMAND. Claude itself runs build/QA/commit/
+    push — the runner only enforces the cycle-not-running guard plus
+    a single-flight per-request lock via the operator_fix_state file
+    so two clicks from the dashboard can't double-fire.
+    """
+    prompt_raw = (payload or {}).get("prompt") or (payload or {}).get("request") or ""
+    if not isinstance(prompt_raw, str) or not prompt_raw.strip():
+        return False, "operator_request payload.prompt가 비어있습니다."
+
+    auto_cp_raw = (payload or {}).get("auto_commit_push", True)
+    auto_commit_push = bool(auto_cp_raw) if not isinstance(auto_cp_raw, str) \
+        else auto_cp_raw.strip().lower() in {"true", "1", "yes", "on"}
+
+    # Refuse to run while a cycle is mid-flight — Claude editing files
+    # under the cycle would corrupt both.
+    state = _read_factory_state() or {}
+    if state.get("status") == "running":
+        msg = "factory 사이클 실행 중 — operator_request 거부 (잠시 후 다시 시도)"
+        _save_operator_fix_state({
+            "status": "failed",
+            "started_at": _utc_now_z(),
+            "allow_publish": auto_commit_push,
+            "publish_status": "blocked",
+            "last_message": msg,
+        })
+        return False, msg
+
+    started_at = _utc_now_z()
+    request_redacted, redactions = _redact_request_text(prompt_raw)
+    truncated = request_redacted.strip()[:OPERATOR_REQUEST_MAX_CHARS]
+    _write_operator_request_md(
+        truncated,
+        allow_publish=auto_commit_push,
+        priority="normal",
+        redactions=redactions,
+    )
+    _save_operator_fix_state({
+        "status": "running",
+        "request_path": str(OPERATOR_REQUEST_FILE),
+        "started_at": started_at,
+        "allow_publish": auto_commit_push,
+        "priority": "operator_request",
+        "redactions": redactions,
+        "publish_status": "not_requested",
+        "last_message": "Claude CLI 호출 중 (operator_request)",
+        "changed_files": [],
+    })
+
+    prompt = OPERATOR_REQUEST_PROMPT_TEMPLATE.format(
+        request=truncated,
+        auto_commit_push="true" if auto_commit_push else "false",
+    )
+
+    argv = list(_resolve_claude_command()) + [
+        "-p", prompt,
+        "--output-format", "text",
+    ]
+    timeout_sec = float(
+        os.environ.get(
+            "FACTORY_CLAUDE_OPERATOR_REQUEST_TIMEOUT_SEC",
+            os.environ.get("FACTORY_CLAUDE_OPERATOR_TIMEOUT_SEC", "1500"),
+        )
+    )
+
+    # Snapshot the diff BEFORE Claude runs so we can report what was
+    # touched even when Claude's final markdown is incomplete.
+    before_changed = set(_git_changed_files())
+
+    try:
+        r = subprocess.run(
+            argv,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        msg = f"claude CLI timeout after {timeout_sec}s"
+        _save_operator_fix_state({
+            "status": "failed",
+            "publish_status": "blocked",
+            "last_message": msg,
+        })
+        return False, msg
+    except FileNotFoundError as e:
+        msg = f"claude CLI 실행 실패: {e}"
+        _save_operator_fix_state({
+            "status": "failed",
+            "publish_status": "blocked",
+            "last_message": msg,
+        })
+        return False, msg
+
+    out = (r.stdout or "")
+    if r.stderr:
+        out += "\n--stderr--\n" + r.stderr
+    out = out.strip()
+    after_changed = set(_git_changed_files())
+    new_or_changed = sorted(after_changed | (after_changed - before_changed))
+
+    if r.returncode != 0:
+        tail = out[-400:] if out else "(no output)"
+        msg = f"claude CLI returncode={r.returncode}: {tail}"
+        _save_operator_fix_state({
+            "status": "failed",
+            "publish_status": "blocked",
+            "changed_files": new_or_changed,
+            "last_message": msg,
+        })
+        return False, msg
+
+    # Best-effort parse of Claude's structured tail. We only use this
+    # to label the operator_fix_state row — the runner did not run
+    # the commit itself, Claude did. The state file is the operator's
+    # rear-view mirror, not a gate.
+    pushed = bool(re.search(r"pushed to main\s*[:：]\s*yes", out, re.IGNORECASE))
+    aborted = "aborted" in out.lower() or "거부" in out
+    if pushed:
+        status = "published"
+        publish_status = "published"
+    elif aborted:
+        status = "qa_failed"
+        publish_status = "blocked"
+    else:
+        status = "applied"
+        publish_status = "not_requested"
+
+    _save_operator_fix_state({
+        "status": status,
+        "publish_status": publish_status,
+        "changed_files": new_or_changed,
+        "last_message": (out[-400:] if out else "Claude 응답 없음"),
+    })
+
+    summary = (
+        f"operator_request 완료 (status={status}, "
+        f"changed_files={len(new_or_changed)})"
+    )
+    return True, summary
+
+
 COMMAND_HANDLERS: dict[str, Callable[[dict], tuple[bool, str]]] = {
     "start_factory":           _h_start,
     "stop_factory":            _h_stop,
@@ -1694,6 +2094,7 @@ COMMAND_HANDLERS: dict[str, Callable[[dict], tuple[bool, str]]] = {
     "update_runner":           _h_update_runner,
     "operator_fix_request":    _h_operator_fix_request,
     "operator_fix_and_publish": _h_operator_fix_and_publish,
+    "operator_request":        _h_operator_request,
 }
 
 
@@ -2293,6 +2694,12 @@ def _build_publish_meta(cycle_state: dict) -> dict:
         "last_restart_action": publish_state.get("last_restart_action"),
         "last_restart_reason": publish_state.get("last_restart_reason"),
         "actions_url": ACTIONS_URL,
+        # Per-stage stepper state for the "배포 진행" panel. Trimmed
+        # so the heartbeat payload stays small (~40 history entries).
+        "deploy_progress": (
+            publish_state.get("deploy_progress")
+            or _new_deploy_progress(_utc_now_z())
+        ),
     }
 
 
