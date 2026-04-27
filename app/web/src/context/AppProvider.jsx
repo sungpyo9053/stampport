@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  checkStampLimits,
   clearUser,
   loadProfileMeta,
+  loadRecentAreas,
   loadStamps,
   loadUser,
   makeNewProfile,
+  pushRecentArea,
   saveProfileMeta,
   saveStamps,
   saveUser,
 } from '../utils/storage.js';
-import { computeBadges, BADGE_DEFS } from '../data/badges.js';
+import { BADGE_DEFS, computeBadges, newlyEarnedBadges } from '../data/badges.js';
 import { computeQuests } from '../data/quests.js';
 import {
   expGainBreakdown,
@@ -17,6 +20,7 @@ import {
   levelProgress,
   stampGradeFor,
   totalExp,
+  verificationLevelFor,
 } from '../utils/leveling.js';
 import { generateKickPoints } from '../utils/kickPoints.js';
 import { AppContext } from './appContext.js';
@@ -26,9 +30,6 @@ function makeStampId() {
 }
 
 export function AppProvider({ children }) {
-  // loadUser() already migrates legacy {nickname, email} blobs into
-  // the new passport-identity shape, so the rest of the provider can
-  // just trust the schema.
   const [user, setUser] = useState(() => loadUser());
   const [stamps, setStamps] = useState(() => {
     const u = loadUser();
@@ -37,6 +38,10 @@ export function AppProvider({ children }) {
   const [profileMeta, setProfileMeta] = useState(() => {
     const u = loadUser();
     return u ? loadProfileMeta(u.user_id) : { selected_title_id: null };
+  });
+  const [recentAreas, setRecentAreas] = useState(() => {
+    const u = loadUser();
+    return u ? loadRecentAreas(u.user_id) : [];
   });
 
   useEffect(() => {
@@ -51,11 +56,6 @@ export function AppProvider({ children }) {
     if (user) saveProfileMeta(user.user_id, profileMeta);
   }, [user, profileMeta]);
 
-  // Generic login entry point — used by both the legacy guest form
-  // (nickname/email) and the new social/mock flows. Caller passes
-  // provider + nickname; everything else is filled in by
-  // makeNewProfile and merged on top of any existing profile so a
-  // returning user keeps their stamps.
   const loginAs = useCallback(
     ({
       provider = 'guest',
@@ -67,9 +67,6 @@ export function AppProvider({ children }) {
     } = {}) => {
       const existing = loadUser();
       let nextUser;
-      // Returning user with the same provider + provider_user_id (or
-      // same email for guest) — keep their existing user_id so the
-      // stamps bucket is preserved.
       const isSameUser = !!existing
         && existing.provider === provider
         && (provider_user_id
@@ -100,15 +97,13 @@ export function AppProvider({ children }) {
       setUser(nextUser);
       setStamps(loadStamps(nextUser.user_id));
       setProfileMeta(loadProfileMeta(nextUser.user_id));
+      setRecentAreas(loadRecentAreas(nextUser.user_id));
       saveUser(nextUser);
       return nextUser;
     },
     [],
   );
 
-  // Back-compat: the legacy nickname+email login form still calls
-  // `login({ nickname, email })`. Forward to loginAs as a guest so
-  // the existing screen keeps working without a rewrite.
   const login = useCallback(
     ({ nickname, email }) => loginAs({ provider: 'guest', nickname, email }),
     [loginAs],
@@ -119,42 +114,65 @@ export function AppProvider({ children }) {
     setUser(null);
     setStamps([]);
     setProfileMeta({ selected_title_id: null });
+    setRecentAreas([]);
   }, []);
 
+  // addStamp now returns { ok, stamp?, error?, newBadges? }. The form
+  // surfaces error.message; the result screen reads newBadges from
+  // sessionStorage so it can render a "방금 받은 뱃지" row even after
+  // a refresh.
   const addStamp = useCallback(
     (input) => {
       const previous = stamps;
       const visited_at = input.visited_at || new Date().toISOString().slice(0, 10);
-      const stamp = {
-        id: makeStampId(),
-        user_id: user?.user_id,
+      const candidate = {
         place_name: input.place_name?.trim() || '',
         area: input.area || '기타',
+        area_source: input.area_source || 'manual',
         category: input.category || 'cafe',
         tags: input.tags || [],
         representative_menu: input.representative_menu?.trim() || '',
+        visit_purpose: input.visit_purpose || '',
         visited_at,
-        verification_level: input.verification_level || 'manual',
-        verification_status: 'unverified',
-        trust_score: 0,
-        created_at: new Date().toISOString(),
-        // Visit-experience fields. Stored even when blank so the
-        // result/passport screens can render a stable shape.
         experience_note: input.experience_note?.trim() || '',
         photo_data_url: input.photo_data_url || '',
         location_label: input.location_label?.trim() || '',
+        latitude: typeof input.latitude === 'number' ? input.latitude : null,
+        longitude: typeof input.longitude === 'number' ? input.longitude : null,
         visit_mood: input.visit_mood || '',
       };
+
+      const limit = checkStampLimits(previous, candidate, visited_at);
+      if (!limit.ok) {
+        return { ok: false, error: limit };
+      }
+
+      const stamp = {
+        id: makeStampId(),
+        user_id: user?.user_id,
+        ...candidate,
+        verification_status: 'unverified',
+        trust_score: 0,
+        created_at: new Date().toISOString(),
+      };
+      stamp.verification_level = verificationLevelFor(stamp);
       stamp.kick_points = generateKickPoints(stamp);
-      // Grade + breakdown are derived purely from the stamp itself
-      // (and the previous-stamps set for "new area" bonuses), so we
-      // freeze them at write time. No re-computation later.
       const breakdown = expGainBreakdown(stamp, previous);
       stamp.exp_breakdown = breakdown.items;
       stamp.exp_gained = breakdown.total;
       stamp.grade = stampGradeFor(stamp);
-      setStamps([stamp, ...previous]);
-      return stamp;
+
+      const beforeBadges = computeBadges(previous);
+      const nextStamps = [stamp, ...previous];
+      const afterBadges = computeBadges(nextStamps);
+      const newBadges = newlyEarnedBadges(beforeBadges, afterBadges);
+
+      setStamps(nextStamps);
+      if (user?.user_id) {
+        pushRecentArea(user.user_id, stamp.area);
+        setRecentAreas(loadRecentAreas(user.user_id));
+      }
+      return { ok: true, stamp, newBadges };
     },
     [stamps, user],
   );
@@ -190,9 +208,8 @@ export function AppProvider({ children }) {
     [stamps],
   );
 
-  // What would `addStamp(input)` award and grade right now? Used by
-  // StampForm to render a live "+EXP / 등급" preview as the player
-  // fills in the form. Pure function; no side effects.
+  // Live preview for StampForm — what would `addStamp(input)` award if
+  // committed right now? Pure; no side effects.
   const previewStamp = useCallback(
     (input) => {
       const candidate = {
@@ -208,13 +225,12 @@ export function AppProvider({ children }) {
       return {
         breakdown: expGainBreakdown(candidate, stamps),
         grade: stampGradeFor(candidate),
+        verification_level: verificationLevelFor(candidate),
       };
     },
     [stamps],
   );
 
-  // 7-day visit streak — used by MyPassport's character header. Counts
-  // distinct calendar dates within the last 7 days that have ≥1 stamp.
   const streakLast7Days = useMemo(() => {
     const days = new Set();
     const now = Date.now();
@@ -227,6 +243,19 @@ export function AppProvider({ children }) {
     }
     return days.size;
   }, [stamps]);
+
+  // The "다음 목표" hint surfaced on MyPassport — pick the in-progress
+  // badge with the highest progress ratio so the user sees something
+  // they're close to finishing. Falls back to the first locked badge
+  // for new players.
+  const nextGoal = useMemo(() => {
+    const inProgress = badges
+      .filter((b) => !b.earned && b.progress > 0)
+      .map((b) => ({ ...b, ratio: b.progress / b.required }))
+      .sort((a, b) => b.ratio - a.ratio);
+    if (inProgress.length) return inProgress[0];
+    return badges.find((b) => !b.earned) || null;
+  }, [badges]);
 
   const value = useMemo(
     () => ({
@@ -248,6 +277,8 @@ export function AppProvider({ children }) {
       stampById,
       previewStamp,
       streakLast7Days,
+      recentAreas,
+      nextGoal,
     }),
     [
       user,
@@ -268,6 +299,8 @@ export function AppProvider({ children }) {
       stampById,
       previewStamp,
       streakLast7Days,
+      recentAreas,
+      nextGoal,
     ],
   );
 

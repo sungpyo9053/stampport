@@ -1,58 +1,117 @@
 // EXP / level math + per-stamp grade.
 //
-// MVP level curve: 100 EXP per level. Each stamp contributes a base
-// reward plus bonuses keyed on what the player actually wrote in the
-// stamp form. The bonuses are the "RPG hook" that makes a real visit
-// (with a memo, a photo, location, mood) feel more rewarding than a
-// drive-by name-only entry.
+// Stampport's RPG hook is the verification ladder. The base reward for
+// a stamp is decided by *how the player proved they were there*, not
+// by the place's identity:
 //
-// All bonus weights live in this file so a balance change ripples
-// through the form preview, the result screen, and the passport
-// totals consistently.
+//   verification level → base EXP → grade
+//   manual              5            C  (이름·후기만)
+//   location           15            B  (위치 확인)
+//   photo              20            A  (사진 첨부)
+//   verified           30            S  (위치 + 사진)
+//
+// On top of that, content bonuses still apply — they reward filling
+// out the passport more thoroughly:
+//
+//   note ≥ 10자          +5
+//   mood selected         +3
+//   tags ×N (max 5)       +2 each
+//   new area              +10
+//   new category          +6
+//
+// All weights live here so balance changes ripple through the form
+// preview, the result screen and the passport totals consistently.
 
-export const EXP_PER_STAMP = 30;
-export const EXP_PER_TAG = 4;
-export const EXP_PER_NEW_AREA = 15;
-export const EXP_PER_NEW_CATEGORY = 10;
-
-// New "real visit" bonuses — set when the user actually proves they
-// were there (memo / photo / location / mood). Each one is opt-in but
-// weighted enough to matter against the 100-EXP-per-level curve.
 export const EXP_NOTE_MIN_CHARS = 10;
-export const EXP_PER_NOTE = 12;
-export const EXP_PER_PHOTO = 14;
-export const EXP_PER_LOCATION = 10;
-export const EXP_PER_MOOD = 6;
+export const EXP_PER_NOTE = 5;
+export const EXP_PER_MOOD = 3;
+export const EXP_PER_TAG = 2;
+export const EXP_PER_NEW_AREA = 10;
+export const EXP_PER_NEW_CATEGORY = 6;
 
-// Tag thresholds for the grade. We don't grade on a single tag because
-// any drive-by entry might tap one. Grade jumps require richer input.
-const GRADE_TAG_THRESHOLD = 2;
+// Verification ladder — base EXP and grade per level.
+export const VERIFICATION_LEVELS = ['manual', 'location', 'photo', 'verified'];
 
-// Compact accessor: does this stamp's note count as a "real" memo?
+const VERIFICATION_DEFS = {
+  manual: {
+    label: '직접 입력 도장',
+    short: 'Manual Stamp',
+    grade: 'C',
+    color: '#877f6c',
+    base_exp: 5,
+    description: '이름과 후기만으로 받은 동네 도장',
+  },
+  location: {
+    label: '위치 확인 도장',
+    short: 'Location Stamp',
+    grade: 'B',
+    color: '#6b4a2b',
+    base_exp: 15,
+    description: '현재 위치를 확인한 발견 도장',
+  },
+  photo: {
+    label: '사진 첨부 도장',
+    short: 'Photo Stamp',
+    grade: 'A',
+    color: '#6e1f2a',
+    base_exp: 20,
+    description: '그날의 분위기까지 남긴 비자',
+  },
+  verified: {
+    label: '여권 비자',
+    short: 'Verified Stamp',
+    grade: 'S',
+    color: '#c9a23a',
+    base_exp: 30,
+    description: '위치 + 사진까지 인증된 정식 비자',
+  },
+};
+
 function hasMeaningfulNote(stamp) {
   const text = (stamp?.experience_note || '').trim();
   return text.length >= EXP_NOTE_MIN_CHARS;
 }
-
 function hasPhoto(stamp) {
   return !!(stamp?.photo_data_url && stamp.photo_data_url.length > 0);
 }
-
 function hasLocation(stamp) {
   return !!(stamp?.location_label && stamp.location_label.length > 0);
 }
-
 function hasMood(stamp) {
   return !!(stamp?.visit_mood && stamp.visit_mood.length > 0);
 }
 
+// Derive verification level from inputs. Photo+location promotes to
+// verified; either-alone keeps the lower tier; neither falls to
+// manual. We take stamp.verification_level as a hint but recompute
+// from the actual fields so we never drift.
+export function verificationLevelFor(stamp) {
+  const photo = hasPhoto(stamp);
+  const loc = hasLocation(stamp);
+  if (photo && loc) return 'verified';
+  if (photo) return 'photo';
+  if (loc) return 'location';
+  return 'manual';
+}
+
+export function verificationDef(level) {
+  return VERIFICATION_DEFS[level] || VERIFICATION_DEFS.manual;
+}
+
 // Per-stamp EXP. Returns a line-item breakdown so the form + result
-// screens can show "기본 +30 / 메모 +12 / 사진 +14 …" without redoing
-// the math themselves.
+// screens can show "기본 / 후기 / 기분 …" without redoing the math.
 export function expGainBreakdown(stamp, previousStamps = []) {
   const items = [];
-  items.push({ key: 'base', label: '도장 기본', exp: EXP_PER_STAMP });
+  const level = verificationLevelFor(stamp);
+  const def = verificationDef(level);
+  items.push({ key: 'base', label: `${def.short} (${def.grade}등급)`, exp: def.base_exp });
 
+  if (hasMeaningfulNote(stamp)) {
+    items.push({ key: 'note', label: '방문 후기', exp: EXP_PER_NOTE });
+  }
+  if (hasMood(stamp)) {
+    items.push({ key: 'mood', label: '오늘의 기분', exp: EXP_PER_MOOD });
+  }
   const tagCount = Math.min(stamp?.tags?.length || 0, 5);
   if (tagCount > 0) {
     items.push({
@@ -60,19 +119,6 @@ export function expGainBreakdown(stamp, previousStamps = []) {
       label: `태그 ×${tagCount}`,
       exp: tagCount * EXP_PER_TAG,
     });
-  }
-
-  if (hasMeaningfulNote(stamp)) {
-    items.push({ key: 'note', label: '방문 후기 작성', exp: EXP_PER_NOTE });
-  }
-  if (hasPhoto(stamp)) {
-    items.push({ key: 'photo', label: '사진 첨부', exp: EXP_PER_PHOTO });
-  }
-  if (hasLocation(stamp)) {
-    items.push({ key: 'location', label: '위치 확인', exp: EXP_PER_LOCATION });
-  }
-  if (hasMood(stamp)) {
-    items.push({ key: 'mood', label: '오늘의 기분', exp: EXP_PER_MOOD });
   }
 
   const knownAreas = new Set(previousStamps.map((s) => s.area));
@@ -108,23 +154,16 @@ export function totalExp(stamps) {
   const seenAreas = new Set();
   const seenCategories = new Set();
   for (const s of [...stamps].reverse()) {
-    // Walk oldest → newest so "new area / new category" only fires
-    // the first time we see each.
-    const previous = {
-      area: seenAreas.has(s.area),
-      category: seenCategories.has(s.category),
-    };
-    exp += EXP_PER_STAMP;
-    exp += Math.min(s.tags?.length || 0, 5) * EXP_PER_TAG;
+    const def = verificationDef(verificationLevelFor(s));
+    exp += def.base_exp;
     if (hasMeaningfulNote(s)) exp += EXP_PER_NOTE;
-    if (hasPhoto(s)) exp += EXP_PER_PHOTO;
-    if (hasLocation(s)) exp += EXP_PER_LOCATION;
     if (hasMood(s)) exp += EXP_PER_MOOD;
-    if (s.area && !previous.area) {
+    exp += Math.min(s.tags?.length || 0, 5) * EXP_PER_TAG;
+    if (s.area && !seenAreas.has(s.area)) {
       exp += EXP_PER_NEW_AREA;
       seenAreas.add(s.area);
     }
-    if (s.category && !previous.category) {
+    if (s.category && !seenCategories.has(s.category)) {
       exp += EXP_PER_NEW_CATEGORY;
       seenCategories.add(s.category);
     }
@@ -132,51 +171,50 @@ export function totalExp(stamps) {
   return exp;
 }
 
-// Stamp grade — derived purely from input quality, not place identity.
-// We deliberately reward the *experience input*, not the gourmet rating
-// of the place, so the player has a reason to write things down.
-//
-// Criteria (each adds +1 to a 0-5 score):
-//   1. Note ≥ 10자
-//   2. Photo attached
-//   3. Location verified
-//   4. Mood selected
-//   5. Tags ≥ 2개
-//
-// Grade map (cumulative quality):
-//   0 → C  · 동네 도장  · just a place name
-//   1 → C  · 동네 도장
-//   2 → B  · 발견 도장
-//   3 → A  · 맛집 비자
-//   4 → A  · 맛집 비자
-//   5 → S  · 여권 비자  · all signals lit
-const GRADE_TABLE = [
-  { grade: 'C', label: '동네 도장', color: '#877f6c' },
-  { grade: 'C', label: '동네 도장', color: '#877f6c' },
-  { grade: 'B', label: '발견 도장', color: '#6b4a2b' },
-  { grade: 'A', label: '맛집 비자', color: '#6e1f2a' },
-  { grade: 'A', label: '맛집 비자', color: '#6e1f2a' },
-  { grade: 'S', label: '여권 비자', color: '#c9a23a' },
-];
-
+// Stamp grade — derived from the verification ladder. We expose the
+// list of "checks" so the form preview can show what's missing for the
+// next tier.
 export function stampGradeFor(stamp) {
+  const level = verificationLevelFor(stamp);
+  const def = verificationDef(level);
   const checks = [
     { key: 'note',     label: '방문 후기',  met: hasMeaningfulNote(stamp) },
-    { key: 'photo',    label: '사진',        met: hasPhoto(stamp) },
-    { key: 'location', label: '위치 확인',  met: hasLocation(stamp) },
+    { key: 'tags',     label: '태그 1+',     met: (stamp?.tags?.length || 0) >= 1 },
     { key: 'mood',     label: '기분 태그',  met: hasMood(stamp) },
-    { key: 'tags',     label: `태그 ${GRADE_TAG_THRESHOLD}+`, met: (stamp?.tags?.length || 0) >= GRADE_TAG_THRESHOLD },
+    { key: 'location', label: '위치 확인',  met: hasLocation(stamp) },
+    { key: 'photo',    label: '사진',        met: hasPhoto(stamp) },
   ];
-  const score = checks.filter((c) => c.met).length;
-  const tier = GRADE_TABLE[Math.max(0, Math.min(score, GRADE_TABLE.length - 1))];
   return {
-    grade: tier.grade,
-    label: tier.label,
-    color: tier.color,
-    score,
+    grade: def.grade,
+    label: def.label,
+    color: def.color,
+    level,
+    base_exp: def.base_exp,
+    description: def.description,
+    score: checks.filter((c) => c.met).length,
     maxScore: checks.length,
     checks,
   };
+}
+
+// Hint for the form: what's the next verification tier and what does
+// the player need to add to get there?
+export function nextVerificationHint(stamp) {
+  const level = verificationLevelFor(stamp);
+  const photo = hasPhoto(stamp);
+  const loc = hasLocation(stamp);
+  if (level === 'verified') return null;
+  if (level === 'photo') {
+    return { next: 'verified', need: '위치 확인', exp_delta: 30 - 20 };
+  }
+  if (level === 'location') {
+    return { next: 'verified', need: '사진 첨부', exp_delta: 30 - 15 };
+  }
+  // manual — suggest the cheaper next step first
+  if (!loc && !photo) {
+    return { next: 'location', need: '위치 확인을 추가하면 Location Stamp', exp_delta: 15 - 5 };
+  }
+  return { next: 'photo', need: '사진을 추가하면 Photo Stamp', exp_delta: 20 - 5 };
 }
 
 // Level curve. Linear for the MVP; the level value is intentionally

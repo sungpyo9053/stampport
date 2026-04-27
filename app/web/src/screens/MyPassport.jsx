@@ -13,19 +13,14 @@ function summarize(stamps, key) {
 }
 
 function CharacterAvatar({ user, level }) {
-  // Simple SVG character: badge frame + level pip + nickname initial.
-  // Drawn inline so the passport screen renders something Stampport-y
-  // without a real avatar pipeline.
   const initial = (user?.nickname || '여행자').slice(0, 1);
   const provider = (user?.provider || 'guest').toUpperCase();
   return (
     <div className="character-avatar" aria-label={`${user?.nickname || '여행자'} 캐릭터`}>
       <svg viewBox="0 0 96 96" width="96" height="96" aria-hidden="true">
-        {/* outer passport ring */}
         <circle cx="48" cy="48" r="44" fill="#1f3d2b" />
         <circle cx="48" cy="48" r="44" fill="none" stroke="#c9a23a" strokeWidth="3" />
         <circle cx="48" cy="48" r="34" fill="#fbf6e9" />
-        {/* dotted inner ring for "passport" feel */}
         <circle
           cx="48"
           cy="48"
@@ -36,7 +31,6 @@ function CharacterAvatar({ user, level }) {
           strokeDasharray="2 4"
           opacity="0.7"
         />
-        {/* initial */}
         <text
           x="48"
           y="56"
@@ -48,7 +42,6 @@ function CharacterAvatar({ user, level }) {
         >
           {initial}
         </text>
-        {/* burgundy stamp at corner */}
         <g transform="translate(64 64) rotate(-8)">
           <circle cx="0" cy="0" r="14" fill="#6e1f2a" />
           <text
@@ -84,6 +77,7 @@ export default function MyPassport({ navigate }) {
     selectedTitle,
     quests,
     streakLast7Days,
+    nextGoal,
   } = useApp();
 
   const areaSummary = useMemo(() => summarize(stamps, 'area'), [stamps]);
@@ -95,9 +89,22 @@ export default function MyPassport({ navigate }) {
   const recent = stamps.slice(0, 5);
   const activeQuest = quests.find((q) => !q.completed);
 
-  // Distribution of grades in the player's collection — drives the
-  // "grade pip strip" on the character card so the player sees their
-  // S/A/B/C ratio at a glance.
+  // This-week stamp count — drives the "이번 주 N개의 도장을 찍었어요"
+  // line on the character header.
+  const stampsThisWeek = useMemo(() => {
+    const now = new Date();
+    const day = now.getDay();
+    const diff = (day + 6) % 7;
+    const weekStart = new Date(now);
+    weekStart.setHours(0, 0, 0, 0);
+    weekStart.setDate(weekStart.getDate() - diff);
+    return stamps.filter((s) => {
+      if (!s.visited_at) return false;
+      const d = new Date(s.visited_at);
+      return d >= weekStart;
+    }).length;
+  }, [stamps]);
+
   const gradeDistribution = useMemo(() => {
     const counts = { S: 0, A: 0, B: 0, C: 0 };
     for (const s of stamps) {
@@ -127,6 +134,9 @@ export default function MyPassport({ navigate }) {
               <span>·</span>
               <span>최근 7일 {streakLast7Days}일 방문</span>
             </div>
+            <div className="character-week-line">
+              이번 주 <strong>{stampsThisWeek}</strong>개의 도장을 찍었어요.
+            </div>
             <div className="grade-strip">
               {['S', 'A', 'B', 'C'].map((g) => (
                 <span key={g} className={`gp gp-${g}`}>
@@ -138,7 +148,6 @@ export default function MyPassport({ navigate }) {
           </div>
         </div>
 
-        {/* Big level + EXP bar — the "next level까지 N EXP" cue. */}
         <div className="ps-exp ps-exp-large">
           <div className="row">
             <span>
@@ -167,6 +176,30 @@ export default function MyPassport({ navigate }) {
       >
         스탬프 찍기
       </button>
+
+      {nextGoal ? (
+        <div className="next-goal-card">
+          <div className="ngc-head">
+            <span className="ngc-eyebrow">다음 목표</span>
+            <span className="ngc-icon" aria-hidden="true">{nextGoal.icon}</span>
+          </div>
+          <div className="ngc-name">{nextGoal.name}</div>
+          <div className="ngc-desc">{nextGoal.description}</div>
+          <div className="ngc-bar">
+            <div
+              className="fill"
+              style={{
+                width: `${Math.round((nextGoal.progress / nextGoal.required) * 100)}%`,
+              }}
+            />
+          </div>
+          <div className="ngc-num">
+            {nextGoal.progress > 0
+              ? `${nextGoal.required - nextGoal.progress}곳만 더 다녀오면 ‘${nextGoal.titleLabel || nextGoal.name}’ 비자.`
+              : `다음 도장이 ‘${nextGoal.titleLabel || nextGoal.name}’의 출발점이에요.`}
+          </div>
+        </div>
+      ) : null}
 
       <div className="summary-grid">
         <div className="summary-block">
@@ -251,6 +284,9 @@ export default function MyPassport({ navigate }) {
                 {activeQuest.progress}/{activeQuest.required}
               </span>
             </div>
+            {activeQuest.next_hint ? (
+              <div className="quest-hint">{activeQuest.next_hint}</div>
+            ) : null}
           </div>
         </>
       ) : null}

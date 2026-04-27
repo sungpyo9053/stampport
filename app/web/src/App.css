@@ -2144,3 +2144,637 @@
   color: var(--color-ink-muted);
   margin-top: 2px;
 }
+
+/* ----------------------------------------------------------------- */
+/* Verification preview (StampForm) — the big tier card up top.      */
+/* ----------------------------------------------------------------- */
+
+.verification-preview {
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+  overflow: hidden;
+}
+
+.verification-preview[data-grade='S'] {
+  border-color: var(--color-gold);
+  background: linear-gradient(135deg, rgba(201, 162, 58, 0.18), var(--color-paper));
+}
+.verification-preview[data-grade='A'] {
+  border-color: var(--color-burgundy);
+}
+.verification-preview[data-grade='B'] {
+  border-color: var(--color-warm-brown);
+}
+
+.verification-preview .vp-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.verification-preview .vp-tier {
+  flex: 0 0 auto;
+  width: 54px;
+  height: 54px;
+  border-radius: 14px;
+  background-color: var(--color-deep-green);
+  color: var(--color-gold);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-serif);
+  line-height: 1;
+}
+
+.verification-preview .vp-tier strong {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.verification-preview .vp-tier em {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  opacity: 0.85;
+  margin-top: 2px;
+}
+
+.verification-preview .vp-tier-S {
+  background-color: var(--color-gold);
+  color: var(--color-deep-green);
+}
+.verification-preview .vp-tier-A {
+  background-color: var(--color-burgundy);
+  color: var(--color-cream);
+}
+.verification-preview .vp-tier-B {
+  background-color: var(--color-warm-brown);
+  color: var(--color-cream);
+}
+
+.verification-preview .vp-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.verification-preview .vp-name {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-deep-green);
+}
+
+.verification-preview .vp-sub {
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.verification-preview .vp-exp {
+  flex: 0 0 auto;
+  text-align: right;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.verification-preview .vp-exp span {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 22px;
+  color: var(--color-burgundy);
+  line-height: 1;
+}
+
+.verification-preview .vp-exp em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-muted);
+  margin-top: 2px;
+}
+
+.verification-preview .vp-next {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background-color: var(--color-cream-soft);
+  border: 1px dashed var(--color-line);
+  font-size: 12px;
+  color: var(--color-deep-green);
+}
+
+.verification-preview .vp-next-max {
+  background-color: rgba(201, 162, 58, 0.15);
+  border-color: var(--color-gold-soft);
+}
+
+/* Requirement checklist on StampForm */
+.req-checks {
+  list-style: none;
+  margin: 0;
+  padding: 10px 12px;
+  background-color: var(--color-cream-soft);
+  border-radius: 10px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+  font-size: 12px;
+  color: var(--color-ink-muted);
+}
+
+.req-checks li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.req-checks li.met {
+  color: var(--color-deep-green);
+  font-weight: 600;
+}
+
+.req-checks li span[aria-hidden] {
+  font-size: 10px;
+  width: 12px;
+  text-align: center;
+}
+
+/* Area picker — manual input + geolocation + suggested/recent rows */
+.area-picker {
+  display: flex;
+  gap: 8px;
+}
+
+.area-picker .area-input {
+  flex: 1;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-line);
+  background-color: var(--color-paper);
+  outline: none;
+  font-size: 14px;
+}
+
+.area-picker .area-input:focus {
+  border-color: var(--color-deep-green);
+}
+
+.area-picker .area-geo {
+  flex: 0 0 auto;
+  align-self: stretch;
+}
+
+.area-section {
+  margin-top: 8px;
+}
+
+.area-section .area-section-label {
+  font-size: 10.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+  display: block;
+  margin-bottom: 4px;
+}
+
+/* Visit-purpose chip strip — sits beneath 대표 메뉴. Same look as
+   mood chips but in a tighter row. */
+.purpose-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* ----------------------------------------------------------------- */
+/* StampResult — stamp-press animation + EXP rise                    */
+/* ----------------------------------------------------------------- */
+
+.result-tagline {
+  margin-top: 6px;
+  color: var(--color-ink-muted);
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+}
+
+@keyframes stampPressIn {
+  0% {
+    transform: scale(0.85) rotate(-1deg);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.04) rotate(0.5deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) rotate(0);
+    opacity: 1;
+  }
+}
+
+@keyframes stampInkSettle {
+  0% {
+    transform: rotate(-9deg) scale(0.6);
+    opacity: 0;
+  }
+  60% {
+    transform: rotate(-12deg) scale(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: rotate(-9deg) scale(1);
+    opacity: 1;
+  }
+}
+
+.stamp-card-press {
+  animation: stampPressIn 480ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.stamp-card .stamp-mark.stamp-mark-pressed {
+  animation: stampInkSettle 720ms 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes expRiseFloat {
+  0% {
+    transform: translateY(6px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.exp-amount-rise {
+  animation: expRiseFloat 700ms 200ms ease-out both;
+}
+
+.card-celebrate {
+  background: linear-gradient(135deg, rgba(201, 162, 58, 0.16), var(--color-paper));
+  border-color: var(--color-gold-soft);
+}
+
+.badge-grid-new .badge-card.earned {
+  animation: stampPressIn 520ms ease-out both;
+}
+
+/* In-progress badge row in the result card */
+.badge-progress-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  background-color: var(--color-cream-soft);
+  border: 1px solid var(--color-line-soft);
+  border-radius: 10px;
+}
+
+.badge-progress-row .bpr-medal {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, var(--color-gold-soft), var(--color-gold));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex: 0 0 auto;
+}
+
+.badge-progress-row .bpr-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.badge-progress-row .bpr-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-deep-green);
+}
+
+.badge-progress-row .bpr-desc {
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+}
+
+.badge-progress-row .bpr-bar {
+  height: 6px;
+  background-color: var(--color-cream);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--color-line-soft);
+}
+
+.badge-progress-row .bpr-bar .fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--color-gold), var(--color-burgundy));
+}
+
+.badge-progress-row .bpr-num {
+  font-size: 11px;
+  color: var(--color-ink-soft);
+  font-weight: 600;
+}
+
+/* Mini share preview embedded in StampResult */
+.share-mini {
+  background:
+    radial-gradient(circle at 80% 0%, rgba(201, 162, 58, 0.35), transparent 55%),
+    linear-gradient(135deg, var(--color-deep-green), var(--color-navy));
+  color: var(--color-cream);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  position: relative;
+  overflow: hidden;
+}
+
+.share-mini::after {
+  content: '';
+  position: absolute;
+  inset: 8px;
+  border: 1px dashed rgba(246, 239, 222, 0.3);
+  border-radius: 12px;
+  pointer-events: none;
+}
+
+.share-mini .sm-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 0.25em;
+  color: var(--color-gold-soft);
+  text-transform: uppercase;
+}
+
+.share-mini .sm-grade {
+  font-family: var(--font-serif);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--color-cream);
+  text-transform: none;
+}
+
+.share-mini h3 {
+  color: var(--color-cream);
+  font-family: var(--font-serif);
+  font-size: 20px;
+  margin-top: 12px;
+}
+
+.share-mini .sm-meta {
+  font-size: 12px;
+  margin-top: 4px;
+  color: rgba(246, 239, 222, 0.78);
+}
+
+.share-mini .sm-note {
+  margin-top: 10px;
+  font-size: 12.5px;
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--color-cream);
+  line-height: 1.5;
+  border-left: 2px solid var(--color-gold-soft);
+  padding-left: 8px;
+}
+
+.share-mini .sm-bottom {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  font-size: 11px;
+  color: rgba(246, 239, 222, 0.85);
+}
+
+.share-mini .sm-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.share-mini .sm-id strong {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  color: var(--color-cream);
+}
+
+.share-mini .sm-exp {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-gold);
+}
+
+/* ----------------------------------------------------------------- */
+/* MyPassport — character week line + next-goal card                 */
+/* ----------------------------------------------------------------- */
+
+.character-week-line {
+  font-size: 12px;
+  color: rgba(246, 239, 222, 0.85);
+  margin-top: 4px;
+}
+
+.character-week-line strong {
+  color: var(--color-gold);
+  font-family: var(--font-serif);
+  font-size: 14px;
+  margin: 0 2px;
+}
+
+.next-goal-card {
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+  overflow: hidden;
+}
+
+.next-goal-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 100% 0%, rgba(110, 31, 42, 0.08), transparent 60%);
+  pointer-events: none;
+}
+
+.next-goal-card .ngc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.next-goal-card .ngc-eyebrow {
+  font-family: var(--font-serif);
+  font-size: 10px;
+  letter-spacing: 0.4em;
+  color: var(--color-burgundy);
+  text-transform: uppercase;
+}
+
+.next-goal-card .ngc-icon {
+  font-size: 22px;
+}
+
+.next-goal-card .ngc-name {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  color: var(--color-deep-green);
+  font-weight: 700;
+}
+
+.next-goal-card .ngc-desc {
+  font-size: 12px;
+  color: var(--color-ink-muted);
+}
+
+.next-goal-card .ngc-bar {
+  height: 8px;
+  background-color: var(--color-cream);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--color-line-soft);
+  margin-top: 4px;
+}
+
+.next-goal-card .ngc-bar .fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--color-gold), var(--color-burgundy));
+}
+
+.next-goal-card .ngc-num {
+  font-size: 12px;
+  color: var(--color-deep-green);
+  font-weight: 600;
+}
+
+.quest-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-ink-soft);
+}
+
+.quest-card.completed .quest-hint {
+  color: rgba(246, 239, 222, 0.85);
+}
+
+/* ----------------------------------------------------------------- */
+/* Share screen — grade ribbon, note quote, related-badge progress   */
+/* ----------------------------------------------------------------- */
+
+.share-canvas .share-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.share-canvas .share-grade {
+  font-family: var(--font-serif);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 4px 9px;
+  border-radius: 999px;
+  color: var(--color-cream);
+  white-space: nowrap;
+}
+
+.share-canvas .share-note {
+  margin: 14px 0 0;
+  padding: 0 0 0 10px;
+  border-left: 2px solid var(--color-gold-soft);
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 14px;
+  color: var(--color-cream);
+  line-height: 1.55;
+}
+
+.share-canvas .share-badge-progress {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background-color: rgba(246, 239, 222, 0.1);
+  border: 1px dashed rgba(246, 239, 222, 0.3);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.share-canvas .share-badge-progress .sbp-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: rgba(246, 239, 222, 0.95);
+}
+
+.share-canvas .share-badge-progress .sbp-line strong {
+  color: var(--color-gold);
+  font-family: var(--font-serif);
+  font-size: 13px;
+}
+
+.share-canvas .share-badge-progress .sbp-bar {
+  height: 6px;
+  background-color: rgba(246, 239, 222, 0.18);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.share-canvas .share-badge-progress .sbp-bar .fill {
+  height: 100%;
+  background: var(--color-gold);
+}
+
+.share-canvas .share-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-transform: none;
+  letter-spacing: 0.04em;
+}
+
+.share-canvas .share-id strong {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  color: var(--color-cream);
+}
+
+.share-canvas .share-id .share-exp-line {
+  color: var(--color-gold);
+  font-weight: 700;
+}
+
+.share-hint {
+  font-size: 12px;
+  color: var(--color-ink-muted);
+  text-align: center;
+  line-height: 1.5;
+}

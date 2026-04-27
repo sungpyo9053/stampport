@@ -1,10 +1,50 @@
+import { useEffect, useMemo, useState } from 'react';
 import { useApp } from '../context/appContext.js';
-import { categoryIcon, categoryLabel } from '../data/options.js';
-import { levelProgress, stampGradeFor } from '../utils/leveling.js';
+import { categoryIcon, categoryLabel, visitPurposeLabel } from '../data/options.js';
+import { levelProgress, stampGradeFor, verificationDef } from '../utils/leveling.js';
+
+// Animate the EXP bar from 0% → ratio% on first paint so the player
+// *sees* the gain settle in. Pure visual — totals are already final.
+function useExpRise(ratio) {
+  const [shown, setShown] = useState(0);
+  useEffect(() => {
+    let raf;
+    const start = performance.now();
+    const duration = 900;
+    const tick = (now) => {
+      const elapsed = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - elapsed, 3);
+      setShown(eased * ratio);
+      if (elapsed < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [ratio]);
+  return shown;
+}
+
+function loadNewBadgesFor(stampId) {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.sessionStorage.getItem(`stampport:newBadges:${stampId}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 export default function StampResult({ navigate, stampId }) {
-  const { stampById, badges, exp } = useApp();
+  const { stampById, badges, exp, level, selectedTitle, user } = useApp();
   const stamp = stampById(stampId);
+
+  // Read newly-earned-badges *once*, regardless of whether the stamp
+  // exists yet — must be a top-level hook call.
+  const newBadges = useMemo(() => loadNewBadgesFor(stampId), [stampId]);
+
+  const info = useMemo(() => levelProgress(exp), [exp]);
+  const animatedRatio = useExpRise(info.ratio);
 
   if (!stamp) {
     return (
@@ -27,28 +67,33 @@ export default function StampResult({ navigate, stampId }) {
     day: 'numeric',
   });
 
-  const info = levelProgress(exp);
   const earnedAfter = badges.filter((b) => b.earned).length;
   const inProgressBadges = badges
     .filter((b) => !b.earned && b.progress > 0)
+    .sort((a, b) => b.progress / b.required - a.progress / a.required)
     .slice(0, 3);
 
-  // Use the frozen grade if it was persisted; fall back to a fresh
-  // compute for legacy stamps (pre-grade schema).
   const grade = stamp.grade || stampGradeFor(stamp);
+  const verification = verificationDef(stamp.verification_level || grade.level || 'manual');
   const breakdown = stamp.exp_breakdown || [];
+
+  const purposeLabel = visitPurposeLabel(stamp.visit_purpose);
 
   return (
     <section className="result">
       <div className="result-header">
         <span className="eyebrow">Stamp Acquired · {grade.grade}등급</span>
-        <h1>{grade.label} 획득!</h1>
+        <h1>{verification.label} 획득!</h1>
+        <p className="result-tagline">오늘의 도장이 여권에 기록되었습니다.</p>
       </div>
 
-      <div className="stamp-card" data-grade={grade.grade}>
+      <div
+        className={`stamp-card stamp-card-press grade-${grade.grade}`}
+        data-grade={grade.grade}
+      >
         <div className="grade-ribbon" style={{ backgroundColor: grade.color }}>
           <span>{grade.grade}</span>
-          <strong>{grade.label}</strong>
+          <strong>{verification.short}</strong>
         </div>
         <div className="stamp-meta">
           <span>{stamp.area} · {categoryLabel(stamp.category)}</span>
@@ -57,6 +102,8 @@ export default function StampResult({ navigate, stampId }) {
         <div className="place-name">{stamp.place_name}</div>
         {stamp.representative_menu ? (
           <div className="place-sub">대표 메뉴 · {stamp.representative_menu}</div>
+        ) : purposeLabel ? (
+          <div className="place-sub">방문 목적 · {purposeLabel}</div>
         ) : null}
 
         {stamp.photo_data_url ? (
@@ -80,6 +127,7 @@ export default function StampResult({ navigate, stampId }) {
           {stamp.visit_mood ? (
             <span className="proof-pill">✨ {moodLabel(stamp.visit_mood)}</span>
           ) : null}
+          <span className="proof-pill">🏷 +{stamp.exp_gained} EXP</span>
         </div>
 
         {stamp.tags?.length ? (
@@ -89,7 +137,7 @@ export default function StampResult({ navigate, stampId }) {
             ))}
           </div>
         ) : null}
-        <div className="stamp-mark" aria-hidden="true">
+        <div className="stamp-mark stamp-mark-pressed" aria-hidden="true">
           <span>STAMPPORT</span>
           <strong>{categoryIcon(stamp.category)}</strong>
           <span>{stamp.area}</span>
@@ -100,13 +148,14 @@ export default function StampResult({ navigate, stampId }) {
         <div className="card-title">레벨 진행도</div>
         <div className="exp-bar-row">
           <div className="exp-bar">
-            <div className="fill" style={{ width: `${Math.round(info.ratio * 100)}%` }} />
+            <div className="fill" style={{ width: `${Math.round(animatedRatio * 100)}%` }} />
           </div>
-          <span className="exp-amount">+{stamp.exp_gained} EXP</span>
+          <span className="exp-amount exp-amount-rise">+{stamp.exp_gained} EXP</span>
         </div>
         <div className="next-level-line">
           다음 레벨까지{' '}
-          <strong>{info.expToNext}</strong> EXP — Lv.{info.level + 1} 코앞이에요.
+          <strong>{info.expToNext}</strong> EXP — Lv.{info.level + 1}{' '}
+          {info.expToNext < 30 ? '코앞이에요.' : '가까워지고 있어요.'}
         </div>
 
         {breakdown.length ? (
@@ -136,6 +185,70 @@ export default function StampResult({ navigate, stampId }) {
         </div>
       </div>
 
+      {newBadges.length ? (
+        <div className="card card-celebrate">
+          <div className="card-title">🎉 방금 새로 받은 뱃지</div>
+          <p className="card-sub">여권에 새 비자가 추가됐어요.</p>
+          <div className="badge-grid badge-grid-new">
+            {newBadges.map((b) => (
+              <div key={b.id} className="badge-card earned">
+                <div className="badge-medal" aria-hidden="true">{b.icon}</div>
+                <div className="badge-name">{b.name}</div>
+                <div className="badge-desc">{b.description}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {inProgressBadges.length ? (
+        <div className="card">
+          <div className="card-title">진행 중인 뱃지</div>
+          <p className="card-sub">조금만 더 다녀오면 새 비자를 발급받아요.</p>
+          <div className="kick-list">
+            {inProgressBadges.map((b) => {
+              const ratio = Math.min(b.progress / b.required, 1);
+              return (
+                <div key={b.id} className="badge-progress-row">
+                  <div className="bpr-medal" aria-hidden="true">{b.icon}</div>
+                  <div className="bpr-text">
+                    <div className="bpr-name">{b.name}</div>
+                    <div className="bpr-desc">{b.description}</div>
+                    <div className="bpr-bar">
+                      <div className="fill" style={{ width: `${Math.round(ratio * 100)}%` }} />
+                    </div>
+                    <div className="bpr-num">
+                      진행 {b.progress}/{b.required} — {b.required - b.progress}곳 남음
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="card">
+        <div className="card-title">공유 카드 미리보기</div>
+        <p className="card-sub">이 도장을 공유 카드로 남겨보세요.</p>
+        <SharePreview
+          stamp={stamp}
+          grade={grade}
+          verification={verification}
+          user={user}
+          level={level}
+          title={selectedTitle}
+        />
+        <button
+          type="button"
+          className="btn btn-gold btn-block"
+          onClick={() => navigate(`/share/${stamp.id}`)}
+          style={{ marginTop: 12 }}
+        >
+          공유 카드 만들기
+        </button>
+      </div>
+
       <div className="card">
         <div className="card-title">다음 방문을 위한 킥 포인트 3가지</div>
         <p className="card-sub">취향과 카테고리에 맞춰 자동 추천했어요.</p>
@@ -149,36 +262,7 @@ export default function StampResult({ navigate, stampId }) {
         </div>
       </div>
 
-      {inProgressBadges.length ? (
-        <div className="card">
-          <div className="card-title">진행 중인 뱃지</div>
-          <div className="kick-list">
-            {inProgressBadges.map((b) => (
-              <div key={b.id} className="kick-item">
-                <span className="num" style={{ background: 'var(--color-burgundy)' }}>
-                  {b.icon}
-                </span>
-                <span>
-                  <strong>{b.name}</strong> · {b.progress}/{b.required}
-                  <br />
-                  <span style={{ color: 'var(--color-ink-muted)', fontSize: 12 }}>
-                    {b.description}
-                  </span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
       <div className="form-stack">
-        <button
-          type="button"
-          className="btn btn-gold btn-block"
-          onClick={() => navigate(`/share/${stamp.id}`)}
-        >
-          공유 카드 만들기
-        </button>
         <button
           type="button"
           className="btn btn-secondary btn-block"
@@ -195,6 +279,33 @@ export default function StampResult({ navigate, stampId }) {
         </button>
       </div>
     </section>
+  );
+}
+
+function SharePreview({ stamp, grade, verification, user, level, title }) {
+  return (
+    <div className="share-mini" data-grade={grade.grade}>
+      <div className="sm-top">
+        <span className="sm-eyebrow">STAMPPORT · 로컬 여권</span>
+        <span className="sm-grade" style={{ backgroundColor: grade.color }}>
+          {grade.grade} · {verification.short}
+        </span>
+      </div>
+      <h3>{stamp.place_name}</h3>
+      <div className="sm-meta">
+        {stamp.area} · {categoryLabel(stamp.category)}
+      </div>
+      {stamp.experience_note ? (
+        <p className="sm-note">“{stamp.experience_note}”</p>
+      ) : null}
+      <div className="sm-bottom">
+        <div className="sm-id">
+          <strong>{user?.nickname || '여행자'}</strong>
+          <span>Lv.{level} · {title}</span>
+        </div>
+        <div className="sm-exp">+{stamp.exp_gained} EXP</div>
+      </div>
+    </div>
   );
 }
 
