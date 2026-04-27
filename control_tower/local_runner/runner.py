@@ -84,6 +84,17 @@ REPORT_FILE = RUNTIME_DIR / "factory_last_report.md"
 LOG_FILE = RUNTIME_DIR / "local_factory.log"
 PUBLISH_STATE_FILE = RUNTIME_DIR / "factory_publish.json"
 
+# Deploy state — separate from publish state so the dashboard can
+# render "publish vs deploy" without conflating commit hashes with
+# remote-build outcomes.
+DEPLOY_STATE_FILE = RUNTIME_DIR / "factory_deploy.json"
+# Single-flight lock for deploy_to_server. Created with O_EXCL on
+# acquire, deleted on release. A stale lock older than
+# DEPLOY_LOCK_STALE_SEC is force-cleared so a crashed deploy doesn't
+# permanently wedge the queue.
+DEPLOY_LOCK_FILE = RUNTIME_DIR / "factory_deploy.lock"
+DEPLOY_LOCK_STALE_SEC = 30 * 60  # 30 minutes
+
 # Operator Fix Request artifacts. See _h_operator_fix_request handler
 # below for the lifecycle: dashboard textarea → command queue → runner
 # writes the request file → Claude CLI edits files → runner runs QA
@@ -1070,6 +1081,191 @@ def _h_update_runner(_payload: dict) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Server deployment (deploy_to_server)
+#
+# 관제실의 배포 버튼이 누르는 경로. 흐름:
+#
+#   1. file lock 획득 (단일-flight 보장; stale 30분이면 자동 회수)
+#   2. 같은 command_id 재처리면 캐시된 결과를 그대로 반환 (idempotent)
+#   3. _h_publish_changes 호출 — Release Safety Gate / QA / git push
+#   4. main 에 push 가 성사되면 GitHub Actions(deploy.yml)가 자동으로
+#      서버 SSH 배포를 수행한다 — runner는 SSH를 직접 만지지 않는다.
+#   5. 결과를 factory_deploy.json + publish_state 에 기록한다.
+#
+# `scripts/remote_deploy_stampport.sh`는 더 이상 publish 경로에서 호출되지
+# 않는다 (수동 fallback 용도로만 남겨둠). LOCAL_RUNNER_DEPLOY_DRY_RUN
+# 환경 변수도 이 핸들러에서는 더 이상 의미가 없다 — 실제 서버 배포 여부는
+# main 브랜치에 commit이 push 되었는지(=GitHub Actions가 트리거되었는지)로
+# 판가름한다.
+# ---------------------------------------------------------------------------
+
+
+def _read_deploy_state() -> dict:
+    if not DEPLOY_STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(DEPLOY_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_deploy_state(updates: dict) -> None:
+    cur = _read_deploy_state()
+    cur.update(updates)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    DEPLOY_STATE_FILE.write_text(
+        json.dumps(cur, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _deploy_lock_acquire(command_id: int) -> tuple[bool, str]:
+    """Atomic file-create as the single-flight guard.
+
+    O_EXCL fails if the lock file already exists. A stale lock older
+    than DEPLOY_LOCK_STALE_SEC is force-cleared first so a crashed
+    runner doesn't permanently wedge the deploy queue.
+    """
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if DEPLOY_LOCK_FILE.is_file():
+        try:
+            age = time.time() - DEPLOY_LOCK_FILE.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age >= DEPLOY_LOCK_STALE_SEC:
+            try:
+                DEPLOY_LOCK_FILE.unlink()
+            except OSError:
+                pass
+    try:
+        fd = os.open(
+            str(DEPLOY_LOCK_FILE),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o644,
+        )
+    except FileExistsError:
+        return False, "다른 deploy가 진행 중 — 중복 실행 차단"
+    try:
+        os.write(
+            fd,
+            json.dumps({
+                "command_id": command_id,
+                "started_at": _utc_now_z(),
+                "pid": os.getpid(),
+            }).encode("utf-8"),
+        )
+    finally:
+        os.close(fd)
+    return True, "lock acquired"
+
+
+def _deploy_lock_release() -> None:
+    try:
+        DEPLOY_LOCK_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
+    """Publish + handoff to GitHub Actions.
+
+    publish_changes가 main에 push를 성사시키면 .github/workflows/deploy.yml
+    이 그 push를 감지해 SSH 배포를 자동 실행한다. runner는 SSH를 직접
+    만지지 않으며, "GitHub Actions가 이어받았습니다" 라는 안내를
+    돌려준다.
+
+    Returns (ok, message). `message`는 대시보드에 그대로 표시되니
+    한국어로 짧게: commit 해시 + Actions URL + 변경/무변경 안내를 담는다.
+    """
+    cmd_id = int((payload or {}).get("__command_id") or 0)
+
+    # 1. Idempotency — same command_id seen twice returns the cached
+    # outcome without re-running. Protects against the server retrying
+    # a delivery the runner already handled.
+    last = _read_deploy_state()
+    if cmd_id and last.get("last_command_id") == cmd_id and last.get("last_finished_at"):
+        ok_prev = bool(last.get("last_status_ok"))
+        prev_msg = last.get("last_message") or "(no detail)"
+        return ok_prev, f"이미 처리된 deploy command #{cmd_id} — {prev_msg}"
+
+    # 2. Single-flight lock — dedup mass clicks even across processes.
+    ok_lock, lock_msg = _deploy_lock_acquire(cmd_id)
+    if not ok_lock:
+        return False, lock_msg
+
+    started = _utc_now_z()
+    _save_deploy_state({
+        "last_status": "running",
+        "last_status_ok": False,
+        "last_command_id": cmd_id,
+        "last_started_at": started,
+        "last_finished_at": None,
+        "last_message": "deploy started — publish 단계 진입",
+        "last_failed_stage": None,
+        "last_actions_url": ACTIONS_URL,
+    })
+
+    try:
+        # 3. Run the publish pipeline. _h_publish_changes does its own
+        # Release Safety Gate / QA / secret_scan / revalidate / commit /
+        # push. A noop (no changes to publish) is reported as ok=True
+        # but no commit/push happens — we surface that distinctly so
+        # the operator knows GitHub Actions did NOT trigger.
+        publish_ok, publish_msg = _h_publish_changes(payload or {})
+        finished = _utc_now_z()
+        if not publish_ok:
+            _save_deploy_state({
+                "last_status": "failed",
+                "last_status_ok": False,
+                "last_finished_at": finished,
+                "last_message": f"publish 실패: {publish_msg[:280]}",
+                "last_failed_stage": "publish",
+            })
+            return False, f"deploy failed at publish: {publish_msg}"
+
+        # 4. Distinguish "pushed" vs "noop" so the dashboard message is
+        # accurate about whether GitHub Actions will fire.
+        msg_lower = (publish_msg or "").lower()
+        no_changes = "no changes to publish" in msg_lower
+        is_dry_run = "dry-run" in msg_lower or "dry_run" in msg_lower
+
+        if no_changes:
+            handoff_msg = (
+                "변경 파일 없음 — main에 새 commit이 없으므로 GitHub Actions 배포는 트리거되지 않습니다. "
+                f"서버를 강제 재배포하려면 deploy.yml workflow_dispatch를 사용하세요. ({ACTIONS_URL})"
+            )
+        elif is_dry_run:
+            handoff_msg = (
+                f"publish dry-run 완료 — 실제 push 미수행이라 GitHub Actions도 트리거되지 않습니다. "
+                f"실제 배포는 LOCAL_RUNNER_PUBLISH_DRY_RUN=false + LOCAL_RUNNER_ALLOW_PUBLISH=true 후 다시 시도. "
+                f"detail: {publish_msg}"
+            )
+        else:
+            handoff_msg = (
+                f"published — main push 성공. GitHub Actions(deploy.yml)가 서버 배포를 이어받습니다. "
+                f"진행 상황: {ACTIONS_URL} · publish: {publish_msg}"
+            )
+
+        _save_deploy_state({
+            "last_status": "succeeded",
+            "last_status_ok": True,
+            "last_finished_at": finished,
+            "last_message": handoff_msg,
+            "last_failed_stage": None,
+            "last_actions_url": ACTIONS_URL,
+            "last_publish_message": publish_msg,
+            "last_no_changes": no_changes,
+            "last_dry_run": is_dry_run,
+        })
+        # Surface the handoff on the publish state row too so the
+        # dashboard's existing "마지막 배포 결과" chip shows it.
+        _save_publish_state({"last_publish_message": handoff_msg})
+        return True, handoff_msg
+    finally:
+        _deploy_lock_release()
+
+
+# ---------------------------------------------------------------------------
 # Operator Fix Request
 #
 # Lets an admin type a free-form bug/improvement request into the
@@ -1493,6 +1689,7 @@ COMMAND_HANDLERS: dict[str, Callable[[dict], tuple[bool, str]]] = {
     "build_check":             _h_build_check,
     "test_check":              _h_test_check,
     "publish_changes":         _h_publish_changes,
+    "deploy_to_server":        _h_deploy_to_server,
     "restart_runner":          _h_restart_runner,
     "update_runner":           _h_update_runner,
     "operator_fix_request":    _h_operator_fix_request,
@@ -2024,6 +2221,10 @@ def _execute(cmd_row: dict) -> None:
         sys.stderr.write(f"[runner] unknown command '{name}' — rejecting\n")
         report_result(cid, False, f"rejected_unknown_command: {name}")
         return
+    # Surface the command id to handlers that want idempotency
+    # (deploy_to_server uses it to dedupe the same command across
+    # retries). Other handlers ignore it.
+    payload["__command_id"] = cid
     sys.stderr.write(f"[runner] executing '{name}' (cmd #{cid})\n")
     try:
         ok, msg = handler(payload)
