@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence } from "framer-motion";
 import AgentDesk from "./AgentDesk.jsx";
 import SpeechBubble from "./SpeechBubble.jsx";
+import AgentRouteLayer from "./AgentRouteLayer.jsx";
 import {
   AGENTS,
   AGENT_LIST,
@@ -207,9 +208,14 @@ export default function PixelOffice({
   agentStatuses = {},
   bubbles = {},
   activeAgentId = null,
+  factory = null,
+  runners = [],
 }) {
   const hostRef = useRef(null);
   const [scale, setScale] = useState(1);
+  const [hostWidth, setHostWidth] = useState(0);
+  const [routeBanner, setRouteBanner] = useState(null);
+  const [isDemoFlow, setIsDemoFlow] = useState(false);
 
   useEffect(() => {
     const el = hostRef.current;
@@ -218,6 +224,7 @@ export default function PixelOffice({
     const recompute = () => {
       const { width, height } = el.getBoundingClientRect();
       if (!width || !height) return;
+      setHostWidth(width);
       const next = Math.min(
         width / PIXEL_OFFICE_WIDTH,
         height / PIXEL_OFFICE_HEIGHT,
@@ -232,6 +239,14 @@ export default function PixelOffice({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+
+  const handleBannerChange = useCallback((msg) => setRouteBanner(msg), []);
+  const handleDemoChange = useCallback((flag) => setIsDemoFlow(flag), []);
+
+  // Office is "narrow" once the host viewport collapses to phone size.
+  // We use the host width here, not window.innerWidth, so the layout
+  // also responds when the office sits in a narrow side rail.
+  const isMobile = hostWidth > 0 && hostWidth < 520;
 
   return (
     <div
@@ -264,6 +279,41 @@ export default function PixelOffice({
           STAMPPORT · OFFICE
         </span>
       </div>
+
+      {/* live handoff banner — top-center, above the scaled stage so the
+          text stays sharp regardless of office scale. Empty when no
+          card is currently in transit. */}
+      {routeBanner && (
+        <div
+          className="pointer-events-none absolute z-30 flex items-center gap-2 px-3 py-1"
+          style={{
+            left: "50%",
+            top: 12,
+            transform: "translateX(-50%)",
+            maxWidth: "min(80%, 520px)",
+            backgroundColor: "#0a1228cc",
+            border: `1px solid ${isDemoFlow ? "#38bdf866" : "#34d39966"}`,
+            borderRadius: 3,
+            fontFamily: "ui-monospace, monospace",
+          }}
+        >
+          <span
+            className="inline-block h-1.5 w-1.5"
+            style={{ backgroundColor: isDemoFlow ? "#38bdf8" : "#34d399" }}
+          />
+          <span className="truncate text-[10.5px] tracking-[0.15em] text-[#f5e9d3]">
+            {routeBanner}
+          </span>
+          {isDemoFlow && (
+            <span
+              className="ml-1 rounded px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.25em] text-sky-300"
+              style={{ border: "1px solid #38bdf855", backgroundColor: "#0a1228" }}
+            >
+              DEMO FLOW
+            </span>
+          )}
+        </div>
+      )}
 
       <div ref={hostRef} className="absolute inset-0">
         {/* fixed-coord stage, scaled to fit */}
@@ -340,6 +390,16 @@ export default function PixelOffice({
               </div>
             );
           })}
+
+          {/* moving handoff cards — overlay rendered last so the paper
+              draws on top of desks while in flight. */}
+          <AgentRouteLayer
+            factory={factory}
+            runners={runners}
+            onBannerChange={handleBannerChange}
+            onDemoChange={handleDemoChange}
+            isMobile={isMobile}
+          />
         </div>
       </div>
     </div>

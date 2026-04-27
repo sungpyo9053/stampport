@@ -110,6 +110,7 @@ export default function AgentDesk({
 }) {
   const working = status === "working" || isActive;
   const done = status === "done";
+  const failed = status === "error" || status === "blocked";
 
   return (
     <div
@@ -257,7 +258,7 @@ export default function AgentDesk({
       </div>
 
       {/* working ring around the desk */}
-      {working && (
+      {working && !failed && (
         <motion.div
           className="pointer-events-none absolute"
           style={{
@@ -273,6 +274,53 @@ export default function AgentDesk({
           animate={{ opacity: [0.3, 0.9, 0.3] }}
           transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
         />
+      )}
+
+      {/* failure ring + warning glyph for blocked/error agents */}
+      {failed && (
+        <>
+          <motion.div
+            className="pointer-events-none absolute"
+            style={{
+              left: "50%",
+              top: 54,
+              transform: "translateX(-50%)",
+              width: DESK_W + 18,
+              height: DESK_H + 16,
+              border: "1.5px solid #f87171",
+              borderRadius: 4,
+            }}
+            initial={{ opacity: 0.4 }}
+            animate={{ opacity: [0.4, 1, 0.4] }}
+            transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut" }}
+          />
+          <motion.div
+            className="absolute"
+            style={{
+              left: "50%",
+              top: -2,
+              transform: "translateX(-50%)",
+              fontFamily: "ui-monospace, monospace",
+              fontSize: 12,
+              fontWeight: 800,
+              color: "#0a1228",
+              backgroundColor: "#f87171",
+              border: "1.5px solid #7f1d1d",
+              padding: "0 6px",
+              borderRadius: 3,
+              letterSpacing: "1px",
+              zIndex: 6,
+            }}
+            initial={{ scale: 0.6, opacity: 0 }}
+            animate={{
+              scale: [0.95, 1.05, 0.95],
+              opacity: [0.85, 1, 0.85],
+            }}
+            transition={{ duration: 1.1, repeat: Infinity, ease: "easeInOut" }}
+          >
+            !
+          </motion.div>
+        </>
       )}
     </div>
   );

@@ -235,6 +235,8 @@ export default function ControlTowerPage() {
             agentStatuses={agentStatuses}
             bubbles={bubbles}
             activeAgentId={activeAgentId}
+            factory={factory}
+            runners={runners}
           />
         </div>
 
