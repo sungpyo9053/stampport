@@ -16,6 +16,7 @@ import {
   resetDemo,
   runDemo,
 } from "../api/controlTowerApi.js";
+import { synthesizeCycleEvents } from "../utils/cycleEventSynth.js";
 
 const POLL_MS = 1500;
 const FAST_POLL_MS = 800;
@@ -220,7 +221,9 @@ export default function ControlTowerPage() {
           (Operator first so a phone tap on a small screen lands on
           the input field). */}
       <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <SystemLogPanel events={events} />
+        <SystemLogPanel
+          events={[...events, ...synthesizeCycleEvents(runners)]}
+        />
         <OperatorCommandPanel runners={runners} onSent={tick} />
       </section>
 

@@ -537,6 +537,17 @@ class CycleState:
     qa_fix_max_attempts: int = 2
     qa_fix_propose_status: str = "skipped"
     qa_fix_apply_status: str = "skipped"
+    # Cycle effectiveness — was this cycle "real" (touched product
+    # code) or did it spin without changing anything? Populated at the
+    # end of main() and surfaced via heartbeat metadata so the
+    # dashboard can show "이번 사이클 실제 변경" instead of just a green
+    # check on a no-op.
+    code_changed: bool = False
+    no_code_change_reason: str | None = None
+    failed_stage: str | None = None
+    failed_reason: str | None = None
+    suggested_action: str | None = None
+    cycle_log: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -636,6 +647,12 @@ class CycleState:
             "qa_fix_max_attempts": self.qa_fix_max_attempts,
             "qa_fix_propose_status": self.qa_fix_propose_status,
             "qa_fix_apply_status": self.qa_fix_apply_status,
+            "code_changed": self.code_changed,
+            "no_code_change_reason": self.no_code_change_reason,
+            "failed_stage": self.failed_stage,
+            "failed_reason": self.failed_reason,
+            "suggested_action": self.suggested_action,
+            "cycle_log": list(self.cycle_log),
         }
 
 
@@ -662,6 +679,60 @@ def _log(line: str) -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(f"[{utc_now_iso()}] {line}\n")
+
+
+# Cap the in-state cycle_log so the heartbeat payload doesn't grow
+# unbounded over a long-lived factory loop. Older entries fall off
+# the array but stay in factory_last_report.md / local_factory.log.
+CYCLE_LOG_CAP = 60
+
+
+def _emit_cycle_log(state: "CycleState", kind: str, message: str, **payload) -> None:
+    """Append one structured log line to state.cycle_log. The dashboard
+    derives synthetic System Log events from this list so the operator
+    sees per-cycle markers (claude_apply_started / claude_apply_changed_files
+    / validation_passed / cycle_produced_code_change / ...) without us
+    having to extend the API event_bus.
+
+    `kind` should match the keys the FE eventClassifier expects (kept
+    in lowercase_snake_case so the keyword classifier still picks them
+    up via the human-readable `message`)."""
+    entry = {
+        "at": utc_now_iso(),
+        "cycle": int(state.cycle or 0),
+        "kind": kind,
+        "message": message,
+    }
+    if payload:
+        entry["payload"] = payload
+    state.cycle_log.append(entry)
+    if len(state.cycle_log) > CYCLE_LOG_CAP:
+        state.cycle_log = state.cycle_log[-CYCLE_LOG_CAP:]
+    # Mirror to local_factory.log so the runner's log_tail also reflects
+    # the structured marker — handy when grepping the log file.
+    _log(f"[cycle_log] {kind}: {message}")
+
+
+def _suggest_action_for_stage(stage_name: str) -> str:
+    """Map a failed stage name onto a short Korean next-step hint
+    surfaced in the dashboard's "이번 사이클 실제 변경" / failed_reason
+    block. Generic fallback when the stage isn't in the table."""
+    table = {
+        "build_app":               "app/web 디렉터리에서 npm run build 직접 실행 후 오류 메시지 확인",
+        "build_control":           "control_tower/web 디렉터리에서 npm run build 직접 실행 후 오류 메시지 확인",
+        "syntax_check":            "py_compile 실패 — 변경 파일을 직접 점검하고 import/들여쓰기 오류 확인",
+        "git_check":               "working tree 의 conflict marker / unmerged 파일 정리 후 재시도",
+        "publish_blocker_resolve": "blocker_resolve_report.md 확인 후 hard_risky/secret 파일 처리",
+        "claude_propose":          "claude CLI 설치/CLAUDE_BIN/예산 환경변수 확인 후 재시도",
+        "claude_apply":            "claude_apply.diff 확인 후 사람이 수동으로 적용 또는 롤백",
+        "qa_gate":                 "qa_feedback.md 확인 — 실패 카테고리별 파일 수정 후 재시도",
+        "qa_recheck":              "qa_feedback.md 확인 후 다시 cycle 실행",
+        "product_planning":        "config/domain_profiles/stampport.json 의 PM 입력값 점검",
+    }
+    return table.get(
+        stage_name,
+        f"실패 단계({stage_name}) 로그 확인 후 운영자가 직접 판단",
+    )
 
 
 def _read_goal() -> str:
@@ -3636,6 +3707,10 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     label = next(lab for n, lab, _ in STAGES if n == "claude_apply")
     sr = StageResult(name="claude_apply", label=label, status="running")
     t0 = time.time()
+    _emit_cycle_log(
+        state, "claude_apply_started",
+        "claude apply started — 제안서를 working tree에 적용 시도",
+    )
 
     def _skip(reason: str) -> StageResult:
         sr.status = "skipped"
@@ -3643,6 +3718,10 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         sr.duration_sec = round(time.time() - t0, 3)
         state.claude_apply_status = "skipped"
         state.claude_apply_skipped_reason = reason
+        _emit_cycle_log(
+            state, "claude_apply_no_changes",
+            f"claude apply no changes (skipped): {reason}",
+        )
         return sr
 
     # Pre-condition 0: publish blocker policy. Even more important here
@@ -3758,11 +3837,20 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         state.claude_apply_status = "noop"
         state.claude_apply_skipped_reason = "claude no-op"
         state.claude_apply_message = sr.message
+        _emit_cycle_log(
+            state, "claude_apply_no_changes",
+            "claude apply no changes — Claude가 working tree를 건드리지 않음",
+        )
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
 
     # Re-validate — the heart of the sandbox. If anything broke,
     # rollback the entire change set.
+    _emit_cycle_log(
+        state, "validation_started",
+        "validation started — _revalidate_after_apply (build / py_compile / 위험파일 스캔)",
+        files=(changed_tracked + new_untracked)[:30],
+    )
     revalidate_ok, failures = _revalidate_after_apply()
     if not revalidate_ok:
         ok_rb, rb_msg = _rollback_apply(changed_tracked, new_untracked)
@@ -3826,6 +3914,17 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     state.claude_apply_rollback = False
     state.claude_apply_message = (
         f"{len(diff_files)}개 파일 변경, 빌드/문법/위험 파일 재검증 통과"
+    )
+
+    _emit_cycle_log(
+        state, "validation_passed",
+        f"validation passed — {len(diff_files)}개 파일에 대한 빌드/문법 재검증 통과",
+        files=diff_files[:30],
+    )
+    _emit_cycle_log(
+        state, "claude_apply_changed_files",
+        f"claude apply changed files — {len(diff_files)}개 파일 (model={model})",
+        files=diff_files[:30],
     )
 
     sr.status = "passed"
@@ -5120,11 +5219,11 @@ def main() -> int:
         state.last_message = "QA 수정 재시도 한도를 초과했습니다."
 
     # Decide overall status BEFORE writing the report so the report
-    # header reflects the final outcome (succeeded/failed), not "running".
-    # If a qa_recheck recovered after an initial qa_gate failure,
-    # filter the original qa_gate failure out of the failure list —
-    # otherwise we'd show "cycle failed" even though the recheck
-    # passed and publish is allowed.
+    # header reflects the final outcome (succeeded/failed/no_code_change/
+    # planning_only), not "running". If a qa_recheck recovered after an
+    # initial qa_gate failure, filter the original qa_gate failure out
+    # of the failure list — otherwise we'd show "cycle failed" even
+    # though the recheck passed and publish is allowed.
     if state.qa_status == "passed":
         failed = [
             s for s in state.stages
@@ -5132,6 +5231,10 @@ def main() -> int:
         ]
     else:
         failed = [s for s in state.stages if s.status == "failed"]
+
+    apply_changed = list(state.claude_apply_changed_files or [])
+    apply_status = state.claude_apply_status
+
     if state.publish_blocked:
         # Publish blocker takes priority over all other failure reasons:
         # the user needs to clear the blocker before any other diagnosis
@@ -5143,15 +5246,97 @@ def main() -> int:
         state.last_message = (
             "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
+        state.failed_stage = "publish_blocker_resolve"
+        state.failed_reason = (
+            state.publish_blocker_message
+            or "Release Safety Gate 차단 — secret 또는 conflict marker 잔존"
+        )
+        state.suggested_action = (
+            "blocker_resolve_report.md 확인 후 hard_risky / conflict marker 파일을 직접 처리"
+        )
+        state.code_changed = False
+        state.no_code_change_reason = "publish_blocker_active"
+        _emit_cycle_log(
+            state, "cycle_failed",
+            f"cycle #{state.cycle} failed: publish blocker active",
+            stage=state.failed_stage, reason=state.failed_reason,
+        )
     elif failed:
+        first = failed[0]
         state.status = "failed"
         state.last_message = (
             "자동 점검 사이클 실패: "
             + ", ".join(s.label for s in failed)
         )
-    else:
+        state.failed_stage = first.name
+        state.failed_reason = first.message or "원인 메시지 없음"
+        state.suggested_action = _suggest_action_for_stage(first.name)
+        state.code_changed = False
+        state.no_code_change_reason = f"stage_failed:{first.name}"
+        _emit_cycle_log(
+            state, "cycle_failed",
+            f"cycle #{state.cycle} failed at {first.name}: {first.message}",
+            stage=first.name, reason=first.message or "",
+        )
+    elif apply_status == "applied" and apply_changed:
         state.status = "succeeded"
-        state.last_message = "자동 점검 사이클이 완료되었습니다."
+        state.code_changed = True
+        state.last_message = (
+            f"이번 사이클 코드 변경 {len(apply_changed)}개 — 검증 통과"
+        )
+        _emit_cycle_log(
+            state, "cycle_produced_code_change",
+            f"cycle produced code change: {len(apply_changed)}개 파일",
+            files=apply_changed[:30],
+        )
+    else:
+        # No failed stages, but no actual code change either. Distinguish
+        # planning_only (planner / designer / pm artifact freshly generated)
+        # vs no_code_change (everything skipped).
+        planner_generated = (
+            state.product_planner_status == "generated"
+            or state.designer_critique_status == "generated"
+            or state.planner_revision_status == "generated"
+            or state.designer_final_review_status == "generated"
+            or state.pm_decision_status == "generated"
+        )
+        reason = (
+            state.claude_apply_skipped_reason
+            or state.claude_apply_message
+            or apply_status
+            or "claude_apply 미실행"
+        )
+        state.code_changed = False
+        state.no_code_change_reason = (
+            f"planning_only:{reason}" if planner_generated
+            else f"no_code_change:{reason}"
+        )
+        if planner_generated:
+            state.status = "planning_only"
+            state.last_message = (
+                "기획/디자인 산출물만 생성됨 — 코드 변경 없음 ("
+                f"claude_apply={apply_status}, 사유={reason})"
+            )
+            _emit_cycle_log(
+                state, "cycle_planning_only",
+                f"cycle planning only: {reason}",
+                claude_apply_status=apply_status,
+            )
+        else:
+            state.status = "no_code_change"
+            state.last_message = (
+                "이번 사이클은 코드 변경 없음 ("
+                f"claude_apply={apply_status}, 사유={reason})"
+            )
+            _emit_cycle_log(
+                state, "cycle_produced_no_code_change",
+                f"cycle produced no code change: {reason}",
+                claude_apply_status=apply_status,
+            )
+        state.suggested_action = (
+            "FACTORY_APPLY_CLAUDE=true 로 켠 뒤 다시 실행하거나, "
+            "operator_request 로 수동 변경 지시를 내리세요."
+        )
 
     state.current_stage = "report"
     state.current_task = "리포트 작성"
@@ -5165,9 +5350,16 @@ def main() -> int:
     _write_state(state)
     _log(
         f"cycle #{state.cycle} {state.status} — "
-        f"failed_stages={[s.name for s in failed]}"
+        f"failed_stages={[s.name for s in failed]} · "
+        f"code_changed={state.code_changed} · "
+        f"changed={len(state.claude_apply_changed_files or [])}건"
     )
-    return 0 if state.status == "succeeded" else 1
+    # Exit 0 covers any non-failed terminal state — succeeded /
+    # planning_only / no_code_change all leave the working tree clean.
+    # The bash factory loop reads the exit code as "did the cycle
+    # crash?", not "did it ship code", so a clean planning_only run
+    # should not look like a crash.
+    return 0 if state.status in {"succeeded", "planning_only", "no_code_change"} else 1
 
 
 if __name__ == "__main__":

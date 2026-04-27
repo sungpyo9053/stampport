@@ -206,10 +206,24 @@ const SYSTEM_TYPE_TABLE = {
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
   // Claude lifecycle.
+  [/claude\s+apply\s+started/i,                           { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
+  [/claude\s+apply\s+changed\s+files/i,                   { category: "Claude", actor: "claude", severity: "success", phase: "completed" }],
+  [/claude\s+apply\s+no\s+changes/i,                      { category: "Claude", actor: "claude", severity: "warn",    phase: "skipped"   }],
   [/claude\s*(code|cli)?\s*started/i,                     { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
   [/claude\s*(code|cli)?\s*(completed|finished|passed)/i, { category: "Claude", actor: "claude", severity: "success", phase: "completed" }],
   [/claude\s*(code|cli)?\s*(failed|error|timeout)/i,      { category: "Error",  actor: "claude", severity: "error",   phase: "failed"    }],
   [/(operator[_ ]?request|claude에게 작업 지시)/i,        { category: "Claude", actor: "claude", severity: "info",    phase: "info"      }],
+
+  // Cycle outcomes — derived from heartbeat cycle_log on the FE.
+  [/cycle\s+produced\s+code\s+change/i,                   { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
+  [/cycle\s+produced\s+no\s+code\s+change/i,              { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],
+  [/cycle\s+planning\s+only/i,                            { category: "Runner", actor: "factory", severity: "warn",   phase: "skipped"   }],
+  [/cycle\s+failed/i,                                     { category: "Error", actor: "factory", severity: "error",   phase: "failed"    }],
+
+  // Validation (cycle's _revalidate_after_apply).
+  [/validation\s+started/i,                               { category: "Build", actor: "factory", severity: "info",    phase: "started"   }],
+  [/validation\s+passed/i,                                { category: "Build", actor: "factory", severity: "success", phase: "completed" }],
+  [/validation\s+failed/i,                                { category: "Error", actor: "factory", severity: "error",   phase: "failed"    }],
 
   // Build.
   [/build\s+(started|진행|시작)/i,                        { category: "Build", actor: "factory", severity: "info",    phase: "started"   }],
@@ -296,8 +310,9 @@ export function classifySystemEvent(ev) {
   const msg = ev.message || "";
   if (AGENT_ACTIVITY_TYPES.has(ev.type)) {
     // Only allow keyword passthrough when the message names a
-    // system concern.
-    const passthrough = /(build|qa|deploy|git|push|claude|배포|빌드|커밋|푸시|에러|실패|timeout)/i;
+    // system concern. `validation`/`cycle` cover the synthetic
+    // cycle-log events synthesizeCycleEvents emits.
+    const passthrough = /(build|qa|deploy|git|push|claude|validation|cycle|배포|빌드|커밋|푸시|에러|실패|timeout)/i;
     if (!passthrough.test(msg)) return null;
   }
 

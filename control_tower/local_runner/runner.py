@@ -2310,6 +2310,64 @@ COMMAND_HANDLERS: dict[str, Callable[[dict], tuple[bool, str]]] = {
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Per-command-name dedupe — short-circuit duplicate test_check /
+# build_check / deploy_to_server requests that pile up from rapid
+# clicking. The runner is single-threaded so true concurrency isn't an
+# issue, but a queue full of the same command wastes the polling slot.
+#
+# DEDUPE_NAMES are the commands we actively dedupe. Other commands
+# (start_factory / pause_factory / restart_runner / operator_*) are
+# left alone — they're either rare or have their own idempotency.
+# ---------------------------------------------------------------------------
+
+DEDUPE_WINDOW_SEC = 30.0
+DEDUPE_NAMES: frozenset[str] = frozenset({
+    "build_check",
+    "test_check",
+    "deploy_to_server",
+})
+
+_LAST_COMMAND_RESULT: dict[str, dict] = {}
+_INFLIGHT_COMMAND: dict | None = None
+
+
+def _is_duplicate_recent_command(name: str, cid: int) -> bool:
+    if name not in DEDUPE_NAMES:
+        return False
+    # Same command name finished within DEDUPE_WINDOW_SEC and reported
+    # success → treat the new claim as a duplicate. Failures don't
+    # dedupe (the operator might be retrying after fixing whatever
+    # broke).
+    prev = _LAST_COMMAND_RESULT.get(name)
+    if not prev:
+        return False
+    if prev.get("cid") == cid:
+        # Same exact command id — that's the deploy idempotency case;
+        # let the handler answer with its own cached result.
+        return False
+    if prev.get("ok") is not True:
+        return False
+    finished = float(prev.get("at") or 0.0)
+    return (time.time() - finished) < DEDUPE_WINDOW_SEC
+
+
+def _mark_command_inflight(name: str, cid: int) -> None:
+    global _INFLIGHT_COMMAND
+    _INFLIGHT_COMMAND = {"name": name, "cid": cid, "started_at": time.time()}
+
+
+def _record_command_result(name: str, cid: int, ok: bool, message: str) -> None:
+    global _INFLIGHT_COMMAND
+    _LAST_COMMAND_RESULT[name] = {
+        "cid": cid,
+        "ok": ok,
+        "message": message,
+        "at": time.time(),
+    }
+    _INFLIGHT_COMMAND = None
+
+
 def _read_factory_state() -> dict | None:
     """Read .runtime/factory_state.json — written by cycle.py.
 
@@ -2633,6 +2691,7 @@ def _build_local_factory_meta() -> dict:
         "publish_blocker": _build_publish_blocker_meta(state),
         "qa_gate": _build_qa_meta(state),
         "operator_fix": _build_operator_fix_meta(),
+        "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See
         # _build_pingpong_meta for the full schema. Always present so
         # the dashboard can decide enabled=true/false on the runner
@@ -2779,6 +2838,67 @@ def _build_operator_fix_meta() -> dict:
         "publish_status": state.get("publish_status") or "not_requested",
         "last_commit_hash": state.get("last_commit_hash"),
         "last_message": state.get("last_message"),
+    }
+
+
+def _build_cycle_effectiveness_meta(state: dict) -> dict:
+    """Compose the heartbeat's `metadata.local_factory.cycle_effectiveness`
+    block — the dashboard's source-of-truth for "did the most recent
+    cycle actually change product code, or did we just spin?".
+
+    Pulls cycle status / claude_apply detail from factory_state.json
+    and the commit_hash + push status from publish_state.json (the
+    runner owns push, not cycle.py — so the linkage is "the cycle
+    that produced these files" + "the publish_changes invocation that
+    pushed them").
+    """
+    code_changed = bool(state.get("code_changed"))
+    apply_status = state.get("claude_apply_status") or "skipped"
+    apply_message = state.get("claude_apply_message")
+    changed_files = list(state.get("claude_apply_changed_files") or [])
+    no_code_change_reason = state.get("no_code_change_reason")
+    failed_stage = state.get("failed_stage")
+    failed_reason = state.get("failed_reason")
+    suggested_action = state.get("suggested_action")
+    cycle_log = list(state.get("cycle_log") or [])
+
+    # Pull commit / push status from publish_state.json so the panel
+    # can show "이 사이클이 만든 변경이 push 되었는가" without the FE
+    # having to cross-reference two heartbeat blocks.
+    publish_state = _read_publish_state() or {}
+    commit_hash = publish_state.get("last_commit_hash")
+    push_status = publish_state.get("last_push_status")
+    push_at = publish_state.get("last_push_at")
+    push_files = publish_state.get("last_pushed_files") or []
+
+    # The publish/commit only "belongs" to this cycle if the pushed
+    # file list overlaps with claude_apply_changed_files. Otherwise we
+    # leave commit_hash null so the UI doesn't claim a stale commit
+    # represents this cycle's output.
+    if commit_hash and changed_files:
+        push_set = set(push_files)
+        if not push_set.intersection(changed_files):
+            commit_hash = None
+            push_status = None
+            push_at = None
+
+    return {
+        "cycle_id": state.get("cycle"),
+        "status": state.get("status"),
+        "code_changed": code_changed,
+        "changed_files_count": len(changed_files),
+        "changed_files": changed_files[:30],
+        "commit_hash": commit_hash,
+        "commit_hash_short": (commit_hash[:8] if commit_hash else None),
+        "push_status": push_status,
+        "push_at": push_at,
+        "no_code_change_reason": no_code_change_reason,
+        "last_claude_apply_status": apply_status,
+        "last_claude_apply_message": apply_message,
+        "failed_stage": failed_stage,
+        "failed_reason": failed_reason,
+        "suggested_action": suggested_action,
+        "cycle_log": cycle_log[-30:],  # last 30 entries — keep payload small
     }
 
 
@@ -2984,6 +3104,24 @@ def _execute(cmd_row: dict) -> None:
         sys.stderr.write(f"[runner] unknown command '{name}' — rejecting\n")
         report_result(cid, False, f"rejected_unknown_command: {name}")
         return
+
+    # Pile-up dedupe — when rapid clicks land multiple of the same
+    # build_check / test_check / deploy_to_server in the queue, the
+    # *first* to claim runs; subsequent ones within DEDUPE_WINDOW_SEC
+    # short-circuit with "already_running". deploy_to_server has its
+    # own command_id idempotency on top of this so a server retry of
+    # the same id still gets the cached outcome.
+    if _is_duplicate_recent_command(name, cid):
+        prev = _LAST_COMMAND_RESULT.get(name) or {}
+        prev_msg = prev.get("message") or "no detail"
+        report_result(
+            cid, True,
+            f"already_running: {name} 가 최근 {DEDUPE_WINDOW_SEC}초 내 실행됨 — "
+            f"중복 요청 무시 (cached: {prev_msg[:160]})",
+        )
+        return
+    _mark_command_inflight(name, cid)
+
     # Surface the command id to handlers that want idempotency
     # (deploy_to_server uses it to dedupe the same command across
     # retries). Other handlers ignore it.
@@ -2993,6 +3131,7 @@ def _execute(cmd_row: dict) -> None:
         ok, msg = handler(payload)
     except Exception as e:  # noqa: BLE001
         ok, msg = False, f"handler raised: {e}"
+    _record_command_result(name, cid, ok, msg)
     report_result(cid, ok, msg)
 
     # Honor any deferred action a handler scheduled. We always run the
