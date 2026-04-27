@@ -1,0 +1,57 @@
+name: Deploy Stampport
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/stampport_deploy_key
+          chmod 600 ~/.ssh/stampport_deploy_key
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy on server
+        run: |
+          ssh -i ~/.ssh/stampport_deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}" <<'EOF'
+          set -euo pipefail
+
+          cd /home/admin/stampport
+          git pull origin main
+
+          echo "▶ Build Stampport app web"
+          cd /home/admin/stampport/app/web
+          npm install
+          npm run build
+
+          sudo mkdir -p /var/www/stampport
+          sudo rm -rf /var/www/stampport/*
+          sudo cp -r dist/* /var/www/stampport/
+
+          echo "▶ Build Stampport control tower web"
+          cd /home/admin/stampport/control_tower/web
+          npm install
+          npm run build
+
+          sudo mkdir -p /var/www/stampport-control
+          sudo rm -rf /var/www/stampport-control/*
+          sudo cp -r dist/* /var/www/stampport-control/
+
+          echo "▶ Health checks"
+          curl -f https://reviewdr.kr/stampport-control-api/health
+          curl -I https://reviewdr.kr/stampport/
+          curl -I https://reviewdr.kr/stampport-control/
+
+          echo "✅ Stampport deploy completed"
+          EOF
