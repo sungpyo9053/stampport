@@ -1,6 +1,6 @@
 import { useApp } from '../context/appContext.js';
 import { categoryIcon, categoryLabel } from '../data/options.js';
-import { levelProgress } from '../utils/leveling.js';
+import { levelProgress, stampGradeFor } from '../utils/leveling.js';
 
 export default function StampResult({ navigate, stampId }) {
   const { stampById, badges, exp } = useApp();
@@ -33,14 +33,23 @@ export default function StampResult({ navigate, stampId }) {
     .filter((b) => !b.earned && b.progress > 0)
     .slice(0, 3);
 
+  // Use the frozen grade if it was persisted; fall back to a fresh
+  // compute for legacy stamps (pre-grade schema).
+  const grade = stamp.grade || stampGradeFor(stamp);
+  const breakdown = stamp.exp_breakdown || [];
+
   return (
     <section className="result">
       <div className="result-header">
-        <span className="eyebrow">Stamp Acquired</span>
-        <h1>스탬프를 획득했어요!</h1>
+        <span className="eyebrow">Stamp Acquired · {grade.grade}등급</span>
+        <h1>{grade.label} 획득!</h1>
       </div>
 
-      <div className="stamp-card">
+      <div className="stamp-card" data-grade={grade.grade}>
+        <div className="grade-ribbon" style={{ backgroundColor: grade.color }}>
+          <span>{grade.grade}</span>
+          <strong>{grade.label}</strong>
+        </div>
         <div className="stamp-meta">
           <span>{stamp.area} · {categoryLabel(stamp.category)}</span>
           <span>{dateLabel}</span>
@@ -49,6 +58,30 @@ export default function StampResult({ navigate, stampId }) {
         {stamp.representative_menu ? (
           <div className="place-sub">대표 메뉴 · {stamp.representative_menu}</div>
         ) : null}
+
+        {stamp.photo_data_url ? (
+          <img
+            className="stamp-photo"
+            src={stamp.photo_data_url}
+            alt={`${stamp.place_name} 방문 사진`}
+          />
+        ) : null}
+
+        {stamp.experience_note ? (
+          <blockquote className="stamp-note">
+            “{stamp.experience_note}”
+          </blockquote>
+        ) : null}
+
+        <div className="stamp-proofs">
+          {stamp.location_label ? (
+            <span className="proof-pill">📍 {stamp.location_label}</span>
+          ) : null}
+          {stamp.visit_mood ? (
+            <span className="proof-pill">✨ {moodLabel(stamp.visit_mood)}</span>
+          ) : null}
+        </div>
+
         {stamp.tags?.length ? (
           <div className="tag-row">
             {stamp.tags.map((t) => (
@@ -71,6 +104,22 @@ export default function StampResult({ navigate, stampId }) {
           </div>
           <span className="exp-amount">+{stamp.exp_gained} EXP</span>
         </div>
+        <div className="next-level-line">
+          다음 레벨까지{' '}
+          <strong>{info.expToNext}</strong> EXP — Lv.{info.level + 1} 코앞이에요.
+        </div>
+
+        {breakdown.length ? (
+          <ul className="exp-breakdown">
+            {breakdown.map((it) => (
+              <li key={it.key}>
+                <span>{it.label}</span>
+                <strong>+{it.exp}</strong>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
         <div className="gain-row" style={{ marginTop: 14 }}>
           <div className="gain">
             <div className="label">레벨</div>
@@ -147,4 +196,18 @@ export default function StampResult({ navigate, stampId }) {
       </div>
     </section>
   );
+}
+
+const MOOD_LABEL = {
+  cozy: '아늑함',
+  memorable: '기억에 남음',
+  with_someone: '누구랑 또',
+  alone: '혼자 좋음',
+  value: '가성비 좋음',
+  dessert: '디저트 천국',
+  discovery: '새 발견',
+};
+
+function moodLabel(id) {
+  return MOOD_LABEL[id] || id;
 }

@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { useApp } from '../context/appContext.js';
 import { categoryLabel } from '../data/options.js';
+import { stampGradeFor } from '../utils/leveling.js';
 
 function summarize(stamps, key) {
   const map = new Map();
@@ -11,8 +12,79 @@ function summarize(stamps, key) {
   return [...map.entries()].sort((a, b) => b[1] - a[1]);
 }
 
+function CharacterAvatar({ user, level }) {
+  // Simple SVG character: badge frame + level pip + nickname initial.
+  // Drawn inline so the passport screen renders something Stampport-y
+  // without a real avatar pipeline.
+  const initial = (user?.nickname || '여행자').slice(0, 1);
+  const provider = (user?.provider || 'guest').toUpperCase();
+  return (
+    <div className="character-avatar" aria-label={`${user?.nickname || '여행자'} 캐릭터`}>
+      <svg viewBox="0 0 96 96" width="96" height="96" aria-hidden="true">
+        {/* outer passport ring */}
+        <circle cx="48" cy="48" r="44" fill="#1f3d2b" />
+        <circle cx="48" cy="48" r="44" fill="none" stroke="#c9a23a" strokeWidth="3" />
+        <circle cx="48" cy="48" r="34" fill="#fbf6e9" />
+        {/* dotted inner ring for "passport" feel */}
+        <circle
+          cx="48"
+          cy="48"
+          r="38"
+          fill="none"
+          stroke="#c9a23a"
+          strokeWidth="1"
+          strokeDasharray="2 4"
+          opacity="0.7"
+        />
+        {/* initial */}
+        <text
+          x="48"
+          y="56"
+          textAnchor="middle"
+          fontFamily="Iowan Old Style, Georgia, serif"
+          fontSize="28"
+          fontWeight="700"
+          fill="#1f3d2b"
+        >
+          {initial}
+        </text>
+        {/* burgundy stamp at corner */}
+        <g transform="translate(64 64) rotate(-8)">
+          <circle cx="0" cy="0" r="14" fill="#6e1f2a" />
+          <text
+            x="0"
+            y="3"
+            textAnchor="middle"
+            fontFamily="Iowan Old Style, Georgia, serif"
+            fontSize="9"
+            fontWeight="800"
+            fill="#f6efde"
+          >
+            SP
+          </text>
+        </g>
+      </svg>
+      <div className="character-level" title={`Level ${level}`}>
+        <span className="lv">Lv</span>
+        <strong>{level}</strong>
+      </div>
+      <div className="character-provider">{provider} 여권</div>
+    </div>
+  );
+}
+
 export default function MyPassport({ navigate }) {
-  const { user, stamps, exp, level, levelInfo, earnedBadges, selectedTitle, quests } = useApp();
+  const {
+    user,
+    stamps,
+    exp,
+    level,
+    levelInfo,
+    earnedBadges,
+    selectedTitle,
+    quests,
+    streakLast7Days,
+  } = useApp();
 
   const areaSummary = useMemo(() => summarize(stamps, 'area'), [stamps]);
   const categorySummary = useMemo(
@@ -23,52 +95,67 @@ export default function MyPassport({ navigate }) {
   const recent = stamps.slice(0, 5);
   const activeQuest = quests.find((q) => !q.completed);
 
+  // Distribution of grades in the player's collection — drives the
+  // "grade pip strip" on the character card so the player sees their
+  // S/A/B/C ratio at a glance.
+  const gradeDistribution = useMemo(() => {
+    const counts = { S: 0, A: 0, B: 0, C: 0 };
+    for (const s of stamps) {
+      const g = (s.grade && s.grade.grade) || stampGradeFor(s).grade;
+      if (counts[g] != null) counts[g] += 1;
+    }
+    return counts;
+  }, [stamps]);
+
   return (
     <section className="form-stack" style={{ gap: 18 }}>
-      <div className="passport-summary">
+      <div className="passport-summary character-summary">
         <span className="ps-tag">My Passport</span>
-        <h2>{user?.nickname}님의 로컬 여권</h2>
-        <div className="ps-title">현재 칭호 · {selectedTitle}</div>
 
-        <div className="passport-card-identity">
-          <div className="pci-avatar">{(user?.nickname || '?').slice(0, 1)}</div>
-          <div className="pci-text">
-            <div className="pci-title">
-              Lv.{level} · {user?.passport_title || '동네 도장 수집가'}
+        <div className="character-card">
+          <CharacterAvatar user={user} level={level} />
+          <div className="character-meta">
+            <h2>{user?.nickname || '게스트'} 님의 여권</h2>
+            <div className="character-title">
+              <span className="ct-tag">현재 칭호</span>
+              <strong>{selectedTitle}</strong>
             </div>
-            <div className="pci-meta">
-              {user?.nickname || '게스트'}님 · 도장 {stamps.length}개 · 다음 레벨까지 {Math.max(0, levelInfo.expForLevel - levelInfo.expIntoLevel)} EXP
+            <div className="character-stats">
+              <span>도장 {stamps.length}</span>
+              <span>·</span>
+              <span>뱃지 {earnedBadges.length}</span>
+              <span>·</span>
+              <span>최근 7일 {streakLast7Days}일 방문</span>
             </div>
-            <div className="pci-provider">
-              {(user?.provider || 'guest').toUpperCase()} 여권
+            <div className="grade-strip">
+              {['S', 'A', 'B', 'C'].map((g) => (
+                <span key={g} className={`gp gp-${g}`}>
+                  <strong>{g}</strong>
+                  <em>{gradeDistribution[g]}</em>
+                </span>
+              ))}
             </div>
           </div>
         </div>
 
-        <div className="ps-stats">
-          <div className="ps-stat">
-            <div className="label">Stamps</div>
-            <div className="value">{stamps.length}</div>
-          </div>
-          <div className="ps-stat">
-            <div className="label">Level</div>
-            <div className="value">{level}</div>
-          </div>
-          <div className="ps-stat">
-            <div className="label">Badges</div>
-            <div className="value">{earnedBadges.length}</div>
-          </div>
-        </div>
-
-        <div className="ps-exp">
+        {/* Big level + EXP bar — the "next level까지 N EXP" cue. */}
+        <div className="ps-exp ps-exp-large">
           <div className="row">
-            <span>EXP {exp}</span>
             <span>
-              {levelInfo.expIntoLevel} / {levelInfo.expForLevel}
+              Lv.{level} → Lv.{level + 1}
+            </span>
+            <span>
+              {levelInfo.expIntoLevel} / {levelInfo.expForLevel} EXP
             </span>
           </div>
           <div className="ps-exp-bar">
-            <div className="fill" style={{ width: `${Math.round(levelInfo.ratio * 100)}%` }} />
+            <div
+              className="fill"
+              style={{ width: `${Math.round(levelInfo.ratio * 100)}%` }}
+            />
+          </div>
+          <div className="next-level-hint">
+            다음 레벨까지 <strong>{levelInfo.expToNext}</strong> EXP — 도장 1~2개면 도착해요.
           </div>
         </div>
       </div>
@@ -173,24 +260,38 @@ export default function MyPassport({ navigate }) {
       </div>
       {recent.length ? (
         <div className="stamp-list">
-          {recent.map((s) => (
-            <button
-              key={s.id}
-              type="button"
-              className="stamp-row"
-              onClick={() => navigate(`/result/${s.id}`)}
-              style={{ appearance: 'none', textAlign: 'left', cursor: 'pointer' }}
-            >
-              <div className="pin">{categoryLabel(s.category).slice(0, 1)}</div>
-              <div className="info">
-                <div className="name">{s.place_name}</div>
-                <div className="meta">
-                  {s.area} · {categoryLabel(s.category)} · {s.visited_at}
+          {recent.map((s) => {
+            const g = (s.grade && s.grade.grade) || stampGradeFor(s).grade;
+            const gColor =
+              (s.grade && s.grade.color) || stampGradeFor(s).color;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                className="stamp-row"
+                onClick={() => navigate(`/result/${s.id}`)}
+                style={{ appearance: 'none', textAlign: 'left', cursor: 'pointer' }}
+              >
+                <div
+                  className="pin grade-pin"
+                  style={{ backgroundColor: gColor }}
+                  aria-label={`${g}등급`}
+                >
+                  {g}
                 </div>
-              </div>
-              <div className="arrow" aria-hidden="true">→</div>
-            </button>
-          ))}
+                <div className="info">
+                  <div className="name">{s.place_name}</div>
+                  <div className="meta">
+                    {s.area} · {categoryLabel(s.category)} · {s.visited_at}
+                  </div>
+                  {s.experience_note ? (
+                    <div className="note-snippet">“{s.experience_note}”</div>
+                  ) : null}
+                </div>
+                <div className="arrow" aria-hidden="true">→</div>
+              </button>
+            );
+          })}
         </div>
       ) : (
         <p className="empty">아직 스탬프가 없어요. 첫 도장을 찍어 볼까요?</p>

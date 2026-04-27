@@ -11,7 +11,13 @@ import {
 } from '../utils/storage.js';
 import { computeBadges, BADGE_DEFS } from '../data/badges.js';
 import { computeQuests } from '../data/quests.js';
-import { expGainFor, levelFor, levelProgress, totalExp } from '../utils/leveling.js';
+import {
+  expGainBreakdown,
+  levelFor,
+  levelProgress,
+  stampGradeFor,
+  totalExp,
+} from '../utils/leveling.js';
 import { generateKickPoints } from '../utils/kickPoints.js';
 import { AppContext } from './appContext.js';
 
@@ -132,10 +138,21 @@ export function AppProvider({ children }) {
         verification_status: 'unverified',
         trust_score: 0,
         created_at: new Date().toISOString(),
+        // Visit-experience fields. Stored even when blank so the
+        // result/passport screens can render a stable shape.
+        experience_note: input.experience_note?.trim() || '',
+        photo_data_url: input.photo_data_url || '',
+        location_label: input.location_label?.trim() || '',
+        visit_mood: input.visit_mood || '',
       };
       stamp.kick_points = generateKickPoints(stamp);
-      const exp_gained = expGainFor(stamp, previous);
-      stamp.exp_gained = exp_gained;
+      // Grade + breakdown are derived purely from the stamp itself
+      // (and the previous-stamps set for "new area" bonuses), so we
+      // freeze them at write time. No re-computation later.
+      const breakdown = expGainBreakdown(stamp, previous);
+      stamp.exp_breakdown = breakdown.items;
+      stamp.exp_gained = breakdown.total;
+      stamp.grade = stampGradeFor(stamp);
       setStamps([stamp, ...previous]);
       return stamp;
     },
@@ -173,6 +190,44 @@ export function AppProvider({ children }) {
     [stamps],
   );
 
+  // What would `addStamp(input)` award and grade right now? Used by
+  // StampForm to render a live "+EXP / 등급" preview as the player
+  // fills in the form. Pure function; no side effects.
+  const previewStamp = useCallback(
+    (input) => {
+      const candidate = {
+        place_name: input.place_name || '',
+        area: input.area || '기타',
+        category: input.category || 'cafe',
+        tags: input.tags || [],
+        experience_note: input.experience_note || '',
+        photo_data_url: input.photo_data_url || '',
+        location_label: input.location_label || '',
+        visit_mood: input.visit_mood || '',
+      };
+      return {
+        breakdown: expGainBreakdown(candidate, stamps),
+        grade: stampGradeFor(candidate),
+      };
+    },
+    [stamps],
+  );
+
+  // 7-day visit streak — used by MyPassport's character header. Counts
+  // distinct calendar dates within the last 7 days that have ≥1 stamp.
+  const streakLast7Days = useMemo(() => {
+    const days = new Set();
+    const now = Date.now();
+    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+    for (const s of stamps) {
+      const t = s.visited_at ? Date.parse(s.visited_at) : NaN;
+      if (!Number.isFinite(t)) continue;
+      if (now - t > SEVEN_DAYS) continue;
+      days.add(s.visited_at.slice(0, 10));
+    }
+    return days.size;
+  }, [stamps]);
+
   const value = useMemo(
     () => ({
       user,
@@ -191,6 +246,8 @@ export function AppProvider({ children }) {
       profileMeta,
       setSelectedTitle,
       stampById,
+      previewStamp,
+      streakLast7Days,
     }),
     [
       user,
@@ -209,6 +266,8 @@ export function AppProvider({ children }) {
       profileMeta,
       setSelectedTitle,
       stampById,
+      previewStamp,
+      streakLast7Days,
     ],
   );
 

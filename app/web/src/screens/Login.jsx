@@ -1,10 +1,12 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useApp } from '../context/appContext.js';
 import {
   buildAuthorizeUrl,
   isOAuthConfigured,
   MOCK_PROFILE,
 } from '../utils/oauth.js';
+import { loadStamps, loadUser } from '../utils/storage.js';
+import { levelFor, totalExp } from '../utils/leveling.js';
 
 // Login screen — Stampport's "내 로컬 여권 시작" entry. Social
 // (Kakao/Naver) is the primary CTA; nickname-only guest mode is the
@@ -70,6 +72,23 @@ export default function Login({ navigate }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
+  // Returning-passport hint — if there's a profile in localStorage,
+  // show a "이어가기" panel so the player feels their character is
+  // waiting, instead of being asked to start over.
+  const returning = useMemo(() => {
+    const u = loadUser();
+    if (!u) return null;
+    const stamps = loadStamps(u.user_id);
+    const exp = totalExp(stamps);
+    return {
+      nickname: u.nickname || '여행자',
+      provider: u.provider || 'guest',
+      level: levelFor(exp),
+      stamps: stamps.length,
+      exp,
+    };
+  }, []);
+
   const handleSocial = (provider) => {
     setError('');
     if (busy) return;
@@ -133,6 +152,27 @@ export default function Login({ navigate }) {
           도장을 모으고, 배지를 얻고, 동네 칭호를 키워보세요.
         </p>
       </div>
+
+      {returning ? (
+        <div className="returning-card" role="status">
+          <div className="rc-avatar" aria-hidden="true">
+            {(returning.nickname || '?').slice(0, 1)}
+          </div>
+          <div className="rc-text">
+            <div className="rc-line">
+              <strong>{returning.nickname}</strong>
+              <span className="rc-pip">Lv.{returning.level}</span>
+            </div>
+            <div className="rc-meta">
+              도장 {returning.stamps}개 · 누적 {returning.exp} EXP ·{' '}
+              {(returning.provider || 'guest').toUpperCase()} 여권
+            </div>
+            <div className="rc-hint">
+              여권이 이 기기에 저장돼 있어요. 같은 방법으로 로그인하면 그대로 이어집니다.
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <ul className="login-perks">
         <li><span aria-hidden="true">📓</span> 내 취향 여권</li>

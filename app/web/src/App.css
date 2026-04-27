@@ -1477,3 +1477,670 @@
   color: var(--color-ink-muted);
   font-size: 13.5px;
 }
+
+/* ----------------------------------------------------------------- */
+/* Visit-experience inputs (StampForm) — required note, mood chips,  */
+/* photo + location proof tiles, and the live grade/EXP preview.     */
+/* ----------------------------------------------------------------- */
+
+.form-required {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background-color: var(--color-burgundy);
+  color: var(--color-cream);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.form-helper.is-ok {
+  font-weight: 600;
+}
+
+.form-field textarea {
+  width: 100%;
+  min-height: 80px;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink);
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  resize: vertical;
+}
+
+.form-field textarea:focus {
+  outline: 2px solid var(--color-deep-green);
+  outline-offset: -1px;
+  border-color: var(--color-deep-green);
+}
+
+.stamp-preview-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 360px) {
+  .stamp-preview-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.grade-preview,
+.exp-preview {
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  padding: 12px 12px 10px;
+}
+
+.grade-preview {
+  position: relative;
+  border-color: var(--color-gold-soft);
+}
+
+.grade-preview .gp-rank {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.grade-preview .gp-rank .rank {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background-color: var(--color-deep-green);
+  color: var(--color-gold);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.grade-preview[data-grade='S'] .gp-rank .rank {
+  background-color: var(--color-gold);
+  color: var(--color-deep-green);
+}
+.grade-preview[data-grade='A'] .gp-rank .rank {
+  background-color: var(--color-burgundy);
+  color: var(--color-cream);
+}
+.grade-preview[data-grade='B'] .gp-rank .rank {
+  background-color: var(--color-warm-brown);
+  color: var(--color-cream);
+}
+
+.grade-preview .gp-rank .label {
+  font-family: var(--font-serif);
+  font-size: 14.5px;
+  color: var(--color-deep-green);
+  font-weight: 700;
+}
+
+.grade-preview .gp-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+}
+
+.grade-preview .gp-checks li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.grade-preview .gp-checks li.met {
+  color: var(--color-deep-green);
+  font-weight: 600;
+}
+
+.exp-preview .ep-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.exp-preview .ep-label {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+}
+
+.exp-preview .ep-total {
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-deep-green);
+}
+
+.exp-preview ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11.5px;
+  color: var(--color-ink-soft);
+}
+
+.exp-preview li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.exp-preview li strong {
+  color: var(--color-burgundy);
+  font-size: 12px;
+}
+
+/* Mood chips — emoji + Korean label, snake-grid layout. */
+.mood-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.mood-chip {
+  appearance: none;
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--color-ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.mood-chip .mood-emoji {
+  font-size: 14px;
+}
+
+.mood-chip.active {
+  background-color: var(--color-deep-green);
+  border-color: var(--color-deep-green);
+  color: var(--color-cream);
+  font-weight: 700;
+}
+
+/* Proof tiles — photo + location side-by-side. */
+.proof-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+@media (max-width: 360px) {
+  .proof-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.proof-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  background-color: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+
+.proof-tile .proof-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-serif);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-deep-green);
+}
+
+.proof-tile .proof-icon {
+  font-size: 16px;
+}
+
+.proof-tile .proof-sub {
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.proof-tile .proof-loc {
+  color: var(--color-deep-green);
+  font-weight: 600;
+}
+
+.proof-tile .proof-photo {
+  width: 100%;
+  max-height: 140px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--color-line);
+}
+
+.proof-tile .proof-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.btn.btn-mini {
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ----------------------------------------------------------------- */
+/* StampResult — grade ribbon, photo, memo quote, breakdown.         */
+/* ----------------------------------------------------------------- */
+
+.stamp-card {
+  position: relative;
+}
+
+.stamp-card .grade-ribbon {
+  position: absolute;
+  top: 14px;
+  right: -8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 5px 10px;
+  font-family: var(--font-serif);
+  font-size: 12px;
+  color: var(--color-cream);
+  background-color: var(--color-burgundy);
+  box-shadow: var(--shadow-stamp);
+  z-index: 2;
+}
+
+.stamp-card .grade-ribbon::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: -6px;
+  border-style: solid;
+  border-width: 0 8px 6px 0;
+  border-color: transparent rgba(0, 0, 0, 0.35) transparent transparent;
+}
+
+.stamp-card .grade-ribbon span {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.stamp-card .grade-ribbon strong {
+  font-size: 11.5px;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+}
+
+.stamp-card .stamp-photo {
+  width: 100%;
+  max-height: 220px;
+  object-fit: cover;
+  border-radius: 12px;
+  margin-top: 12px;
+  border: 1px solid var(--color-line);
+}
+
+.stamp-card .stamp-note {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  font-family: var(--font-serif);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-deep-green);
+  background-color: var(--color-cream-soft);
+  border-left: 3px solid var(--color-burgundy);
+  border-radius: 0 8px 8px 0;
+}
+
+.stamp-card .stamp-proofs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.stamp-card .stamp-proofs .proof-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background-color: var(--color-cream);
+  color: var(--color-deep-green);
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--color-line);
+}
+
+.exp-breakdown {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  background-color: var(--color-cream-soft);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-ink-soft);
+}
+
+.exp-breakdown li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.exp-breakdown li strong {
+  color: var(--color-burgundy);
+  font-weight: 700;
+}
+
+.next-level-line {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--color-ink-soft);
+}
+
+.next-level-line strong {
+  color: var(--color-deep-green);
+  font-family: var(--font-serif);
+  font-size: 14px;
+}
+
+/* ----------------------------------------------------------------- */
+/* MyPassport character card                                         */
+/* ----------------------------------------------------------------- */
+
+.character-summary {
+  padding-bottom: 18px;
+}
+
+.character-card {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  margin-top: 10px;
+}
+
+.character-avatar {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.character-avatar svg {
+  display: block;
+  border-radius: 50%;
+  filter: drop-shadow(0 6px 10px rgba(31, 61, 43, 0.18));
+}
+
+.character-avatar .character-level {
+  position: absolute;
+  left: -6px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 3px 9px;
+  background-color: var(--color-gold);
+  color: var(--color-deep-green);
+  border-radius: 999px;
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 13px;
+  box-shadow: 0 3px 8px rgba(201, 162, 58, 0.4);
+}
+
+.character-avatar .character-level .lv {
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.character-avatar .character-provider {
+  position: absolute;
+  right: -6px;
+  top: 4px;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--color-burgundy);
+  background-color: var(--color-paper);
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--color-line);
+}
+
+.character-meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.character-meta h2 {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  margin: 0;
+  color: var(--color-deep-green);
+}
+
+.character-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background-color: var(--color-burgundy);
+  color: var(--color-cream);
+  font-size: 11.5px;
+  width: fit-content;
+}
+
+.character-title .ct-tag {
+  opacity: 0.85;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.character-title strong {
+  font-family: var(--font-serif);
+  font-weight: 700;
+}
+
+.character-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--color-ink-soft);
+}
+
+.grade-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.grade-strip .gp {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 0;
+  border-radius: 8px;
+  background-color: var(--color-cream-soft);
+  border: 1px solid var(--color-line);
+  font-family: var(--font-serif);
+  font-size: 11px;
+}
+
+.grade-strip .gp strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.grade-strip .gp em {
+  font-style: normal;
+  color: var(--color-ink-muted);
+}
+
+.grade-strip .gp-S {
+  background-color: rgba(201, 162, 58, 0.16);
+  border-color: var(--color-gold-soft);
+  color: var(--color-warm-brown);
+}
+.grade-strip .gp-A {
+  background-color: rgba(110, 31, 42, 0.10);
+  border-color: var(--color-burgundy);
+  color: var(--color-burgundy);
+}
+.grade-strip .gp-B {
+  background-color: rgba(107, 74, 43, 0.12);
+  border-color: var(--color-warm-brown);
+  color: var(--color-warm-brown);
+}
+.grade-strip .gp-C {
+  color: var(--color-ink-muted);
+}
+
+/* Big EXP bar variant on the passport summary */
+.ps-exp-large {
+  margin-top: 14px;
+}
+
+.ps-exp-large .ps-exp-bar {
+  height: 12px !important;
+}
+
+.next-level-hint {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--color-cream);
+  opacity: 0.92;
+}
+
+.next-level-hint strong {
+  color: var(--color-gold-soft);
+  font-family: var(--font-serif);
+  font-size: 15px;
+  margin: 0 2px;
+}
+
+/* Recent stamp list — grade pin + memo snippet */
+.stamp-row .grade-pin {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-cream);
+  letter-spacing: 0.04em;
+}
+
+.stamp-row .note-snippet {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--color-ink-muted);
+  font-style: italic;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Returning-passport hint on the Login screen */
+.returning-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-top: 4px;
+  background-color: var(--color-paper);
+  border: 1px dashed var(--color-burgundy);
+  border-radius: var(--radius-md);
+}
+
+.returning-card .rc-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background-color: var(--color-deep-green);
+  color: var(--color-cream);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.returning-card .rc-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.returning-card .rc-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-serif);
+  font-size: 14.5px;
+  color: var(--color-deep-green);
+}
+
+.returning-card .rc-pip {
+  background-color: var(--color-gold);
+  color: var(--color-deep-green);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+}
+
+.returning-card .rc-meta {
+  font-size: 11.5px;
+  color: var(--color-ink-soft);
+}
+
+.returning-card .rc-hint {
+  font-size: 11px;
+  color: var(--color-ink-muted);
+  margin-top: 2px;
+}

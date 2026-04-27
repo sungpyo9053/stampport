@@ -20,8 +20,33 @@
 //     // stamps:<old> bucket carries over without a copy.
 //     user_id:          string,
 //   }
+//
+// Stamp shape (per-visit record kept under stampport:stamps:<user_id>):
+//   {
+//     id, user_id, place_name, area, category, tags[],
+//     representative_menu, visited_at, created_at,
+//     // Visit-experience fields — the new "RPG hook" that drives
+//     // grade + EXP. ALL optional except experience_note (form requires
+//     // ≥10 chars before submit). See utils/leveling.js for weights.
+//     experience_note,        // string  — what the player writes
+//     photo_data_url,         // string  — base64 jpeg, capped via
+//                             //          PHOTO_MAX_DATA_URL_BYTES
+//     location_label,         // string  — e.g. "성수동 일대 (GPS)"
+//     visit_mood,             // string  — single mood-chip id
+//     // Computed at addStamp() time so the result/passport screens
+//     // never need to re-derive.
+//     grade,                  // { grade, label, color, score, ... }
+//     exp_breakdown,          // [{ key, label, exp }, ...]
+//     exp_gained,             // sum of the above
+//   }
 
 const USER_KEY = 'stampport:user';
+
+// localStorage budget for an embedded photo. Photos are downscaled
+// in the form so we never write more than ~250KB into a single stamp
+// — keeps the per-user bucket small enough that the JSON.parse round
+// trip stays fast even after dozens of stamps.
+export const PHOTO_MAX_DATA_URL_BYTES = 260_000;
 
 export function readJson(key, fallback) {
   if (typeof window === 'undefined') return fallback;
