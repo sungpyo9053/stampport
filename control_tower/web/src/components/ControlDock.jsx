@@ -115,6 +115,13 @@ function computeDeployDisplay({ progress, queuedLocally, actionsInFlight }) {
 // once the workflow has actually finished.
 const ACTIONS_INFLIGHT_MS = 5 * 60_000;
 
+// Window after which a *terminal* failure is no longer "the current
+// problem" — the panel should fall back to a small "마지막 배포: 실패,
+// HH:MM:SS" chip rather than a big red banner forever. Stays
+// conservative; the operator can still scroll the previous_attempts
+// list to see older failures.
+const STALE_FAILURE_MS = 5 * 60_000;
+
 // Compute the deploy button's visible state from runner heartbeat
 // metadata. Returns the enabled flag, button label, and a short reason
 // string for the disabled case so both the button and the explanation
@@ -126,14 +133,34 @@ function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
   const qa = lf.qa_gate || {};
   const progress = publish.deploy_progress || null;
   const progressStatus = progress?.status || "idle";
+  // The new schema flips is_active=true for any in-flight stage and
+  // back to false the instant we hit a terminal status (completed /
+  // failed). That's the canonical button gate — it lets a failed
+  // attempt re-arm the button without waiting for a heartbeat tick.
+  const isActive = progress?.is_active === true;
   const changedCount = publish.changed_count ?? 0;
   const dryRun = publish.dry_run !== false;
   const blocked = blocker.blocked === true;
-  const qaFailed = qa.status === "failed";
   const currentCommand = runner?.current_command || null;
   const runnerBusy = runner?.status === "busy";
   const lastPushStatus = publish.last_push_status;
   const lastPushAt = publish.last_push_at;
+
+  // Was the most recent terminal failure within STALE_FAILURE_MS?
+  // We use this to keep showing a big "실패" banner ONLY when the
+  // failure is fresh; older terminal failures collapse to a small
+  // "마지막 배포: 실패, HH:MM:SS" chip in the panel.
+  let recentFailure = false;
+  if (
+    progressStatus === "failed" &&
+    !isActive &&
+    progress?.failed_at
+  ) {
+    const t = Date.parse(progress.failed_at);
+    if (!Number.isNaN(t) && Date.now() - t < STALE_FAILURE_MS) {
+      recentFailure = true;
+    }
+  }
 
   // GitHub Actions in-flight heuristic: a real (non-dry-run) push
   // succeeded recently and the working tree is clean → the workflow
@@ -146,6 +173,14 @@ function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
     }
   }
 
+  // Whether the runner is currently chewing on a deploy/publish
+  // command. Anything else (factory restart, build_check, etc.)
+  // doesn't conflict with a deploy click — the queue serializes,
+  // but the user sees them as parallel concerns.
+  const cmdBlocksDeploy =
+    currentCommand === "deploy_to_server" ||
+    currentCommand === "publish_changes";
+
   // First-match wins. Order matches the user-facing priority — the
   // local in-flight click guard outranks server state because it
   // reflects "we just sent the command, server hasn't echoed yet".
@@ -157,29 +192,34 @@ function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
     enabled = false;
     label = "배포 중";
     reason = "배포 명령 진행 중";
-  } else if (DEPLOY_INFLIGHT_STATUSES.has(progressStatus)) {
+  } else if (isActive) {
     enabled = false;
     label = "배포 중";
     reason = "배포 진행 중 — 단계: " + (progress?.current_step || progressStatus);
   } else if (!runner) {
     enabled = false;
     reason = "러너 오프라인";
-  } else if (currentCommand || runnerBusy) {
+  } else if (cmdBlocksDeploy || runnerBusy) {
     enabled = false;
     reason = "명령 실행 중";
   } else if (blocked) {
     enabled = false;
     reason = "Release Safety Gate 차단";
-  } else if (qaFailed) {
-    enabled = false;
-    reason = "QA 실패";
   } else if (actionsInFlight || progressStatus === "actions_triggered") {
     enabled = false;
     reason = "GitHub Actions 배포 진행 중";
   } else if (changedCount === 0) {
+    // status === completed AND no changes → disabled. Same gate
+    // covers the "post-success" idle case where the working tree
+    // is clean.
     enabled = false;
     reason = "배포할 변경 없음";
   }
+  // NOTE: a stale qa.status === "failed" no longer blocks the
+  // button. The on-demand QA Gate runs at deploy click time, so
+  // gating on a leftover qa_status from an earlier cycle just keeps
+  // the operator stuck. publish_blocked still blocks; risky/secret
+  // checks still block at handler time.
 
   return {
     enabled,
@@ -194,6 +234,8 @@ function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
     qa,
     progress,
     progressStatus,
+    isActive,
+    recentFailure,
     queuedLocally,
   };
 }
@@ -248,8 +290,72 @@ function _formatLogTime(iso) {
   return `${hh}:${mm}:${ss}`;
 }
 
+function _attemptShortLabel(progress) {
+  // Prefer a numeric "Deploy #<cid>" because it lines up with the
+  // System Log markers; fall back to the stamped attempt id when the
+  // command_id is missing (e.g. operator-fix path).
+  if (progress?.command_id) return `Deploy #${progress.command_id}`;
+  if (progress?.attempt_id) return progress.attempt_id;
+  return "Deploy (현재 시도)";
+}
+
+function PreviousAttemptsBlock({ attempts = [] }) {
+  if (!attempts || attempts.length === 0) return null;
+  // Newest-last in the array as runner appends; render newest-first
+  // so the operator sees the most recent prior attempt first.
+  const ordered = [...attempts].reverse().slice(0, 3);
+  return (
+    <details className="grid gap-1">
+      <summary className="cursor-pointer text-[10px] font-bold uppercase tracking-[0.3em] text-slate-400 hover:text-slate-200">
+        이전 배포 시도 ({attempts.length})
+      </summary>
+      <ul className="grid gap-1 pt-1">
+        {ordered.map((a) => {
+          const label = _attemptShortLabel(a);
+          const tone =
+            a.status === "failed"
+              ? STEP_STATE_COLOR.failed
+              : a.status === "completed"
+                ? STEP_STATE_COLOR.success
+                : "#94a3b8";
+          return (
+            <li
+              key={`${a.attempt_id || label}-${a.ended_at || a.updated_at}`}
+              className="rounded px-2 py-1 text-[10px] tracking-wider"
+              style={{
+                backgroundColor: "#0a1228",
+                border: `1px solid ${tone}55`,
+              }}
+            >
+              <div className="flex flex-wrap items-baseline gap-2">
+                <span className="font-bold text-slate-200">{label}</span>
+                <span style={{ color: tone }}>· {a.status}</span>
+                {(a.failed_at || a.ended_at) && (
+                  <span className="text-slate-500">
+                    · {_formatLogTime(a.failed_at || a.ended_at)}
+                  </span>
+                )}
+              </div>
+              {a.failed_stage && (
+                <div className="mt-0.5 text-slate-400">
+                  실패 단계 · <span className="text-slate-200">{a.failed_stage}</span>
+                </div>
+              )}
+              {a.failed_reason && (
+                <div className="mt-0.5 line-clamp-2 text-slate-300">
+                  {a.failed_reason}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
+}
+
 function DeployProgressPanel({ deployState, queuedLocally }) {
-  const { progress, actionsInFlight } = deployState;
+  const { progress, actionsInFlight, isActive, recentFailure } = deployState;
   const { effective, failedAtIdx } = computeDeployDisplay({
     progress,
     queuedLocally,
@@ -263,7 +369,8 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
   const hasSignal =
     queuedLocally ||
     (progress && progress.status && progress.status !== "idle") ||
-    (progress?.history && progress.history.length > 0);
+    (progress?.history && progress.history.length > 0) ||
+    (progress?.previous_attempts && progress.previous_attempts.length > 0);
   if (!hasSignal) return null;
 
   // Drive the stepper from `effective` so "actions_triggered" can be
@@ -280,11 +387,54 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
     currentIdx = STATUS_TO_INDEX[effective] ?? -1;
   }
 
+  // Stale failure (>5min terminal) → collapse the panel into a small
+  // "마지막 배포: 실패, HH:MM:SS" chip + the previous-attempts list.
+  // Anything fresher gets the full stepper + failure card so the
+  // operator can act on it.
+  const isFailedTerminal =
+    progress?.status === "failed" && progress?.is_active === false;
+  const showStaleSummary = isFailedTerminal && !recentFailure;
+
+  if (showStaleSummary) {
+    const failedAt = progress?.failed_at || progress?.ended_at;
+    return (
+      <div
+        className="grid gap-2 px-1 pt-1"
+        style={{ borderTop: "1px solid #1a2540" }}
+      >
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] tracking-wider">
+          <span className="font-bold tracking-[0.25em] text-[#d4a843]">
+            ▶ 배포 진행
+          </span>
+          <span className="text-slate-300">현재 상태: 대기 중</span>
+          {failedAt && (
+            <span className="text-slate-400">
+              마지막 배포 ·{" "}
+              <span style={{ color: STEP_STATE_COLOR.failed }}>실패</span>
+              {", "}
+              {_formatLogTime(failedAt)}
+            </span>
+          )}
+          <span className="rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-widest"
+            style={{ borderColor: "#34d39955", color: "#86efac" }}
+          >
+            다시 시도 가능
+          </span>
+        </div>
+        <PreviousAttemptsBlock attempts={progress?.previous_attempts} />
+      </div>
+    );
+  }
+
   const history = (progress?.history || []).slice(-8).reverse();
   const failedReason = progress?.failed_reason;
+  const failedStage = progress?.failed_stage;
+  const failedAt = progress?.failed_at;
+  const suggestedAction = progress?.suggested_action;
   const startedAt = progress?.started_at;
   const updatedAt = progress?.updated_at;
   const completedAt = progress?.completed_at;
+  const attemptLabel = _attemptShortLabel(progress);
 
   return (
     <div
@@ -293,8 +443,12 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
         borderTop: "1px solid #1a2540",
       }}
     >
-      <div className="flex flex-wrap items-center gap-2 text-[10px] tracking-[0.25em] text-[#d4a843]">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] tracking-[0.25em] text-[#d4a843]">
         <span className="font-bold">▶ 배포 진행</span>
+        <span className="text-slate-500">·</span>
+        <span className="text-[10px] tracking-wider text-slate-300">
+          {attemptLabel}
+        </span>
         <span className="text-slate-500">·</span>
         <span
           className="text-[10px] font-bold"
@@ -317,6 +471,14 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
                   ? "GitHub Actions 진행 중"
                   : "진행 중"}
         </span>
+        {!isActive && effective === "failed" && (
+          <span
+            className="rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-widest"
+            style={{ borderColor: "#34d39955", color: "#86efac" }}
+          >
+            다시 시도 가능
+          </span>
+        )}
         {progress?.current_step && effective !== "completed" && (
           <span className="text-[10px] text-slate-400">
             · {progress.current_step}
@@ -383,10 +545,14 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
       </div>
 
       {/* Timestamps + failure detail */}
-      <div className="flex flex-wrap gap-x-3 text-[10px] text-slate-500">
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
+        {progress?.command_id && <span>cmd · #{progress.command_id}</span>}
         {startedAt && <span>시작 · {_formatLogTime(startedAt)}</span>}
         {updatedAt && <span>업데이트 · {_formatLogTime(updatedAt)}</span>}
-        {completedAt && <span>종료 · {_formatLogTime(completedAt)}</span>}
+        {completedAt && <span>완료 · {_formatLogTime(completedAt)}</span>}
+        {failedAt && effective === "failed" && (
+          <span>실패 · {_formatLogTime(failedAt)}</span>
+        )}
         {effective !== "completed" &&
           effective !== "failed" &&
           progress?.actions_url && (
@@ -401,16 +567,38 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
           )}
       </div>
 
-      {effective === "failed" && failedReason && (
+      {effective === "failed" && (failedReason || failedStage || suggestedAction) && (
         <div
-          className="rounded px-2 py-1 text-[10px] tracking-wider"
+          className="grid gap-1 rounded px-2 py-1.5 text-[10.5px] tracking-wider"
           style={{
             backgroundColor: "#3d0a14",
             border: "1px solid #8b2e3c",
             color: "#fecaca",
           }}
         >
-          ⚠ {failedReason}
+          <div className="flex flex-wrap items-baseline gap-x-3">
+            <span className="font-bold">⚠ 배포 실패</span>
+            {failedAt && (
+              <span className="text-[10px] text-rose-300">
+                실패 시각 · {_formatLogTime(failedAt)}
+              </span>
+            )}
+            {failedStage && (
+              <span className="text-[10px] text-rose-300">
+                실패 단계 · {failedStage}
+              </span>
+            )}
+          </div>
+          {failedReason && (
+            <pre className="whitespace-pre-wrap break-words text-[10.5px] leading-snug text-rose-100">
+              {failedReason}
+            </pre>
+          )}
+          {suggestedAction && (
+            <div className="text-[10px] text-amber-200">
+              권장 조치 · {suggestedAction}
+            </div>
+          )}
         </div>
       )}
 
@@ -433,6 +621,8 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
           ))}
         </div>
       )}
+
+      <PreviousAttemptsBlock attempts={progress?.previous_attempts} />
     </div>
   );
 }

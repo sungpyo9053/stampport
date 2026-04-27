@@ -557,21 +557,107 @@ def _save_publish_state(updates: dict) -> None:
 # deploy is mid-flight (received → validating → committing → pushing
 # → actions_triggered → completed/failed). Persisted under the
 # publish_state row so a single _save_publish_state write is enough.
+#
+# Each deploy click gets a fresh `attempt_id` (e.g.
+# "deploy_20260427_022412_cmd_31") and the prior attempt is moved into
+# `previous_attempts` (cap 3) when the new one resets. This is what
+# lets the dashboard show "이번 시도 진행 중" vs "이전 배포 시도"
+# without smearing a stale failure on top of an in-flight retry.
 DEPLOY_PROGRESS_HISTORY_CAP = 40
+DEPLOY_PROGRESS_PREVIOUS_CAP = 3
 DEPLOY_PROGRESS_TERMINAL = {"completed", "failed", "actions_triggered"}
+# Statuses where a click is still meaningfully in flight. Anything not
+# in this set with is_active=false is treated as "settled" — the
+# dashboard re-enables the button.
+DEPLOY_PROGRESS_ACTIVE_STATUSES = {
+    "queued",
+    "command_received",
+    "validating",
+    "committing",
+    "pushing",
+    "actions_triggered",
+    "deploying",
+}
+
+
+def _make_attempt_id(command_id: int | None, now_iso: str) -> str:
+    """Build a stable attempt id: deploy_<YYYYMMDD>_<HHMMSS>_cmd_<cid>.
+
+    Falls back to "cmd_local" when the command_id is unknown (operator-
+    fix path, manual publish_changes call) so the UI still has a key
+    to keep history rows distinct.
+    """
+    try:
+        # Strip the trailing "Z" so fromisoformat accepts it.
+        ts = datetime.strptime(now_iso[:19], "%Y-%m-%dT%H:%M:%S")
+        stamp = ts.strftime("%Y%m%d_%H%M%S")
+    except (ValueError, TypeError):
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    cid_token = f"cmd_{int(command_id)}" if command_id else "cmd_local"
+    return f"deploy_{stamp}_{cid_token}"
 
 
 def _new_deploy_progress(now: str) -> dict:
     return {
+        # Identity. attempt_id flips on reset; command_id matches the
+        # runner queue's command row id for the *current* attempt.
+        "attempt_id": None,
+        "command_id": None,
+        # Lifecycle.
         "status": "idle",
+        "is_active": False,
         "current_step": None,
         "started_at": None,
         "updated_at": now,
         "completed_at": None,
+        "ended_at": None,
+        "failed_at": None,
+        # Failure detail (mirrored into history but kept top-level so
+        # the FE doesn't have to rescan the array).
+        "failed_stage": None,
         "failed_reason": None,
+        "suggested_action": None,
         "failed_at_status": None,
+        # Static metadata.
         "actions_url": ACTIONS_URL,
+        # Per-attempt timeline.
         "history": [],
+        # Archive of the last DEPLOY_PROGRESS_PREVIOUS_CAP attempts.
+        # Each entry is a snapshot of a settled attempt.
+        "previous_attempts": [],
+    }
+
+
+def _archive_attempt(prev: dict) -> dict | None:
+    """Snapshot a settled deploy_progress so a new attempt's reset can
+    drop it into `previous_attempts`. Returns None when the prior
+    block has nothing worth archiving — e.g. the very first deploy of
+    a runner session, or a brand-new runner with only a default idle
+    placeholder."""
+    if not prev:
+        return None
+    status = prev.get("status") or "idle"
+    if status == "idle" and not prev.get("history"):
+        return None
+    if not prev.get("attempt_id") and status == "idle":
+        return None
+    return {
+        "attempt_id": prev.get("attempt_id"),
+        "command_id": prev.get("command_id"),
+        "status": status,
+        "is_active": False,
+        "current_step": prev.get("current_step"),
+        "started_at": prev.get("started_at"),
+        "updated_at": prev.get("updated_at"),
+        "completed_at": prev.get("completed_at"),
+        "ended_at": prev.get("ended_at") or prev.get("completed_at"),
+        "failed_at": prev.get("failed_at"),
+        "failed_stage": prev.get("failed_stage"),
+        "failed_reason": prev.get("failed_reason"),
+        "suggested_action": prev.get("suggested_action"),
+        "failed_at_status": prev.get("failed_at_status"),
+        # Keep only the tail of the history — snapshots stay small.
+        "history": list(prev.get("history") or [])[-12:],
     }
 
 
@@ -580,8 +666,12 @@ def _set_deploy_progress(
     *,
     current_step: str | None = None,
     failed_reason: str | None = None,
+    failed_stage: str | None = None,
+    suggested_action: str | None = None,
     log_message: str | None = None,
     reset: bool = False,
+    command_id: int | None = None,
+    attempt_id: str | None = None,
 ) -> None:
     """Update the deploy progress block under publish_state.
 
@@ -589,49 +679,109 @@ def _set_deploy_progress(
     timestamped log without the FE having to keep its own buffer
     across reloads. History is capped at DEPLOY_PROGRESS_HISTORY_CAP
     to keep the heartbeat payload small.
+
+    `reset=True` (used when a fresh `deploy_to_server` command lands)
+    archives the prior attempt into `previous_attempts` and starts a
+    new one — fresh attempt_id, fresh history, fresh timestamps.
     """
     cur = _read_publish_state()
     prev = cur.get("deploy_progress")
     if not isinstance(prev, dict):
         prev = {}
     now = _utc_now_z()
-    progress = {
-        "status": prev.get("status") or "idle",
-        "current_step": prev.get("current_step"),
-        "started_at": prev.get("started_at"),
-        "updated_at": prev.get("updated_at") or now,
-        "completed_at": prev.get("completed_at"),
-        "failed_reason": prev.get("failed_reason"),
-        "failed_at_status": prev.get("failed_at_status"),
-        "actions_url": ACTIONS_URL,
-        "history": list(prev.get("history") or [])[-DEPLOY_PROGRESS_HISTORY_CAP:],
-    }
+
     if reset:
+        archived = _archive_attempt(prev)
+        prior_archive = list(prev.get("previous_attempts") or [])
+        if archived is not None:
+            prior_archive.append(archived)
+        # FIFO drop — keep at most DEPLOY_PROGRESS_PREVIOUS_CAP.
+        prior_archive = prior_archive[-DEPLOY_PROGRESS_PREVIOUS_CAP:]
+        progress = _new_deploy_progress(now)
+        progress["previous_attempts"] = prior_archive
+        progress["attempt_id"] = attempt_id or _make_attempt_id(command_id, now)
+        progress["command_id"] = int(command_id) if command_id else None
         progress["started_at"] = now
-        progress["completed_at"] = None
-        progress["failed_reason"] = None
-        progress["failed_at_status"] = None
+    else:
+        progress = {
+            "attempt_id": prev.get("attempt_id"),
+            "command_id": prev.get("command_id"),
+            "status": prev.get("status") or "idle",
+            "is_active": bool(prev.get("is_active")),
+            "current_step": prev.get("current_step"),
+            "started_at": prev.get("started_at"),
+            "updated_at": prev.get("updated_at") or now,
+            "completed_at": prev.get("completed_at"),
+            "ended_at": prev.get("ended_at"),
+            "failed_at": prev.get("failed_at"),
+            "failed_stage": prev.get("failed_stage"),
+            "failed_reason": prev.get("failed_reason"),
+            "suggested_action": prev.get("suggested_action"),
+            "failed_at_status": prev.get("failed_at_status"),
+            "actions_url": ACTIONS_URL,
+            "history": list(prev.get("history") or [])[-DEPLOY_PROGRESS_HISTORY_CAP:],
+            "previous_attempts": list(prev.get("previous_attempts") or [])[
+                -DEPLOY_PROGRESS_PREVIOUS_CAP:
+            ],
+        }
+
     prior_status = progress["status"]
     progress["status"] = status
     progress["updated_at"] = now
+    if command_id is not None:
+        progress["command_id"] = int(command_id)
+    if attempt_id is not None and reset is False:
+        progress["attempt_id"] = attempt_id
+
     if current_step is not None:
         progress["current_step"] = current_step
+
     if status == "command_received" and not progress["started_at"]:
         progress["started_at"] = now
-    if status in {"completed", "failed"}:
+
+    is_terminal = status in {"completed", "failed"}
+    progress["is_active"] = (status in DEPLOY_PROGRESS_ACTIVE_STATUSES) and not is_terminal
+
+    if is_terminal:
+        progress["ended_at"] = now
+    if status == "completed":
         progress["completed_at"] = now
     if status == "failed":
+        progress["failed_at"] = now
         if failed_reason is not None:
             progress["failed_reason"] = failed_reason
+        if failed_stage is not None:
+            progress["failed_stage"] = failed_stage
+        if suggested_action is not None:
+            progress["suggested_action"] = suggested_action
         # Pin the in-flight stage where the failure happened so the
         # stepper can mark exactly that step red.
         progress["failed_at_status"] = (
             prior_status if prior_status not in ("idle", "failed") else "command_received"
         )
-    entry_msg = log_message or current_step or status
+        # Once the user has hit failed, the deploy is no longer
+        # "active" — the button must be allowed to re-enable so the
+        # operator can retry without restarting the runner.
+        if not progress["current_step"] or progress["current_step"].endswith("실행 중"):
+            progress["current_step"] = "배포 실패"
+
+    # Stamp the attempt id into the history line so the System Log
+    # picks up "Deploy #<cid>" markers via the existing classifier.
+    cid_label = (
+        f"Deploy #{progress['command_id']}"
+        if progress.get("command_id")
+        else (
+            f"Deploy [{progress['attempt_id']}]"
+            if progress.get("attempt_id") else "Deploy"
+        )
+    )
+    raw_msg = log_message or current_step or status
+    entry_msg = f"{cid_label} · {status} · {raw_msg}"
     progress["history"].append({
         "at": now,
         "status": status,
+        "attempt_id": progress.get("attempt_id"),
+        "command_id": progress.get("command_id"),
         "message": entry_msg,
     })
     progress["history"] = progress["history"][-DEPLOY_PROGRESS_HISTORY_CAP:]
@@ -689,10 +839,16 @@ def _qa_gate_status_from_state(cycle_state: dict) -> tuple[str, str]:
     qa_publish_allowed = bool((cycle_state or {}).get("qa_publish_allowed"))
 
     if not qa_report.is_file():
-        return "missing", ".runtime/qa_report.md 없음"
+        return (
+            "missing",
+            "QA Gate가 아직 실행되지 않았습니다 (.runtime/qa_report.md 없음)",
+        )
 
     if qa_status in {"", "skipped"}:
-        return "skipped", f"qa_status={qa_status or 'unset'}"
+        return (
+            "skipped",
+            f"QA Gate가 아직 실행되지 않았습니다 (qa_status={qa_status or 'unset'})",
+        )
 
     if qa_status != "passed" or not qa_publish_allowed:
         reason = (cycle_state or {}).get("qa_failed_reason") or qa_status
@@ -1131,12 +1287,27 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     # the stepper doesn't light up out-of-band.
     track_progress = bool((_payload or {}).get("__track_deploy_progress"))
 
-    def _progress(status: str, *, step: str, fail: str | None = None) -> None:
+    def _progress(
+        status: str,
+        *,
+        step: str,
+        fail: str | None = None,
+        log_message: str | None = None,
+    ) -> None:
         if not track_progress:
             return
-        _set_deploy_progress(status, current_step=step, failed_reason=fail)
+        _set_deploy_progress(
+            status,
+            current_step=step,
+            failed_reason=fail,
+            log_message=log_message,
+        )
 
-    def _record_failure(stage: str, message: str) -> None:
+    def _record_failure(
+        stage: str,
+        message: str,
+        suggested_action: str | None = None,
+    ) -> None:
         """Persist enough for the heartbeat/UI to show why we refused."""
         _save_publish_state({
             "last_push_status": "failed",
@@ -1150,6 +1321,9 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                 "failed",
                 current_step=f"{stage} 실패",
                 failed_reason=message[:280],
+                failed_stage=stage,
+                suggested_action=suggested_action,
+                log_message=f"publish blocked at {stage}: {message[:200]}",
             )
 
     _progress("validating", step="브랜치 / Release Safety Gate 확인 중")
@@ -1238,13 +1412,13 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
             )
         elif qa_kind == "fail":
             blocked_msg = f"QA Gate failed (사유: {qa_reason})"
-            _progress(
-                "failed",
-                step="QA Gate failed → publish blocked",
-                failed_reason=blocked_msg[:280],
-                log_message=blocked_msg,
+            _record_failure(
+                "qa_gate",
+                blocked_msg,
+                suggested_action=(
+                    "qa_feedback.md 확인 → 실패 카테고리의 파일 수정 후 다시 배포 시도"
+                ),
             )
-            _record_failure("qa_gate", blocked_msg)
             return False, f"publish failed at qa_gate: {blocked_msg}"
         else:
             # missing / skipped / stale → run on-demand QA Gate. Run
@@ -1314,13 +1488,11 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                     f"권장 조치: {detail['suggested_action']}",
                 ]
                 failed_msg = "\n".join(failure_lines)
-                _progress(
-                    "failed",
-                    step="QA Gate failed → publish blocked",
-                    failed_reason=failed_msg[:280],
-                    log_message=failed_msg,
+                _record_failure(
+                    "qa_gate",
+                    failed_msg[:1200],
+                    suggested_action=detail["suggested_action"],
                 )
-                _record_failure("qa_gate", failed_msg[:1200])
                 return False, f"publish failed at qa_gate: {failed_msg[:1200]}"
 
     # 5. Re-run the correctness gate before we touch git history.
@@ -1700,6 +1872,7 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
         "command_received",
         current_step="Runner가 deploy_to_server 명령 수신",
         reset=True,
+        command_id=cmd_id,
     )
 
     try:
