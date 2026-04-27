@@ -74,11 +74,49 @@ function Btn({ children, onClick, disabled, tone = "default" }) {
   );
 }
 
+// Korean copy keyed by diagnostic_code so the operator immediately
+// sees *why* QA blocked the deploy. Keep aligned with _QA_SUGGESTION
+// in control_tower/local_runner/runner.py.
+const QA_DIAG_LABEL = {
+  qa_passed_cached: "이전 사이클 QA 통과 (캐시 사용)",
+  qa_passed_after_run: "on-demand QA 통과",
+  qa_skipped_bypass: "QA 우회 (비상)",
+  qa_not_run: "QA 단계가 실행되지 않음",
+  qa_report_missing_before_run: "qa_report.md 없음 → on-demand QA 실행 중",
+  qa_report_missing_after_run: "QA 실행 후에도 qa_report.md 없음",
+  qa_report_path_mismatch: "qa_report.md 경로 불일치",
+  qa_command_failed: "검증 명령 실패",
+  qa_exception_before_report: "QA 실행 중 예외 발생",
+  stale_runner: "runner.py 가 부팅 이후 수정됨",
+  stale_command: "이전 deploy 명령이 중복 실행됨",
+  stale_metadata: "qa 상태와 파일 상태 불일치",
+  unknown: "원인 분류 실패",
+};
+
+const QA_DIAG_ERROR_CODES = new Set([
+  "qa_not_run",
+  "qa_report_missing_after_run",
+  "qa_report_path_mismatch",
+  "qa_command_failed",
+  "qa_exception_before_report",
+  "stale_runner",
+  "stale_command",
+  "stale_metadata",
+  "unknown",
+]);
+
 function QaGateRow({ factory }) {
   const qa = factory?.qa_gate;
   if (!qa) return null;
   const status = qa.status || "skipped";
-  if (status === "skipped" && !qa.report_exists && !qa.feedback_exists) {
+  const diagCode = qa.diagnostic_code || null;
+  const hasDiag = !!diagCode && QA_DIAG_ERROR_CODES.has(diagCode);
+  if (
+    status === "skipped" &&
+    !qa.report_exists &&
+    !qa.feedback_exists &&
+    !hasDiag
+  ) {
     return null;
   }
 
@@ -134,6 +172,72 @@ function QaGateRow({ factory }) {
       {qa.failed_reason && status === "failed" && (
         <div className="line-clamp-2 text-rose-200/90">
           원인 · {qa.failed_reason}
+        </div>
+      )}
+      {hasDiag && (
+        <div className="mt-1 grid gap-0.5 rounded border border-rose-500/40 bg-rose-950/40 px-2 py-1 text-[10.5px] text-rose-100">
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <span className="font-bold tracking-wider">진단 코드</span>
+            <code className="rounded bg-slate-900 px-1 text-amber-300">
+              {diagCode}
+            </code>
+            <span className="text-rose-200/80">
+              · {QA_DIAG_LABEL[diagCode] || diagCode}
+            </span>
+          </div>
+          {qa.qa_required_reason && (
+            <div className="text-rose-200/70">
+              실행 사유 · {qa.qa_required_reason}
+            </div>
+          )}
+          {qa.failed_command && (
+            <div>
+              실패 명령 ·{" "}
+              <code className="rounded bg-slate-900 px-1 text-amber-200">
+                {qa.failed_command}
+              </code>
+              {typeof qa.exit_code === "number" && (
+                <span className="ml-2 text-rose-200/80">
+                  exit_code · {qa.exit_code}
+                </span>
+              )}
+            </div>
+          )}
+          {(qa.report_exists_before !== undefined ||
+            qa.report_exists_after !== undefined) && (
+            <div className="text-rose-200/70">
+              report 존재 · before {String(qa.report_exists_before)} · after{" "}
+              {String(qa.report_exists_after)}
+            </div>
+          )}
+          {qa.cycle_report_path &&
+            qa.report_path &&
+            qa.cycle_report_path !== qa.report_path && (
+              <div className="text-amber-300">
+                ⚠ 경로 mismatch · runner={qa.report_path} · cycle=
+                {qa.cycle_report_path}
+              </div>
+            )}
+          {qa.stale_runner && (
+            <div className="text-amber-300">
+              ⚠ runner.py 가 부팅 이후 수정됨 — restart 권장
+            </div>
+          )}
+          {qa.stderr_tail && (
+            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 px-1.5 py-1 text-[10px] leading-snug text-rose-100">
+              {qa.stderr_tail}
+            </pre>
+          )}
+          {qa.exception_message && !qa.stderr_tail && (
+            <div className="text-rose-200">
+              예외 · {qa.exception_message}
+            </div>
+          )}
+          {qa.suggested_action && (
+            <div className="text-amber-200">
+              권장 조치 · {qa.suggested_action}
+            </div>
+          )}
         </div>
       )}
       {(qa.console_errors > 0 || qa.page_errors > 0) && (

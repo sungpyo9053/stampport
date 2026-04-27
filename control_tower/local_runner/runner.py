@@ -96,6 +96,16 @@ DEPLOY_STATE_FILE = RUNTIME_DIR / "factory_deploy.json"
 DEPLOY_LOCK_FILE = RUNTIME_DIR / "factory_deploy.lock"
 DEPLOY_LOCK_STALE_SEC = 30 * 60  # 30 minutes
 
+# QA gate diagnostic artifacts. qa_diagnostics.json is written every
+# time a deploy makes a QA decision (cached pass / on-demand run /
+# crash) so the dashboard can show *why* the gate behaved the way it
+# did even when qa_report.md is missing. command_diagnostics.json
+# stores the most recent dispatched-command's structured failure (so
+# the UI can render `last_command / status / failed_stage /
+# diagnostic_code / suggested_action`).
+QA_DIAGNOSTICS_FILE = RUNTIME_DIR / "qa_diagnostics.json"
+COMMAND_DIAGNOSTICS_FILE = RUNTIME_DIR / "factory_command_diagnostics.json"
+
 # Operator Fix Request artifacts. See _h_operator_fix_request handler
 # below for the lifecycle: dashboard textarea → command queue → runner
 # writes the request file → Claude CLI edits files → runner runs QA
@@ -199,6 +209,14 @@ RUNNER_PID = os.getpid()
 RUNNER_STARTED_AT = (
     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 )
+# code_mtime + git head captured *at boot*. We compare against the
+# current on-disk values to detect "the operator edited runner.py
+# after the process started" (stale_runner) — a frequent root cause
+# of "fix shipped but symptom unchanged" reports.
+try:
+    _RUNNER_CODE_MTIME_AT_START = os.path.getmtime(__file__)
+except OSError:
+    _RUNNER_CODE_MTIME_AT_START = 0.0
 
 # A handler may set this to schedule work that has to happen AFTER its
 # result has been reported to the server (because the work either kills
@@ -815,6 +833,187 @@ def _publish_allows_failed_qa() -> bool:
     return v in {"true", "1", "yes", "on"}
 
 
+# ---------------------------------------------------------------------------
+# QA gate diagnostics
+#
+# Every deploy click goes through the QA gate exactly once. The
+# *result* gets persisted to factory_state.json (qa_status, …) for the
+# next deploy click to look at, but the *decision trail* — "we ran
+# QA because the report was missing, the build_app step exited 1, the
+# stderr tail says X" — needs to land somewhere even when
+# qa_report.md never gets written. That's qa_diagnostics.json.
+#
+# diagnostic_code values map 1:1 to the user-facing failure classifier:
+#
+#   qa_passed_cached            previous cycle's qa_report.md is fresh
+#                               and covers the working tree.
+#   qa_passed_after_run         on-demand QA executed and passed.
+#   qa_skipped_bypass           LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA.
+#   qa_not_run                  publish path exited before reaching QA
+#                               (e.g. branch_check refused first).
+#   qa_report_missing_before_run  no qa_report.md on disk → on-demand
+#                                 was needed.
+#   qa_report_missing_after_run no qa_report.md after stage_qa_gate
+#                               returned (rare — usually means the
+#                               stage crashed mid-write).
+#   qa_report_path_mismatch     stage_qa_gate wrote the report under a
+#                               different RUNTIME path than the runner
+#                               is reading. Usually a REPO_ROOT env
+#                               mismatch.
+#   qa_command_failed           one of the targeted commands
+#                               (npm build / py_compile / …) exited
+#                               non-zero. Carries failed_command +
+#                               exit_code + stderr_tail.
+#   qa_exception_before_report  the QA function itself raised. Carries
+#                               exception_message + traceback tail.
+#   stale_runner                the runner.py on disk has been edited
+#                               since the running process started.
+#   stale_command               a duplicate deploy command landed and
+#                               was answered from cache / lock-rejected.
+#   stale_metadata              cycle_state says qa passed but
+#                               qa_report.md is missing or older than
+#                               the working tree.
+#   unknown                     fallback — the raw detail blob is still
+#                               attached so an operator can debug.
+# ---------------------------------------------------------------------------
+
+
+_QA_SUGGESTION = {
+    "qa_passed_cached":
+        "이전 사이클의 QA 결과 사용 — 별도 조치 필요 없음",
+    "qa_passed_after_run":
+        "on-demand QA 통과 — 별도 조치 필요 없음",
+    "qa_skipped_bypass":
+        "LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA 가 켜져 있음 — 비상시에만 사용",
+    "qa_not_run":
+        "QA 단계가 실행되지 않음 — 이전 단계(branch_check / publish_blocker / secret_scan) 실패 메시지 확인",
+    "qa_report_missing_before_run":
+        "on-demand QA 실행 중 — 결과를 기다리세요",
+    "qa_report_missing_after_run":
+        "QA 실행 후에도 .runtime/qa_report.md 가 생성되지 않음 — runner 와 cycle 의 RUNTIME 경로가 다른지 확인 (LOCAL_RUNNER_REPO env)",
+    "qa_report_path_mismatch":
+        "stage_qa_gate 가 다른 경로에 report 를 기록했어요 — LOCAL_RUNNER_REPO / REPO_ROOT 환경변수를 일치시키세요",
+    "qa_command_failed":
+        "검증 명령이 실패했어요 — 위 stderr tail 의 오류를 수정한 뒤 다시 배포",
+    "qa_exception_before_report":
+        "QA 실행 중 예외 발생 — exception_message 확인 후 cycle.py / runner.py 수정",
+    "stale_runner":
+        "runner.py 가 부팅 이후 수정됐어요 — `restart runner` 또는 `update runner` 후 다시 배포",
+    "stale_command":
+        "이전 deploy 명령이 처리 중 / 캐시됨 — 30초 후 다시 시도하거나 runner 재시작",
+    "stale_metadata":
+        "factory_state.json 의 qa 상태와 실제 파일 상태가 불일치 — on-demand QA 가 자동으로 재실행합니다",
+    "unknown":
+        "원인 분류 실패 — qa_diagnostics.json 의 raw_detail 확인",
+}
+
+
+def _qa_diagnostic_suggested(code: str) -> str:
+    return _QA_SUGGESTION.get(code, _QA_SUGGESTION["unknown"])
+
+
+def _tail_text(text: str | None, lines: int = 12, max_chars: int = 1600) -> str:
+    """Last `lines` lines, capped at `max_chars` characters total. Used
+    so stdout_tail/stderr_tail in heartbeat metadata stay small."""
+    if not text:
+        return ""
+    s = "\n".join(text.splitlines()[-lines:]).strip()
+    if len(s) > max_chars:
+        s = s[-max_chars:]
+    return s
+
+
+def _save_qa_diagnostics(payload: dict) -> None:
+    """Crash-safe writer for qa_diagnostics.json. Even if the QA path
+    later raises, this file is the only durable evidence of WHY the
+    deploy was about to be blocked."""
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        QA_DIAGNOSTICS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write qa_diagnostics: {e}\n")
+
+
+def _read_qa_diagnostics() -> dict:
+    if not QA_DIAGNOSTICS_FILE.is_file():
+        return {}
+    try:
+        return json.loads(QA_DIAGNOSTICS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_command_diagnostics(payload: dict) -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        COMMAND_DIAGNOSTICS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write command_diagnostics: {e}\n")
+
+
+def _read_command_diagnostics() -> dict:
+    if not COMMAND_DIAGNOSTICS_FILE.is_file():
+        return {}
+    try:
+        return json.loads(COMMAND_DIAGNOSTICS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _log_event(line: str) -> None:
+    """Append a line to .runtime/local_factory.log so _log_tail (and
+    the dashboard System Log panel that consumes it) picks it up
+    regardless of whether the cycle is mid-flight. Best-effort: log
+    failures never block the QA flow."""
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{_utc_now_z()}] {line}\n")
+    except OSError as e:
+        sys.stderr.write(f"[runner] log_event failed: {e}\n")
+
+
+def _expected_qa_report_paths() -> tuple[Path, Path | None]:
+    """Return (runner_path, cycle_path). Cycle path is None when the
+    import fails. Used to detect qa_report_path_mismatch — if the
+    cycle module computed RUNTIME from a different REPO_ROOT than the
+    runner did, stage_qa_gate writes to a different file than the
+    runner reads from."""
+    runner_path = RUNTIME_DIR / "qa_report.md"
+    try:
+        from . import cycle as _cycle
+        cycle_path = Path(getattr(_cycle, "QA_REPORT_FILE", runner_path))
+        return runner_path, cycle_path
+    except ImportError:
+        return runner_path, None
+
+
+def _runner_is_stale_now() -> tuple[bool, dict]:
+    """Did the on-disk runner.py change since this process started?
+    That's the strongest "you're running an older runner than the
+    repo" signal we have without re-execing the interpreter."""
+    detail: dict = {
+        "code_mtime_at_start": _RUNNER_CODE_MTIME_AT_START,
+        "code_mtime_now": None,
+    }
+    try:
+        now = os.path.getmtime(__file__)
+    except OSError:
+        return False, detail
+    detail["code_mtime_now"] = now
+    if not _RUNNER_CODE_MTIME_AT_START:
+        return False, detail
+    # 1 second slack so a freshly-started runner whose own startup
+    # touched the .pyc doesn't trip the alarm.
+    return now > _RUNNER_CODE_MTIME_AT_START + 1.0, detail
+
+
 def _qa_gate_status_from_state(cycle_state: dict) -> tuple[str, str]:
     """Inspect the persisted cycle state + qa_report.md and classify
     the QA Gate without running it.
@@ -1002,6 +1201,74 @@ def _stderr_tail(output: str, lines: int = 12) -> str:
     return tail.strip()
 
 
+def _run_qa_step(step: dict, timeout: float = 300.0) -> dict:
+    """Run a single QA step (npm build / py_compile / …) directly via
+    subprocess so we can preserve `returncode`, stdout, and stderr in
+    isolation. cycle._run merges them into a single string with a
+    `--stderr--` divider, which is fine for the cycle log but loses
+    the structure the diagnostic classifier needs.
+
+    Returns a dict the caller can attach to step_results without
+    further shaping.
+    """
+    argv = step["argv"]
+    cwd = step.get("cwd")
+    env_override = step.get("env")
+    env = os.environ.copy()
+    if env_override:
+        env.update(env_override)
+    base = {
+        "key": step["key"],
+        "label": step["label"],
+        "category": step["category"],
+        "command": " ".join(shlex.quote(a) for a in argv),
+        "cwd": str(cwd) if cwd else None,
+        "ok": False,
+        "exit_code": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "timed_out": False,
+        "tool_missing": False,
+        "exception_message": None,
+    }
+    try:
+        r = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        base["ok"] = r.returncode == 0
+        base["exit_code"] = r.returncode
+        base["stdout_tail"] = _tail_text(r.stdout, 12)
+        base["stderr_tail"] = _tail_text(r.stderr, 12)
+        return base
+    except subprocess.TimeoutExpired as e:
+        # TimeoutExpired carries partial stdout/stderr as bytes when
+        # capture_output=True. Decode best-effort.
+        def _maybe_decode(x: object) -> str:
+            if isinstance(x, bytes):
+                return x.decode("utf-8", errors="replace")
+            return x or ""
+        base["ok"] = False
+        base["timed_out"] = True
+        base["exception_message"] = f"timeout after {timeout}s"
+        base["stdout_tail"] = _tail_text(_maybe_decode(e.stdout), 12)
+        base["stderr_tail"] = _tail_text(_maybe_decode(e.stderr), 12)
+        return base
+    except FileNotFoundError as e:
+        base["ok"] = False
+        base["tool_missing"] = True
+        base["exception_message"] = f"missing tool: {e}"
+        return base
+    except Exception as e:  # noqa: BLE001
+        base["ok"] = False
+        base["exception_message"] = f"subprocess error: {e}"[:300]
+        return base
+
+
 def _run_targeted_qa_gate(
     changed_files: list[str],
 ) -> tuple[bool, str, dict, list[dict]]:
@@ -1040,24 +1307,9 @@ def _run_targeted_qa_gate(
     step_results: list[dict] = []
 
     for step in plan:
-        ok, out = _cycle._run(
-            step["argv"],
-            cwd=step.get("cwd"),
-            timeout=300.0,
-            env_override=step.get("env"),
-        )
-        cmd_str = " ".join(shlex.quote(a) for a in step["argv"])
-        record = {
-            "key": step["key"],
-            "label": step["label"],
-            "category": step["category"],
-            "command": cmd_str,
-            "cwd": str(step["cwd"]) if step.get("cwd") else None,
-            "ok": bool(ok),
-            "stderr_tail": _stderr_tail(out) if not ok else "",
-        }
+        record = _run_qa_step(step, timeout=300.0)
         step_results.append(record)
-        if not ok:
+        if not record["ok"]:
             cat_set: list[str] = []
             for r in step_results:
                 if not r["ok"] and r["category"] not in cat_set:
@@ -1325,6 +1577,25 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                 suggested_action=suggested_action,
                 log_message=f"publish blocked at {stage}: {message[:200]}",
             )
+        # Mirror the failure into command_diagnostics so the dashboard
+        # always has a structured reason — including `qa_not_run` for
+        # the cases where publish gave up before the QA gate (e.g.
+        # branch_check, secret_scan, publish_blocker). The QA-stage
+        # path overwrites this with its own richer diagnostic_code.
+        if stage != "qa_gate":
+            _save_command_diagnostics({
+                "last_command": "deploy_to_server",
+                "status": "failed",
+                "failed_stage": stage,
+                "diagnostic_code": "qa_not_run",
+                "failed_reason": message[:600],
+                "suggested_action": (
+                    suggested_action
+                    or _qa_diagnostic_suggested("qa_not_run")
+                ),
+                "occurred_at": _utc_now_z(),
+            })
+            _log_event(f"deploy blocked by {stage}: {message[:200]}")
 
     _progress("validating", step="브랜치 / Release Safety Gate 확인 중")
 
@@ -1385,15 +1656,137 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
         _record_failure("secret_scan", msg)
         return False, f"publish failed at secret_scan: {msg}"
 
-    # 4b. QA Gate. Try the persisted report first; when it's missing,
-    # skipped, or stale we run the QA Gate on-demand instead of
-    # refusing publish outright. That lets a user who pushed manually
-    # (or whose operator_request didn't reach stage_qa_gate) re-trigger
-    # the deploy button without first kicking a full factory cycle.
-    # Override path: LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true
-    # (emergency only) — never overrides risky/secret refusals above.
+    # 4b. QA Gate.
+    #
+    # Goals:
+    #   * Never refuse purely on "qa_report.md is missing" — first run
+    #     the gate on-demand and decide from THAT result.
+    #   * Persist enough evidence (qa_diagnostics.json + heartbeat
+    #     metadata + System Log) that the operator never has to ask
+    #     "did QA actually run? where did the output go?"
+    #   * Crash-safe: even if the QA function raises an exception, we
+    #     still write a diagnostic so the UI shows *why*.
+    #
+    # On every path we end up calling either _qa_finalize_pass or
+    # _qa_finalize_fail (defined below) which write the qa_diagnostics
+    # blob, persist failure context, and emit a System Log line.
     revalidate_already_ran = False
     qa_msg = ""
+
+    runner_report_path, cycle_report_path = _expected_qa_report_paths()
+    qa_required_reason = "no decision yet"
+
+    def _read_qa_state_now() -> dict:
+        """Re-read factory_state.json so the diagnostic blob always
+        reflects what stage_qa_gate just wrote (vs the snapshot we
+        took at publish entry)."""
+        return _read_factory_state() or {}
+
+    def _build_diag_base(stage_label: str) -> dict:
+        existed = runner_report_path.is_file()
+        return {
+            "stage_label": stage_label,
+            "decided_at": _utc_now_z(),
+            "report_path": str(runner_report_path),
+            "cycle_report_path": (
+                str(cycle_report_path) if cycle_report_path else None
+            ),
+            "report_exists_before": existed,
+            "report_exists_after": existed,
+            "changed_files": list(allowed),
+            "qa_required_reason": qa_required_reason,
+            "qa_kind": None,
+            "qa_status": None,
+            "publish_allowed": False,
+            "diagnostic_code": "unknown",
+            "failed_command": None,
+            "exit_code": None,
+            "stdout_tail": None,
+            "stderr_tail": None,
+            "exception_message": None,
+            "step_results": [],
+            "stale_runner": _runner_is_stale_now()[0],
+        }
+
+    def _classify_after_run(
+        diag: dict,
+        ok: bool,
+        ondemand_msg: str,
+        step_results: list[dict],
+    ) -> str:
+        """After an on-demand run, decide the diagnostic_code from the
+        evidence collected. Order matters — we report the most
+        specific cause first."""
+        # Path mismatch: stage_qa_gate (cycle) wrote to a different
+        # path than the runner reads from. We detect it by checking
+        # the cycle path exists *but* the runner path doesn't.
+        if cycle_report_path and (
+            str(cycle_report_path) != str(runner_report_path)
+            and cycle_report_path.is_file()
+            and not runner_report_path.is_file()
+        ):
+            return "qa_report_path_mismatch"
+        # Targeted step failed (build/py_compile non-zero exit).
+        failed_step = next((r for r in step_results if not r["ok"]), None)
+        if failed_step is not None:
+            return "qa_command_failed"
+        # No targeted failure but stage_qa_gate decided fail (screen/
+        # flow/domain). qa_report.md should still have been written.
+        if not ok and runner_report_path.is_file():
+            return "qa_command_failed"
+        # We declared not-ok but no report shows for it on disk.
+        if not runner_report_path.is_file():
+            return "qa_report_missing_after_run"
+        return "unknown"
+
+    def _qa_finalize_fail(
+        diag: dict,
+        diagnostic_code: str,
+        failed_msg: str,
+    ) -> tuple[bool, str]:
+        """Save the diagnostic blob, persist failure context, and emit
+        the deploy_progress + System Log entries. Returns the publish
+        return value the caller should bubble out."""
+        diag["report_exists_after"] = runner_report_path.is_file()
+        diag["diagnostic_code"] = diagnostic_code
+        diag["suggested_action"] = _qa_diagnostic_suggested(diagnostic_code)
+        _save_qa_diagnostics(diag)
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "failed",
+            "failed_stage": "qa_gate",
+            "diagnostic_code": diagnostic_code,
+            "failed_reason": failed_msg[:600],
+            "suggested_action": diag["suggested_action"],
+            "occurred_at": _utc_now_z(),
+        })
+        _log_event(
+            f"QA Gate failed → deploy blocked "
+            f"({diagnostic_code}): {failed_msg.splitlines()[0][:200]}"
+        )
+        _record_failure("qa_gate", failed_msg[:1200], suggested_action=diag["suggested_action"])
+        return False, f"publish failed at qa_gate: {failed_msg[:1200]}"
+
+    def _qa_finalize_pass(diag: dict, message: str) -> None:
+        diag["report_exists_after"] = runner_report_path.is_file()
+        if not diag.get("diagnostic_code") or diag["diagnostic_code"] == "unknown":
+            diag["diagnostic_code"] = (
+                "qa_passed_after_run" if diag.get("qa_kind") in (None, "missing", "skipped", "stale")
+                else "qa_passed_cached"
+            )
+        diag["suggested_action"] = _qa_diagnostic_suggested(diag["diagnostic_code"])
+        _save_qa_diagnostics(diag)
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "running",
+            "failed_stage": None,
+            "diagnostic_code": diag["diagnostic_code"],
+            "failed_reason": None,
+            "suggested_action": diag["suggested_action"],
+            "occurred_at": _utc_now_z(),
+        })
+        _log_event(f"QA Gate passed ({diag['diagnostic_code']}): {message[:200]}")
+
     if _publish_allows_failed_qa():
         qa_msg = "QA Gate 우회 (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true)"
         _progress(
@@ -1401,48 +1794,142 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
             step="QA Gate 우회 (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA)",
             log_message=qa_msg,
         )
+        diag = _build_diag_base("QA Gate bypassed")
+        diag["qa_kind"] = "bypass"
+        diag["diagnostic_code"] = "qa_skipped_bypass"
+        diag["suggested_action"] = _qa_diagnostic_suggested("qa_skipped_bypass")
+        diag["publish_allowed"] = True
+        _save_qa_diagnostics(diag)
+        _log_event("QA Gate bypassed (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA)")
     else:
         qa_kind, qa_reason = _qa_gate_status_from_state(state_at_start)
+        qa_required_reason = f"{qa_kind}: {qa_reason}"
+        diag = _build_diag_base("QA Gate decision")
+        diag["qa_kind"] = qa_kind
+        diag["qa_required_reason"] = qa_required_reason
+
         if qa_kind == "pass":
             qa_msg = qa_reason
+            diag["qa_status"] = "passed"
+            diag["publish_allowed"] = True
             _progress(
                 "validating",
                 step="QA Gate 검증 중 (이전 사이클 통과)",
                 log_message=f"QA Gate passed (이전 사이클): {qa_reason}",
             )
+            _qa_finalize_pass(diag, qa_msg)
         elif qa_kind == "fail":
             blocked_msg = f"QA Gate failed (사유: {qa_reason})"
-            _record_failure(
-                "qa_gate",
-                blocked_msg,
-                suggested_action=(
-                    "qa_feedback.md 확인 → 실패 카테고리의 파일 수정 후 다시 배포 시도"
-                ),
-            )
-            return False, f"publish failed at qa_gate: {blocked_msg}"
+            diag["qa_status"] = "failed"
+            diag["publish_allowed"] = False
+            # The cycle ran QA before us and persisted the failure.
+            # Surface it as qa_command_failed (real failed step) when
+            # we have feedback evidence on disk; otherwise stale_metadata.
+            existing_state = state_at_start or {}
+            if existing_state.get("qa_failed_categories"):
+                diag["diagnostic_code"] = "qa_command_failed"
+            elif runner_report_path.is_file():
+                diag["diagnostic_code"] = "qa_command_failed"
+            else:
+                diag["diagnostic_code"] = "stale_metadata"
+            return _qa_finalize_fail(diag, diag["diagnostic_code"], blocked_msg)
         else:
-            # missing / skipped / stale → run on-demand QA Gate. Run
-            # only the validations relevant to what actually changed
-            # (npm build for the touched web tree, py_compile for the
-            # touched python area) so a docs-only deploy doesn't pay
-            # for a 60-second full revalidate.
+            # missing / skipped / stale → run on-demand QA Gate.
+            #
+            # We map the qa_kind into the diagnostic vocabulary:
+            #   missing  → qa_report_missing_before_run
+            #   skipped  → qa_not_run (factory_state says qa never ran)
+            #   stale    → stale_metadata (report is older than tree)
+            pre_code = {
+                "missing": "qa_report_missing_before_run",
+                "skipped": "qa_not_run",
+                "stale": "stale_metadata",
+            }.get(qa_kind, "qa_report_missing_before_run")
+            diag["diagnostic_code"] = pre_code
+            diag["suggested_action"] = _qa_diagnostic_suggested(pre_code)
+            # Snapshot the "before" state immediately so an exception
+            # mid-run still leaves us with this evidence.
+            _save_qa_diagnostics(diag)
+            _log_event(
+                f"QA Gate missing before deploy "
+                f"({pre_code}): {qa_reason}"
+            )
             _progress(
                 "validating",
                 step="QA Gate 미실행 — 즉시 검증 중",
                 log_message=(
                     f"QA Gate missing — 즉시 검증 시작 "
-                    f"({qa_kind}: {qa_reason})."
+                    f"({pre_code}: {qa_reason})."
                 ),
             )
             plan = _qa_targeted_command_plan(allowed)
             plan_summary = ", ".join(s["label"] for s in plan) or "screen/flow/domain only"
+            _log_event(f"QA Gate on-demand started: {plan_summary}")
             _progress(
                 "validating",
                 step="QA Gate started — 검증 명령 실행 중",
                 log_message=f"QA Gate started: {plan_summary}",
             )
-            ok, ondemand_msg, qa_dict, step_results = _run_targeted_qa_gate(allowed)
+
+            try:
+                ok, ondemand_msg, qa_dict, step_results = _run_targeted_qa_gate(allowed)
+            except Exception as e:  # noqa: BLE001
+                # The QA path itself raised — write a fallback report
+                # + diagnostic so the UI doesn't claim "QA never ran".
+                import traceback as _tb
+                tb = _tb.format_exc()
+                diag["diagnostic_code"] = "qa_exception_before_report"
+                diag["exception_message"] = str(e)[:400]
+                diag["stderr_tail"] = _tail_text(tb, 12)
+                diag["report_exists_after"] = runner_report_path.is_file()
+                if not runner_report_path.is_file():
+                    # Best-effort: leave a minimal report so the
+                    # dashboard's report_exists flag flips on and the
+                    # operator has *something* to read.
+                    try:
+                        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                        runner_report_path.write_text(
+                            "# QA Gate — exception before report\n\n"
+                            f"- 발생 시각: {_utc_now_z()}\n"
+                            f"- 예외: {e}\n\n"
+                            "## traceback (tail)\n\n"
+                            f"```\n{_tail_text(tb, 20)}\n```\n",
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
+                failure_lines = [
+                    "QA Gate raised an exception before writing a report.",
+                    f"diagnostic_code: qa_exception_before_report",
+                    f"exception: {e}",
+                    "traceback tail:",
+                    _tail_text(tb, 12) or "(no traceback captured)",
+                    f"권장 조치: {_qa_diagnostic_suggested('qa_exception_before_report')}",
+                ]
+                return _qa_finalize_fail(
+                    diag,
+                    "qa_exception_before_report",
+                    "\n".join(failure_lines),
+                )
+
             revalidate_already_ran = True
+            diag["step_results"] = [
+                {
+                    "key": r["key"], "label": r["label"], "ok": r["ok"],
+                    "exit_code": r.get("exit_code"),
+                    "command": r.get("command"),
+                    "cwd": r.get("cwd"),
+                    "stderr_tail": r.get("stderr_tail", "")[:600],
+                    "stdout_tail": (r.get("stdout_tail") or "")[:300],
+                    "timed_out": bool(r.get("timed_out")),
+                    "tool_missing": bool(r.get("tool_missing")),
+                    "exception_message": r.get("exception_message"),
+                }
+                for r in step_results
+            ]
+            diag["qa_status"] = qa_dict.get("qa_status")
+            diag["publish_allowed"] = bool(qa_dict.get("qa_publish_allowed"))
+
             if ok:
                 qa_msg = ondemand_msg
                 _progress(
@@ -1453,15 +1940,22 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                         f"{ondemand_msg or 'all targeted checks ok'}"
                     ),
                 )
+                diag["diagnostic_code"] = "qa_passed_after_run"
+                _qa_finalize_pass(diag, qa_msg)
             else:
-                # Build failure detail from BOTH the structured QA
-                # categories AND the targeted step that actually
-                # tripped — operators want to see the exact command
-                # and the stderr tail, not just a category name.
+                diagnostic_code = _classify_after_run(
+                    diag, ok, ondemand_msg, step_results,
+                )
                 failed_step = next(
                     (r for r in step_results if not r["ok"]),
                     None,
                 )
+                if failed_step is not None:
+                    diag["failed_command"] = failed_step.get("command")
+                    diag["exit_code"] = failed_step.get("exit_code")
+                    diag["stdout_tail"] = failed_step.get("stdout_tail")
+                    diag["stderr_tail"] = failed_step.get("stderr_tail")
+                    diag["exception_message"] = failed_step.get("exception_message")
                 detail = _format_qa_failure_detail(qa_dict, ondemand_msg)
                 cats_text = ", ".join(detail["categories"]) or "unknown"
                 cmd_text = (
@@ -1472,28 +1966,27 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                     else str(REPO_ROOT)
                 )
                 stderr_text = (
-                    failed_step["stderr_tail"] if failed_step
+                    failed_step.get("stderr_tail") if failed_step
                     else (detail["reason"] or "")
                 )
                 file_text = detail["file"] or "(파일 미식별)"
                 failure_lines = [
                     "QA Gate failed → publish blocked",
+                    f"diagnostic_code: {diagnostic_code}",
                     f"실패 단계: qa_gate ({failed_step['key'] if failed_step else 'stage_qa_gate'})",
                     f"실패 명령: {cmd_text}",
                     f"실행 위치: {cwd_text}",
                     f"실패 카테고리: {cats_text}",
                     f"실패 파일: {file_text}",
+                    f"exit_code: {failed_step.get('exit_code') if failed_step else 'n/a'}",
                     "stderr tail:",
                     (stderr_text or "(no stderr captured)"),
-                    f"권장 조치: {detail['suggested_action']}",
+                    f"report_exists_before={diag['report_exists_before']}, "
+                    f"report_exists_after={runner_report_path.is_file()}",
+                    f"권장 조치: {_qa_diagnostic_suggested(diagnostic_code)}",
                 ]
                 failed_msg = "\n".join(failure_lines)
-                _record_failure(
-                    "qa_gate",
-                    failed_msg[:1200],
-                    suggested_action=detail["suggested_action"],
-                )
-                return False, f"publish failed at qa_gate: {failed_msg[:1200]}"
+                return _qa_finalize_fail(diag, diagnostic_code, failed_msg)
 
     # 5. Re-run the correctness gate before we touch git history.
     # Skipped when an on-demand QA Gate already executed the same
@@ -1845,17 +2338,68 @@ def _h_deploy_to_server(payload: dict) -> tuple[bool, str]:
 
     # 1. Idempotency — same command_id seen twice returns the cached
     # outcome without re-running. Protects against the server retrying
-    # a delivery the runner already handled.
+    # a delivery the runner already handled. We surface the dedupe as
+    # `stale_command` in command_diagnostics so the UI can explain
+    # *why* a click looked like a no-op.
     last = _read_deploy_state()
     if cmd_id and last.get("last_command_id") == cmd_id and last.get("last_finished_at"):
         ok_prev = bool(last.get("last_status_ok"))
         prev_msg = last.get("last_message") or "(no detail)"
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "stale",
+            "failed_stage": None,
+            "diagnostic_code": "stale_command",
+            "failed_reason": (
+                f"같은 command_id #{cmd_id} 가 이미 처리됨 — 캐시된 결과 반환"
+            ),
+            "suggested_action": _qa_diagnostic_suggested("stale_command"),
+            "occurred_at": _utc_now_z(),
+        })
+        _log_event(
+            f"stale deploy command rejected: cmd #{cmd_id} 이미 처리됨 — "
+            f"prev_ok={ok_prev}"
+        )
         return ok_prev, f"이미 처리된 deploy command #{cmd_id} — {prev_msg}"
 
     # 2. Single-flight lock — dedup mass clicks even across processes.
     ok_lock, lock_msg = _deploy_lock_acquire(cmd_id)
     if not ok_lock:
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "stale",
+            "failed_stage": None,
+            "diagnostic_code": "stale_command",
+            "failed_reason": lock_msg,
+            "suggested_action": _qa_diagnostic_suggested("stale_command"),
+            "occurred_at": _utc_now_z(),
+        })
+        _log_event(f"stale deploy command rejected: {lock_msg}")
         return False, lock_msg
+
+    # 2b. stale_runner — the runner.py on disk has been edited since
+    # this process started. The deploy will probably miss whatever the
+    # operator just patched. We *don't* abort — the deploy may still
+    # succeed — but we surface the warning so the operator can decide.
+    is_stale, stale_detail = _runner_is_stale_now()
+    if is_stale:
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "warn",
+            "failed_stage": None,
+            "diagnostic_code": "stale_runner",
+            "failed_reason": (
+                "runner.py 가 부팅 이후 수정됐어요. "
+                "이 프로세스는 옛 코드를 실행 중일 수 있습니다."
+            ),
+            "suggested_action": _qa_diagnostic_suggested("stale_runner"),
+            "occurred_at": _utc_now_z(),
+            "stale_detail": stale_detail,
+        })
+        _log_event(
+            "stale_runner detected at deploy_to_server entry — "
+            "code_mtime_now > code_mtime_at_start"
+        )
 
     started = _utc_now_z()
     _save_deploy_state({
@@ -3061,6 +3605,7 @@ def _build_local_factory_meta() -> dict:
         "publish": _build_publish_meta(state),
         "publish_blocker": _build_publish_blocker_meta(state),
         "qa_gate": _build_qa_meta(state),
+        "command_diagnostics": _build_command_diagnostics_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See
@@ -3356,6 +3901,13 @@ def _build_qa_meta(state: dict) -> dict:
             qa_feedback_path = str(candidate)
     qa_feedback_exists = bool(qa_feedback_path) and Path(qa_feedback_path).is_file()
 
+    # Pull the latest deploy-time diagnostic blob so the UI can render
+    # *why* the gate behaved the way it did (path mismatch / on-demand
+    # crashed / specific build command failed) — not just status.
+    diag = _read_qa_diagnostics()
+    diagnostic_code = diag.get("diagnostic_code") or "unknown"
+    suggested_action = diag.get("suggested_action") or _qa_diagnostic_suggested(diagnostic_code)
+
     return {
         "status": state.get("qa_status") or "skipped",
         "publish_allowed": bool(state.get("qa_publish_allowed")),
@@ -3374,7 +3926,42 @@ def _build_qa_meta(state: dict) -> dict:
         "fix_max_attempts": int(state.get("qa_fix_max_attempts") or 2),
         "fix_propose_status": state.get("qa_fix_propose_status") or "skipped",
         "fix_apply_status": state.get("qa_fix_apply_status") or "skipped",
+        # New: deploy-time diagnostics so the UI can show diagnostic_code
+        # / failed_command / stderr_tail / suggested_action without
+        # cross-referencing two files.
+        "diagnostic_code": diagnostic_code,
+        "suggested_action": suggested_action,
+        "report_exists_before": diag.get("report_exists_before"),
+        "report_exists_after": diag.get("report_exists_after"),
+        "qa_required_reason": diag.get("qa_required_reason"),
+        "failed_command": diag.get("failed_command"),
+        "exit_code": diag.get("exit_code"),
+        "stdout_tail": diag.get("stdout_tail"),
+        "stderr_tail": diag.get("stderr_tail"),
+        "exception_message": diag.get("exception_message"),
+        "step_results": diag.get("step_results") or [],
+        "decided_at": diag.get("decided_at"),
+        "cycle_report_path": diag.get("cycle_report_path"),
+        "stale_runner": bool(diag.get("stale_runner")),
+        "changed_files": diag.get("changed_files") or [],
     }
+
+
+def _build_command_diagnostics_meta() -> dict:
+    """Surface the most recent dispatched-command's structured failure.
+    Always present so the dashboard can decide enabled=true/false."""
+    cur = _read_command_diagnostics()
+    if not cur:
+        return {
+            "last_command": None,
+            "status": "idle",
+            "failed_stage": None,
+            "diagnostic_code": None,
+            "failed_reason": None,
+            "suggested_action": None,
+            "occurred_at": None,
+        }
+    return cur
 
 
 def _build_publish_meta(cycle_state: dict) -> dict:
@@ -3479,10 +4066,14 @@ def _build_runner_meta() -> dict:
     branch = _git_current_branch()
     dirty = _git_changed_files()
     ok, head = _git("rev-parse", "HEAD", timeout=10)
+    is_stale, stale_detail = _runner_is_stale_now()
     return {
         "pid": RUNNER_PID,
         "started_at": RUNNER_STARTED_AT,
         "code_mtime_at": _runner_code_mtime_iso(),
+        "code_mtime_at_start_epoch": _RUNNER_CODE_MTIME_AT_START or None,
+        "code_mtime_now_epoch": stale_detail.get("code_mtime_now"),
+        "is_stale": is_stale,
         "git_branch": branch,
         "git_commit": head.strip()[:12] if ok else None,
         "git_commit_full": head.strip() if ok else None,

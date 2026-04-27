@@ -232,6 +232,7 @@ function computeDeployState({ runner, busy, guardActive, queuedLocally }) {
     publish,
     blocker,
     qa,
+    diagnostics: lf.command_diagnostics || null,
     progress,
     progressStatus,
     isActive,
@@ -355,7 +356,7 @@ function PreviousAttemptsBlock({ attempts = [] }) {
 }
 
 function DeployProgressPanel({ deployState, queuedLocally }) {
-  const { progress, actionsInFlight, isActive, recentFailure } = deployState;
+  const { progress, actionsInFlight, isActive, recentFailure, qa, diagnostics } = deployState;
   const { effective, failedAtIdx } = computeDeployDisplay({
     progress,
     queuedLocally,
@@ -427,10 +428,28 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
   }
 
   const history = (progress?.history || []).slice(-8).reverse();
-  const failedReason = progress?.failed_reason;
-  const failedStage = progress?.failed_stage;
+  // Prefer the structured command_diagnostics blob written by the
+  // runner (richer than progress.failed_reason — has diagnostic_code,
+  // suggested_action, and the QA stderr_tail when applicable).
+  // Fall back to the qa_gate metadata when command_diagnostics is
+  // empty (older runner heartbeat). Final fallback is the legacy
+  // progress.failed_reason string.
+  const cmdDiag = diagnostics || {};
+  const diagnosticCode =
+    cmdDiag.diagnostic_code || qa?.diagnostic_code || null;
+  const failedReason =
+    cmdDiag.failed_reason ||
+    progress?.failed_reason ||
+    qa?.failed_reason ||
+    null;
+  const failedStage =
+    cmdDiag.failed_stage || progress?.failed_stage || null;
   const failedAt = progress?.failed_at;
-  const suggestedAction = progress?.suggested_action;
+  const suggestedAction =
+    cmdDiag.suggested_action ||
+    progress?.suggested_action ||
+    qa?.suggested_action ||
+    null;
   const startedAt = progress?.started_at;
   const updatedAt = progress?.updated_at;
   const completedAt = progress?.completed_at;
@@ -567,7 +586,7 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
           )}
       </div>
 
-      {effective === "failed" && (failedReason || failedStage || suggestedAction) && (
+      {effective === "failed" && (failedReason || failedStage || suggestedAction || diagnosticCode) && (
         <div
           className="grid gap-1 rounded px-2 py-1.5 text-[10.5px] tracking-wider"
           style={{
@@ -586,6 +605,17 @@ function DeployProgressPanel({ deployState, queuedLocally }) {
             {failedStage && (
               <span className="text-[10px] text-rose-300">
                 실패 단계 · {failedStage}
+              </span>
+            )}
+            {diagnosticCode && (
+              <span className="text-[10px] text-amber-200">
+                진단 ·{" "}
+                <code
+                  className="rounded px-1 text-amber-300"
+                  style={{ backgroundColor: "#0a1228" }}
+                >
+                  {diagnosticCode}
+                </code>
               </span>
             )}
           </div>
