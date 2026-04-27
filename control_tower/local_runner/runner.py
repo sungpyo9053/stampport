@@ -665,48 +665,45 @@ def _publish_allows_failed_qa() -> bool:
     return v in {"true", "1", "yes", "on"}
 
 
-def _qa_gate_allows_publish(cycle_state: dict) -> tuple[bool, str]:
-    """Decide whether the most recent factory cycle's QA gate signed
-    off on a publish.
+def _qa_gate_status_from_state(cycle_state: dict) -> tuple[str, str]:
+    """Inspect the persisted cycle state + qa_report.md and classify
+    the QA Gate without running it.
 
-    Acceptance criteria:
-      - .runtime/qa_report.md exists.
-      - cycle_state.qa_status == "passed"
-      - cycle_state.qa_publish_allowed == True
-      - The qa_report file's mtime is newer than the most recent code
-        change in the working tree (so a stale 'pass' from before the
-        latest edit doesn't carry forward).
+    Returns (kind, reason). `kind` is one of:
+      - "pass"    — qa_report.md exists, status=passed, publish_allowed,
+                    and the report is newer than the working tree.
+      - "fail"    — qa_status is failed (or publish_allowed is false).
+      - "missing" — qa_report.md does not exist on disk.
+      - "skipped" — qa_report.md exists but qa_status is "skipped"/empty,
+                    e.g. the cycle exited before stage_qa_gate ran.
+      - "stale"   — qa_report.md exists and last marked passed, but a
+                    file in the working tree changed after the report
+                    was written so the pass no longer covers the diff.
+
+    `_h_publish_changes` treats "missing" / "skipped" / "stale" as
+    "run the QA Gate on-demand and decide from THAT result", instead
+    of refusing publish outright.
     """
-    if _publish_allows_failed_qa():
-        return True, "QA Gate 우회 (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true)"
-
     qa_report = RUNTIME_DIR / "qa_report.md"
-    if not qa_report.is_file():
-        return (
-            False,
-            "QA Gate가 통과되지 않아 배포를 중단했습니다. "
-            "(.runtime/qa_report.md 없음 — 사이클이 QA까지 도달하지 않았을 수 있음)",
-        )
-
-    qa_status = (cycle_state or {}).get("qa_status")
+    qa_status = ((cycle_state or {}).get("qa_status") or "").strip()
     qa_publish_allowed = bool((cycle_state or {}).get("qa_publish_allowed"))
-    if qa_status != "passed" or not qa_publish_allowed:
-        reason = (cycle_state or {}).get("qa_failed_reason") or qa_status or "unknown"
-        return (
-            False,
-            f"QA Gate가 통과되지 않아 배포를 중단했습니다. (사유: {reason})",
-        )
 
-    # Staleness check — make sure the QA pass corresponds to the
-    # current working tree, not a previous edit.
+    if not qa_report.is_file():
+        return "missing", ".runtime/qa_report.md 없음"
+
+    if qa_status in {"", "skipped"}:
+        return "skipped", f"qa_status={qa_status or 'unset'}"
+
+    if qa_status != "passed" or not qa_publish_allowed:
+        reason = (cycle_state or {}).get("qa_failed_reason") or qa_status
+        return "fail", reason or "unknown"
+
+    # Staleness check — make sure the recorded "pass" still covers the
+    # current working tree.
     try:
         qa_mtime = qa_report.stat().st_mtime
     except OSError:
         qa_mtime = 0.0
-
-    # Find the newest mtime among files git status currently reports
-    # as modified/untracked. If any of those is newer than qa_report,
-    # the report is stale relative to the change set being shipped.
     changed = _git_changed_files()
     newest_change = 0.0
     for rel in changed:
@@ -718,12 +715,134 @@ def _qa_gate_allows_publish(cycle_state: dict) -> tuple[bool, str]:
         if t > newest_change:
             newest_change = t
     if newest_change > qa_mtime + 1.0:  # 1s slack for filesystem precision
-        return (
-            False,
-            "QA Gate 리포트가 현재 작업 트리보다 오래됨 — 다음 사이클의 qa_gate 통과 후 다시 시도하세요.",
-        )
+        return "stale", "qa_report 가 작업 트리보다 오래됨"
 
-    return True, "QA Gate 통과 — 배포 진행"
+    return "pass", "QA Gate 통과 (이전 사이클)"
+
+
+def _merge_factory_state_qa(qa_dict: dict) -> None:
+    """Read-modify-write the QA-related fields in factory_state.json so
+    the heartbeat builder picks up an on-demand QA result without
+    waiting for a fresh cycle. Best-effort: any I/O failure is logged
+    to stderr but does not abort the publish flow."""
+    try:
+        cur = _read_factory_state() or {}
+        cur.update(qa_dict)
+        cur["qa_on_demand_at"] = _utc_now_z()
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(
+            json.dumps(cur, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to merge on-demand QA state: {e}\n")
+
+
+def _run_on_demand_qa_gate() -> tuple[bool, str, dict]:
+    """Run the QA Gate against the *current* working tree.
+
+    Used when publish is requested but no QA report exists yet — e.g.,
+    the user committed manually outside the factory loop, or a partial
+    operator_request modified files without ever reaching stage_qa_gate.
+    Mirrors the cycle's pre-QA correctness pass so the QA Gate's
+    dist-artifact check sees freshly-built outputs:
+
+      1. _revalidate_after_apply — npm run build (app/web +
+         control_tower/web), py_compile across the api/runner trees,
+         bash -n on the factory scripts, plus a risky-file scan.
+      2. stage_qa_gate — the existing build_artifact + api_health +
+         screen_presence + flow_presence + domain_profile checks.
+         Writes qa_report.md (and qa_feedback.md on failure) so the
+         dashboard can deep-link the result.
+
+    Returns (passed, message, qa_dict). qa_dict carries the QA fields
+    factory_state.json expects so the heartbeat reflects the
+    on-demand result.
+    """
+    try:
+        from . import cycle as _cycle
+    except ImportError as e:
+        msg = f"cycle 모듈 import 실패: {e}"
+        qa_dict = {
+            "qa_status": "failed",
+            "qa_publish_allowed": False,
+            "qa_failed_reason": msg,
+            "qa_failed_categories": ["On-Demand"],
+            "qa_build_artifact": "skipped",
+            "qa_api_health": "skipped",
+            "qa_screen_presence": "skipped",
+            "qa_flow_presence": "skipped",
+            "qa_domain_profile": "skipped",
+            "qa_report_path": None,
+            "qa_feedback_path": None,
+        }
+        _merge_factory_state_qa(qa_dict)
+        return False, msg, qa_dict
+
+    revalidate_ok, failures = _cycle._revalidate_after_apply()
+    if not revalidate_ok:
+        msg = "build/syntax 실패: " + ", ".join(failures or ["unknown"])
+        qa_dict = {
+            "qa_status": "failed",
+            "qa_publish_allowed": False,
+            "qa_failed_reason": msg,
+            "qa_failed_categories": ["Build/Syntax"],
+            "qa_build_artifact": (
+                "failed"
+                if any(f in failures for f in ("build_app", "build_control"))
+                else "skipped"
+            ),
+            "qa_api_health": "failed" if "syntax_check_py" in failures else "skipped",
+            "qa_screen_presence": "skipped",
+            "qa_flow_presence": "skipped",
+            "qa_domain_profile": "skipped",
+            "qa_report_path": None,
+            "qa_feedback_path": None,
+        }
+        _merge_factory_state_qa(qa_dict)
+        return False, msg, qa_dict
+
+    state = _cycle.CycleState()
+    sr = _cycle.stage_qa_gate(state)
+    qa_dict = {
+        "qa_status": state.qa_status,
+        "qa_publish_allowed": bool(state.qa_publish_allowed),
+        "qa_failed_reason": state.qa_failed_reason,
+        "qa_failed_categories": list(state.qa_failed_categories),
+        "qa_build_artifact": state.qa_build_artifact,
+        "qa_api_health": state.qa_api_health,
+        "qa_screen_presence": state.qa_screen_presence,
+        "qa_flow_presence": state.qa_flow_presence,
+        "qa_domain_profile": state.qa_domain_profile,
+        "qa_report_path": state.qa_report_path,
+        "qa_feedback_path": state.qa_feedback_path,
+    }
+    _merge_factory_state_qa(qa_dict)
+    return sr.status == "passed", sr.message, qa_dict
+
+
+def _format_qa_failure_detail(qa_dict: dict, qa_msg: str) -> dict:
+    """Pull a structured failure summary out of the QA result so the
+    System Log entry / deploy_progress card surfaces what the operator
+    needs to fix: which category failed, the first failed file when we
+    can extract one from the reason text, and a suggested next action.
+    """
+    cats = list(qa_dict.get("qa_failed_categories") or [])
+    reason = qa_msg or qa_dict.get("qa_failed_reason") or "unknown"
+    m = re.search(r"([\w./-]+\.(?:py|jsx|js|tsx|ts|md|json|sh|html|css))", reason)
+    failed_file = m.group(1) if m else None
+    if cats == ["Build/Syntax"]:
+        suggested = "npm run build / py_compile 실패 → 빌드 오류 수정 후 다시 배포 시도"
+    elif cats:
+        suggested = "qa_feedback.md 확인 → 해당 카테고리의 파일 수정 후 다시 배포 시도"
+    else:
+        suggested = "qa_report.md 확인 → 원인 식별 후 다시 배포 시도"
+    return {
+        "categories": cats,
+        "file": failed_file,
+        "reason": reason,
+        "suggested_action": suggested,
+    }
 
 
 def _publish_blocker_preflight() -> tuple[bool, str]:
@@ -937,23 +1056,101 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
         _record_failure("secret_scan", msg)
         return False, f"publish failed at secret_scan: {msg}"
 
-    # 4b. QA Gate. The most recent factory cycle must have signed off
-    # via cycle.stage_qa_gate; otherwise we refuse to ship even if the
-    # code compiles. Override is possible via
-    # LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true (emergency only),
-    # but never overrides risky/secret refusals above.
-    _progress("validating", step="QA Gate 검증 중")
-    qa_ok, qa_msg = _qa_gate_allows_publish(state_at_start)
-    if not qa_ok:
-        _record_failure("qa_gate", qa_msg)
-        return False, f"publish failed at qa_gate: {qa_msg}"
+    # 4b. QA Gate. Try the persisted report first; when it's missing,
+    # skipped, or stale we run the QA Gate on-demand instead of
+    # refusing publish outright. That lets a user who pushed manually
+    # (or whose operator_request didn't reach stage_qa_gate) re-trigger
+    # the deploy button without first kicking a full factory cycle.
+    # Override path: LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true
+    # (emergency only) — never overrides risky/secret refusals above.
+    revalidate_already_ran = False
+    qa_msg = ""
+    if _publish_allows_failed_qa():
+        qa_msg = "QA Gate 우회 (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA=true)"
+        _progress(
+            "validating",
+            step="QA Gate 우회 (LOCAL_RUNNER_ALLOW_PUBLISH_WITH_FAILED_QA)",
+            log_message=qa_msg,
+        )
+    else:
+        qa_kind, qa_reason = _qa_gate_status_from_state(state_at_start)
+        if qa_kind == "pass":
+            qa_msg = qa_reason
+            _progress(
+                "validating",
+                step="QA Gate 검증 중 (이전 사이클 통과)",
+                log_message=f"QA Gate passed (이전 사이클): {qa_reason}",
+            )
+        elif qa_kind == "fail":
+            blocked_msg = f"QA Gate failed (사유: {qa_reason})"
+            _progress(
+                "failed",
+                step="QA Gate failed → publish blocked",
+                failed_reason=blocked_msg[:280],
+                log_message=blocked_msg,
+            )
+            _record_failure("qa_gate", blocked_msg)
+            return False, f"publish failed at qa_gate: {blocked_msg}"
+        else:
+            # missing / skipped / stale → run on-demand
+            _progress(
+                "validating",
+                step="QA Gate 미실행 → 즉시 실행 중",
+                log_message=(
+                    f"QA Gate missing — running on-demand "
+                    f"({qa_kind}: {qa_reason})."
+                ),
+            )
+            _progress(
+                "validating",
+                step="QA Gate started (on-demand)",
+                log_message=(
+                    "QA Gate started: build_artifact / api_health / "
+                    "screen_presence / flow_presence / domain_profile."
+                ),
+            )
+            ok, ondemand_msg, qa_dict = _run_on_demand_qa_gate()
+            revalidate_already_ran = True
+            if ok:
+                qa_msg = ondemand_msg
+                _progress(
+                    "validating",
+                    step="QA Gate passed → publish continued",
+                    log_message=(
+                        f"QA Gate passed (on-demand). publish continued. "
+                        f"{ondemand_msg}"
+                    ),
+                )
+            else:
+                detail = _format_qa_failure_detail(qa_dict, ondemand_msg)
+                cats_text = ", ".join(detail["categories"]) or "unknown"
+                file_text = detail["file"] or "(파일 미식별)"
+                failure_lines = [
+                    "QA Gate failed (on-demand) → publish blocked",
+                    f"실패 카테고리: {cats_text}",
+                    f"실패 파일: {file_text}",
+                    f"이유: {detail['reason']}",
+                    f"권장 조치: {detail['suggested_action']}",
+                ]
+                failed_msg = "\n".join(failure_lines)
+                _progress(
+                    "failed",
+                    step="QA Gate failed → publish blocked",
+                    failed_reason=failed_msg[:280],
+                    log_message=failed_msg,
+                )
+                _record_failure("qa_gate", failed_msg[:600])
+                return False, f"publish failed at qa_gate: {failed_msg[:600]}"
 
     # 5. Re-run the correctness gate before we touch git history.
-    revalidate_ok, failures = _revalidate_for_publish()
-    if not revalidate_ok:
-        msg = "validation failed: " + ", ".join(failures)
-        _record_failure("revalidate", msg)
-        return False, f"publish failed at revalidate: {msg}"
+    # Skipped when an on-demand QA Gate already executed the same
+    # build/syntax suite earlier in this call.
+    if not revalidate_already_ran:
+        revalidate_ok, failures = _revalidate_for_publish()
+        if not revalidate_ok:
+            msg = "validation failed: " + ", ".join(failures)
+            _record_failure("revalidate", msg)
+            return False, f"publish failed at revalidate: {msg}"
 
     # Pre-compute the restart classification so both the dry-run
     # report and the real-publish path expose accurate "would this
@@ -1030,7 +1227,12 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     # gap that an exec_self causes.
     restart_action = restart_action_pre
     restart_reason = restart_reason_pre
-    msg = f"published: commit={commit_hash[:8]}, pushed to origin/main"
+    qa_summary = qa_msg or "QA Gate passed"
+    msg = (
+        f"QA Gate passed → publish continued — "
+        f"published: commit={commit_hash[:8]}, pushed to origin/main "
+        f"({qa_summary})"
+    )
     if restart_action:
         msg = f"{msg}; restart scheduled ({restart_reason})"
         global _POST_REPORT_ACTION
@@ -1664,6 +1866,11 @@ def _operator_fix_run_qa_gate() -> tuple[bool, str, dict]:
         "qa_report_path": state.qa_report_path,
         "qa_feedback_path": state.qa_feedback_path,
     }
+    # Mirror the result into factory_state.json so the heartbeat (and
+    # a follow-up publish click that re-enters _h_publish_changes)
+    # sees the QA Gate as already passed for the current diff and does
+    # not waste cycles running it on-demand a second time.
+    _merge_factory_state_qa(qa_dict)
     return sr.status == "passed", sr.message, qa_dict
 
 
