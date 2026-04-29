@@ -209,6 +209,8 @@ const KEYWORD_TABLE = [
   // Control State aggregator — top-level verdict.
   [/control\s+state\s+aggregated/i,                         { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
   [/continuous\s+stopped\s+by\s+control_?state/i,           { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+  [/pipeline\s+doctor\s+diagnosed/i,                        { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+  [/pipeline\s+doctor\s+operator\s+required/i,              { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
 
   // Agent Supervisor (Product Director / 공장장).
   [/agent\s+supervisor\s+review\s+started/i,                { category: "Doctor", actor: "system", severity: "info",    phase: "started"   }],

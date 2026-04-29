@@ -5008,6 +5008,43 @@ def _watchdog_tick() -> None:
             severity="info",
         )
 
+    # Pipeline Doctor — run BEFORE control_state so any repair prompt
+    # the Doctor wrote this tick is included in heartbeat. Always
+    # cheap (file reads only); auto-execution is gated on
+    # FACTORY_DOCTOR_ALLOW_CLAUDE_REPAIR which we don't enforce here.
+    doctor_state = _pipeline_doctor_tick()
+    if doctor_state:
+        d_code = doctor_state.get("last_diagnostic_code") or "unknown"
+        d_repeat = int(doctor_state.get("repeat_count_for_current") or 0)
+        d_op_required = bool(doctor_state.get("operator_required"))
+        if d_code not in {"healthy", "unknown"}:
+            _watchdog_log_event(
+                state,
+                kind="pipeline_doctor_diagnosed",
+                message=(
+                    f"Pipeline Doctor diagnosed — {d_code} "
+                    f"(repeat {d_repeat}/3): "
+                    f"{(doctor_state.get('root_cause') or '')[:160]}"
+                ),
+                severity=(
+                    "error" if d_op_required
+                    else "warning" if doctor_state.get("severity") == "error"
+                    else "info"
+                ),
+                diagnostic_code=d_code,
+            )
+        if d_op_required:
+            _watchdog_log_event(
+                state,
+                kind="pipeline_doctor_operator_required",
+                message=(
+                    f"Pipeline Doctor escalated — {d_code} repeated "
+                    f"{d_repeat}회. operator_required."
+                ),
+                severity="error",
+                diagnostic_code=d_code,
+            )
+
     # Control State aggregation — single source of truth. Runs after
     # pipeline / forward_progress / supervisor have all written their
     # sub-states so the verdict reflects the latest tick.
@@ -5533,6 +5570,14 @@ DIAGNOSTIC_REPAIR_MAP: dict[str, dict] = {
         "actions": ["claude_repair"],
         "description": "Claude 가 변경하지 않음 — 실제 app/web/src 또는 control_tower/web/src 파일을 수정하라고 재요청.",
     },
+    "claude_apply_failed_no_code_change": {
+        "stage": "claude_apply",
+        "actions": ["claude_repair"],
+        "description": (
+            "claude_apply 가 실행됐지만 변경 파일이 0개 — ticket 의 수정 대상 "
+            "파일을 실제로 수정하도록 Claude 에게 재요청 (completed 금지)."
+        ),
+    },
     "docs_only_change": {
         "stage": "claude_apply",
         "actions": ["claude_repair"],
@@ -6032,10 +6077,20 @@ def _pipeline_diagnose() -> dict:
             "current_stage": current_stage,
             "last_success_stage": last_success,
             "failed_stage": current_stage,
-            "diagnostic_code": "no_code_change",
-            "severity": "warning",
-            "root_cause": "Claude 가 변경하지 않았습니다.",
-            "evidence": [f"claude_apply_status={apply_status}"],
+            # Distinct from `no_code_change` (which used to be the
+            # idle-cycle terminal classification): this code says the
+            # operator-driven stage actually ran but produced zero
+            # diff. control_state must refuse to mark cycle completed.
+            "diagnostic_code": "claude_apply_failed_no_code_change",
+            "severity": "error",
+            "root_cause": (
+                "claude_apply 가 실행됐지만 변경 파일이 0개 — "
+                "ticket 의 수정 대상 파일을 실제로 수정해야 합니다."
+            ),
+            "evidence": [
+                f"claude_apply_status={apply_status}",
+                "claude_apply_changed_files=[]",
+            ],
         }
 
     # QA Gate paths
@@ -7079,6 +7134,37 @@ def _control_state_read() -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Pipeline Doctor (minimum) — generates repair prompts when one of the 5
+# minimum diagnostic codes fires. Default OFF; opt in via
+# FACTORY_DOCTOR_ENABLED=true.
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_doctor_tick() -> dict | None:
+    try:
+        from . import pipeline_doctor as _pd
+    except ImportError as e:
+        sys.stderr.write(f"[runner] pipeline_doctor import failed: {e}\n")
+        return None
+    try:
+        return _pd.tick()
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[runner] pipeline_doctor.tick raised: {e}\n")
+        return None
+
+
+def _build_pipeline_doctor_meta() -> dict:
+    try:
+        from . import pipeline_doctor as _pd
+    except ImportError:
+        return {"available": False}
+    try:
+        return _pd.read_meta()
+    except Exception:  # noqa: BLE001
+        return {"available": False}
+
+
 def _build_control_state_meta() -> dict:
     """Heartbeat metadata block under `local_factory.control_state`.
     Reads the file the watchdog last wrote — keeps heartbeats cheap."""
@@ -7530,6 +7616,7 @@ def _build_local_factory_meta() -> dict:
         "agent_accountability": _build_agent_accountability_meta(),
         "operator_request_health": _build_operator_request_health_meta(),
         "control_state": _build_control_state_meta(),
+        "pipeline_doctor": _build_pipeline_doctor_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See

@@ -2664,9 +2664,8 @@ def stage_product_planning(state: CycleState) -> StageResult:
             "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
-    enabled = os.environ.get("FACTORY_PRODUCT_PLANNER_MODE", "").strip().lower()
-    if enabled not in {"true", "1", "yes", "on"}:
-        return _skip("FACTORY_PRODUCT_PLANNER_MODE 미설정 — 기본 OFF (스킵)")
+    if not _factory_flag_enabled("FACTORY_PRODUCT_PLANNER_MODE", default_on=True):
+        return _skip("FACTORY_PRODUCT_PLANNER_MODE=false — 기획 단계 명시적 비활성")
 
     claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     if not claude_bin:
@@ -2826,11 +2825,34 @@ def stage_product_planning(state: CycleState) -> StageResult:
 PINGPONG_ENV_FLAG = "FACTORY_PLANNER_DESIGNER_PINGPONG"
 
 
+# ---------------------------------------------------------------------------
+# Feature-flag semantics.
+#
+# Stampport's automation factory is an OPT-OUT product, not opt-in: the
+# operator starts a cycle from Control Tower and expects the full
+# pipeline (planner → designer → PM → ticket → claude_apply → QA →
+# commit/push) to run. Historically each stage was gated on its own
+# env flag defaulting to OFF, which left every cycle stuck at
+# "skipped because flag unset".
+#
+# `_factory_flag_enabled(name, default_on=True)` honors the same
+# `{true,1,yes,on}` enable set as before, but flips the default so that
+# a *missing* env variable means ON. Explicit `false/0/no/off` still
+# disables — operators running cycle.py manually for diagnostics can
+# turn off any stage by setting the flag to `false`.
+# ---------------------------------------------------------------------------
+
+
+def _factory_flag_enabled(name: str, *, default_on: bool = True) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default_on
+    return raw in {"true", "1", "yes", "on"}
+
+
 def _pingpong_enabled() -> bool:
-    """Honor the same true/1/yes/on convention the rest of cycle.py uses."""
-    return os.environ.get(PINGPONG_ENV_FLAG, "").strip().lower() in {
-        "true", "1", "yes", "on",
-    }
+    """Honor the new opt-out semantics: ON unless explicitly disabled."""
+    return _factory_flag_enabled(PINGPONG_ENV_FLAG, default_on=True)
 
 
 def _read_artifact(path: Path) -> str | None:
@@ -3621,11 +3643,12 @@ def stage_claude_propose(state: CycleState) -> StageResult:
             "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
-    # Pre-condition 1: opt-in. Default OFF — never run unless explicitly
-    # asked. We accept "true"/"1"/"yes" (case-insensitive) for ergonomics.
-    enabled = os.environ.get("FACTORY_RUN_CLAUDE", "").strip().lower()
-    if enabled not in {"true", "1", "yes", "on"}:
-        return _skip("FACTORY_RUN_CLAUDE 미설정 — 기본 OFF (스킵)")
+    # Pre-condition 1: opt-out. Default ON — Stampport's automation
+    # factory is meant to ship code, so every cycle should reach the
+    # claude_propose stage. The operator can disable explicitly with
+    # FACTORY_RUN_CLAUDE=false for diagnostic-only cycles.
+    if not _factory_flag_enabled("FACTORY_RUN_CLAUDE", default_on=True):
+        return _skip("FACTORY_RUN_CLAUDE=false — Claude 호출 명시적 비활성")
 
     # Pre-condition 2: don't ask Claude to propose changes when the
     # working tree is leaking secrets / build artifacts.
@@ -4489,10 +4512,12 @@ def stage_claude_apply(state: CycleState) -> StageResult:
             "차단 사유(secret/conflict)가 남아 있어 신규 개발을 중단했습니다."
         )
 
-    # Pre-condition 1: opt-in. Default OFF.
-    enabled = os.environ.get("FACTORY_APPLY_CLAUDE", "").strip().lower()
-    if enabled not in {"true", "1", "yes", "on"}:
-        return _skip("FACTORY_APPLY_CLAUDE 미설정 — 기본 OFF (스킵)")
+    # Pre-condition 1: opt-out. Default ON — Stampport's automation
+    # factory must reach claude_apply by default so the cycle can
+    # actually ship code. Operators running cycle.py manually for
+    # diagnostic purposes can disable with FACTORY_APPLY_CLAUDE=false.
+    if not _factory_flag_enabled("FACTORY_APPLY_CLAUDE", default_on=True):
+        return _skip("FACTORY_APPLY_CLAUDE=false — Claude 적용 명시적 비활성")
 
     # Pre-condition 2: this cycle must have produced a fresh proposal.
     # We refuse to apply a stale proposal from a previous run because
@@ -5429,9 +5454,8 @@ def stage_qa_fix_propose(state: CycleState) -> StageResult:
         )
 
     # Hard gates that mirror claude_propose's preconditions.
-    enabled = os.environ.get("FACTORY_RUN_CLAUDE", "").strip().lower()
-    if enabled not in {"true", "1", "yes", "on"}:
-        return _skip("FACTORY_RUN_CLAUDE 미설정 — QA 수정 제안 스킵")
+    if not _factory_flag_enabled("FACTORY_RUN_CLAUDE", default_on=True):
+        return _skip("FACTORY_RUN_CLAUDE=false — QA 수정 제안 명시적 비활성")
     if state.risky_files:
         return _skip(
             f"위험 파일 {len(state.risky_files)}건 — QA 수정 제안 스킵"

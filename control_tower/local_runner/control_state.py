@@ -117,6 +117,17 @@ PIPELINE_HEALTHY_CODES: frozenset[str] = frozenset({
     "qa_report_missing_before_run",
 })
 
+# Diagnostic codes that must always block the cycle's completed verdict
+# even when the supervisor or factory.status would otherwise accept it.
+# `claude_apply_failed_no_code_change` is the canonical "ran but
+# produced 0 files" signal — never let that float to completed.
+PIPELINE_HARD_BLOCK_CODES: frozenset[str] = frozenset({
+    "claude_apply_failed_no_code_change",
+    "claude_apply_skipped",
+    "implementation_ticket_missing",
+    "implementation_ticket_invalid",
+})
+
 # Forward Progress statuses that DO bubble up as "blocked" at the
 # control level.
 FP_BLOCKED_STATUSES: frozenset[str] = frozenset({
@@ -209,6 +220,8 @@ def _compute_pipeline(
         pipe_failed_stage
         and pipe_code not in PIPELINE_HEALTHY_CODES
     )
+    if pipe_code in PIPELINE_HARD_BLOCK_CODES:
+        pipe_blocked = True
     fp_blocked = fp_status in FP_BLOCKED_STATUSES
 
     if fp_status == "stuck":
@@ -497,6 +510,34 @@ def aggregate(runner_meta: dict | None = None) -> dict:
     pipeline_state = _read_json(runtime / "pipeline_state.json") or {}
     fp_state = _read_json(runtime / "forward_progress_state.json") or {}
     supervisor_report = _read_json(runtime / "agent_accountability.json") or {}
+
+    # Direct aggregator-level diagnostic for the "claude_apply applied
+    # but produced 0 files" case. The pipeline orchestrator usually
+    # writes this to pipeline_state.json, but on the very first tick
+    # of a fresh runtime that file may not exist yet — we still need
+    # to refuse `completed` immediately. Mirror the diagnostic into
+    # pipeline_state so the rest of the pipeline-block computation
+    # picks it up.
+    apply_status = (cycle_state.get("claude_apply_status") or "").strip()
+    apply_changed_count = len(cycle_state.get("claude_apply_changed_files") or [])
+    if (
+        apply_status in {"applied", "no_changes"}
+        and apply_changed_count == 0
+        and (cycle_state.get("implementation_ticket_status") in {"generated"})
+        and not pipeline_state.get("diagnostic_code")
+    ):
+        pipeline_state = {
+            **pipeline_state,
+            "current_stage": "claude_apply",
+            "failed_stage": "claude_apply",
+            "diagnostic_code": "claude_apply_failed_no_code_change",
+            "severity": "error",
+            "root_cause": (
+                "claude_apply 가 실행됐지만 변경 파일 0개 — completed 거부."
+            ),
+            "evidence": [f"claude_apply_status={apply_status}",
+                         "claude_apply_changed_files=[]"],
+        }
 
     liveness = _compute_liveness(runner_meta)
     kernel = _compute_execution_kernel(op_state, cmd_diag)

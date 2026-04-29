@@ -252,6 +252,9 @@ const WATCHDOG_KIND_TO_PHRASE = {
   // Control State aggregator — single source of truth verdict.
   control_state_aggregated:              "Control state aggregated",
   control_state_continuous_stopped:      "Continuous stopped by control_state",
+  // Pipeline Doctor — minimum repair-prompt generator.
+  pipeline_doctor_diagnosed:             "Pipeline Doctor diagnosed",
+  pipeline_doctor_operator_required:     "Pipeline Doctor operator required",
   // Forward Progress Detector — same channel.
   forward_progress_check_started:        "Forward progress check started",
   forward_progress_blocked:              "Forward progress blocked",
