@@ -706,19 +706,126 @@ def _load_cycle_number() -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# Safe write helpers — atomic + crash-safe + never-raises.
+#
+# Every state file and every artifact file in .runtime/ goes through
+# these. The runtime directory is the dashboard's only source of truth
+# for "did this cycle actually happen", so a half-written
+# factory_state.json or a missing artifact directly translates to
+# Watchdog/Pipeline/Supervisor false-positives.
+#
+# Atomic write protocol:
+#   1. mkdirs(parents=True, exist_ok=True) for the parent directory
+#   2. write the new payload to <path>.tmp
+#   3. flush + fsync
+#   4. os.replace(tmp, target) — atomic on POSIX
+#
+# On any OSError we log to stderr + LOG_FILE but never raise. A cycle
+# that lost a state write is already in trouble; raising would kill
+# the bash factory loop and leave nothing on disk.
+# ---------------------------------------------------------------------------
+
+
+def safe_write_text(path: Path, text: str) -> bool:
+    """Atomic write of arbitrary text. Returns True when persisted."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        sys.stderr.write(f"[cycle] safe_write_text failed for {path}: {e}\n")
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"[{utc_now_iso()}] safe_write_text failed for "
+                    f"{path}: {e}\n"
+                )
+        except OSError:
+            pass
+        return False
+
+
+def safe_write_json(path: Path, data: dict | list) -> bool:
+    """Atomic JSON write with stable indent + utf-8."""
+    try:
+        payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    except (TypeError, ValueError) as e:
+        sys.stderr.write(
+            f"[cycle] safe_write_json could not serialise {path}: {e}\n"
+        )
+        return False
+    return safe_write_text(path, payload)
+
+
+# Stampport artifact metadata.
+#
+# Each markdown artifact we write under .runtime/ gets a small HTML
+# comment header + YAML-ish front-matter block so downstream tools
+# (cycle.py readers, Pipeline Recovery file-presence checks, the
+# dashboard preview) can answer "which cycle / stage / agent produced
+# this file" without grepping the body. HTML comments are ignored by
+# every Markdown renderer we care about.
+#
+# The metadata is intentionally tiny — bigger blocks would interfere
+# with the existing _extract_md_section() readers.
+def _artifact_header(
+    *,
+    cycle_id: int | None,
+    stage: str,
+    source_agent: str,
+    extra: dict | None = None,
+) -> str:
+    fields = [
+        f"cycle_id: {cycle_id if cycle_id is not None else '—'}",
+        f"stage: {stage}",
+        f"source_agent: {source_agent}",
+        f"created_at: {utc_now_iso()}",
+    ]
+    if extra:
+        for k, v in extra.items():
+            fields.append(f"{k}: {v}")
+    inner = "\n".join(fields)
+    return f"<!--\nstampport_artifact\n{inner}\n-->\n\n"
+
+
+def safe_write_artifact(
+    path: Path,
+    body: str,
+    *,
+    cycle_id: int | None,
+    stage: str,
+    source_agent: str,
+    extra: dict | None = None,
+) -> bool:
+    """Atomic write of a markdown artifact with a metadata header."""
+    header = _artifact_header(
+        cycle_id=cycle_id, stage=stage, source_agent=source_agent, extra=extra,
+    )
+    payload = header + (body if body.endswith("\n") else body + "\n")
+    return safe_write_text(path, payload)
+
+
 def _write_state(state: CycleState) -> None:
     state.updated_at = utc_now_iso()
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(
-        json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    safe_write_json(STATE_FILE, state.to_dict())
 
 
 def _log(line: str) -> None:
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(f"[{utc_now_iso()}] {line}\n")
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{utc_now_iso()}] {line}\n")
+    except OSError as e:
+        sys.stderr.write(f"[cycle] _log failed: {e}\n")
 
 
 # Cap the in-state cycle_log so the heartbeat payload doesn't grow
@@ -2391,25 +2498,27 @@ def stage_product_planning(state: CycleState) -> StageResult:
         state.product_planner_message = sr.message
         # Persist the report anyway so the user can inspect what claude
         # produced and improve the prompt.
-        try:
-            (PRODUCT_PLANNER_FILE.with_suffix(".rejected.md")).write_text(
-                body + "\n", encoding="utf-8",
-            )
-        except OSError:
-            pass
+        safe_write_artifact(
+            PRODUCT_PLANNER_FILE.with_suffix(".rejected.md"),
+            body,
+            cycle_id=state.cycle, stage="planner_proposal",
+            source_agent="planner",
+            extra={"verdict": "rejected"},
+        )
         return sr
 
-    PRODUCT_PLANNER_FILE.write_text(body + "\n", encoding="utf-8")
-    # Ping-pong protocol uses planner_proposal.md as the canonical
-    # name for the planner's "원안". Keep the legacy
-    # product_planner_report.md write so existing readers (claude_propose,
-    # heartbeat metadata) keep working, and mirror the same content
-    # under the new name so the dashboard / designer stages can read
-    # a stable file path.
-    try:
-        PLANNER_PROPOSAL_FILE.write_text(body + "\n", encoding="utf-8")
-    except OSError:
-        pass
+    # Both filenames are kept in sync — `product_planner_report.md` is
+    # the legacy reader path; `planner_proposal.md` is the ping-pong
+    # canonical name. Pipeline Recovery accepts either, so writing both
+    # makes the cycle robust against a partial-write recovery.
+    safe_write_artifact(
+        PRODUCT_PLANNER_FILE, body,
+        cycle_id=state.cycle, stage="planner_proposal", source_agent="planner",
+    )
+    safe_write_artifact(
+        PLANNER_PROPOSAL_FILE, body,
+        cycle_id=state.cycle, stage="planner_proposal", source_agent="planner",
+    )
 
     bottleneck = _extract_bottleneck(body)
     selected = _extract_selected_feature(body)
@@ -2645,7 +2754,11 @@ def stage_designer_critique(state: CycleState) -> StageResult:
         state.designer_critique_message = sr.message
         return sr
 
-    DESIGNER_CRITIQUE_FILE.write_text(body + "\n", encoding="utf-8")
+    safe_write_artifact(
+        DESIGNER_CRITIQUE_FILE, body,
+        cycle_id=state.cycle, stage="designer_critique",
+        source_agent="designer",
+    )
     state.designer_critique_status = "generated"
     state.designer_critique_path = str(DESIGNER_CRITIQUE_FILE)
     state.designer_critique_at = utc_now_iso()
@@ -2759,7 +2872,10 @@ def stage_planner_revision(state: CycleState) -> StageResult:
         state.planner_revision_message = sr.message
         return sr
 
-    PLANNER_REVISION_FILE.write_text(body + "\n", encoding="utf-8")
+    safe_write_artifact(
+        PLANNER_REVISION_FILE, body,
+        cycle_id=state.cycle, stage="planner_revision", source_agent="planner",
+    )
     state.planner_revision_status = "generated"
     state.planner_revision_path = str(PLANNER_REVISION_FILE)
     state.planner_revision_at = utc_now_iso()
@@ -2947,7 +3063,11 @@ def stage_designer_final_review(state: CycleState) -> StageResult:
         state.designer_final_review_message = sr.message
         return sr
 
-    DESIGNER_FINAL_REVIEW_FILE.write_text(body + "\n", encoding="utf-8")
+    safe_write_artifact(
+        DESIGNER_FINAL_REVIEW_FILE, body,
+        cycle_id=state.cycle, stage="designer_final_review",
+        source_agent="designer",
+    )
     scores = _parse_desire_scorecard(body)
     total, ship_ready, rework = _evaluate_desire_gate(scores)
     verdict = _extract_verdict(body)
@@ -3093,7 +3213,10 @@ def stage_pm_decision(state: CycleState) -> StageResult:
         state.pm_decision_message = sr.message
         return sr
 
-    PM_DECISION_FILE.write_text(body + "\n", encoding="utf-8")
+    safe_write_artifact(
+        PM_DECISION_FILE, body,
+        cycle_id=state.cycle, stage="pm_decision", source_agent="pm",
+    )
     decision_section = _extract_md_section(body, "출하 결정").lower()
     ship_word = "ship" in decision_section
     hold_word = "hold" in decision_section
@@ -3638,11 +3761,15 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             planner_md=planner_md,
             proposal_md=proposal_md,
         )
-        try:
-            IMPLEMENTATION_TICKET_FILE.write_text(body, encoding="utf-8")
-        except OSError as e:
+        ok_write = safe_write_artifact(
+            IMPLEMENTATION_TICKET_FILE, body,
+            cycle_id=state.cycle, stage="implementation_ticket",
+            source_agent="pm",
+            extra={"verdict": "missing"},
+        )
+        if not ok_write:
             sr.status = "failed"
-            sr.message = f"ticket write failed: {e}"
+            sr.message = "ticket write failed (see local_factory.log)"
             sr.duration_sec = round(time.time() - t0, 3)
             state.implementation_ticket_status = "failed"
             state.implementation_ticket_message = sr.message
@@ -3675,11 +3802,18 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         planner_md=planner_md,
         proposal_md=proposal_md,
     )
-    try:
-        IMPLEMENTATION_TICKET_FILE.write_text(body, encoding="utf-8")
-    except OSError as e:
+    ok_write = safe_write_artifact(
+        IMPLEMENTATION_TICKET_FILE, body,
+        cycle_id=state.cycle, stage="implementation_ticket",
+        source_agent="pm",
+        extra={
+            "target_files_count": len(target_files),
+            "selected_feature": feature or "—",
+        },
+    )
+    if not ok_write:
         sr.status = "failed"
-        sr.message = f"ticket write failed: {e}"
+        sr.message = "ticket write failed (see local_factory.log)"
         sr.duration_sec = round(time.time() - t0, 3)
         state.implementation_ticket_status = "failed"
         state.implementation_ticket_message = sr.message
@@ -5512,17 +5646,37 @@ def _recommend_next(state: CycleState) -> list[str]:
 
 
 def main() -> int:
+    # Always make sure RUNTIME exists before anything else — even the
+    # PAUSE_FILE branch needs it for _log.
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"[cycle] could not create RUNTIME dir: {e}\n")
+        return 2
+
     if PAUSE_FILE.exists():
         _log("paused marker present — skipping cycle")
+        # Even on a paused tick we want the dashboard to know "the
+        # cycle process did wake up". Write a minimal valid state so
+        # heartbeat readers never see a missing factory_state.json.
+        if not STATE_FILE.exists():
+            paused_state = CycleState(cycle=_load_cycle_number())
+            paused_state.status = "paused"
+            paused_state.current_stage = "paused"
+            paused_state.current_task = "factory.paused 마커 — 다음 cycle 대기"
+            paused_state.last_message = "paused marker present"
+            _write_state(paused_state)
         return 0
 
-    RUNTIME.mkdir(parents=True, exist_ok=True)
     state = CycleState(cycle=_load_cycle_number())
     state.goal = _read_goal()
     state.current_stage = "prepare"
     state.current_task = "사이클 준비"
     state.last_message = "자동 점검 사이클 시작"
+    state.started_at = utc_now_iso()
     _log(f"cycle #{state.cycle} start (goal={state.goal[:40]}…)")
+    # Persist the initial state immediately so even an instant crash
+    # below leaves the dashboard with a valid factory_state.json.
     _write_state(state)
 
     # Track per-stage progress contribution.
@@ -5910,5 +6064,46 @@ def main() -> int:
     return 0 if state.status in {"succeeded", "planning_only", "no_code_change"} else 1
 
 
+def _safe_main() -> int:
+    """Wrapper around main() that guarantees an on-disk factory_state.json
+    even when main() raises. Without this, a crash early in the cycle
+    would leave the dashboard with no state file and every consumer
+    falling back to "no cycle ran" — exactly the symptom we're fixing.
+    """
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        # Persist a minimal failed state so the dashboard sees the
+        # crash instead of an empty file. We deliberately do not
+        # use _write_state because CycleState construction itself
+        # might be the failure source.
+        try:
+            RUNTIME.mkdir(parents=True, exist_ok=True)
+            crash_payload = {
+                "cycle": _load_cycle_number(),
+                "status": "failed",
+                "current_stage": "main",
+                "current_task": "cycle main() crashed",
+                "last_message": f"cycle main raised: {e}",
+                "started_at": utc_now_iso(),
+                "finished_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+                "failed_stage": "cycle_bootstrap",
+                "failed_reason": str(e)[:600],
+                "suggested_action": (
+                    "local_factory.log 의 traceback 확인 후 cycle.py 코드 점검"
+                ),
+            }
+            safe_write_json(STATE_FILE, crash_payload)
+            _log(f"cycle main crashed: {e}")
+        except Exception as e2:  # noqa: BLE001
+            sys.stderr.write(
+                f"[cycle] failed to persist crash state: {e2}\n"
+            )
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_safe_main())
