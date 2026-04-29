@@ -263,6 +263,79 @@ export function synthesizeWatchdogEvents(runners = []) {
 }
 
 // ---------------------------------------------------------------------------
+// Operator Request log → System Log events.
+//
+// runner._h_operator_request now drives a structured event log via
+// _op_emit() which lands at metadata.local_factory.operator_fix.log[].
+// Each entry's `kind` and `message` are crafted so the existing
+// eventClassifier keyword table (claude command started/completed,
+// validation started/passed/failed, commit created, git push completed,
+// operator_request) buckets them into Claude / Build / Git / Error.
+// ---------------------------------------------------------------------------
+
+const OPERATOR_KIND_TO_PHRASE = {
+  operator_request_received:   "operator request received",
+  factory_pause_requested:     "operator request — factory pause requested",
+  factory_pause_confirmed:     "operator request — factory pause confirmed",
+  operator_request_blocked:    "operator request blocked",
+  claude_command_started:      "Claude command started",
+  claude_command_completed:    "Claude command completed",
+  claude_command_failed:       "Claude command failed",
+  validation_started:          "validation started",
+  validation_passed:           "validation passed",
+  validation_failed:           "validation failed",
+  commit_created:              "commit created",
+  push_completed:              "git push completed",
+  git_push_failed:             "git push failed",
+  operator_request_no_changes: "operator request — no code change",
+};
+
+function operatorEntryId(entry) {
+  const seed = `op|${entry.kind || ""}|${entry.at || ""}|${(entry.message || "").slice(0, 32)}`;
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+  return -1 - (Math.abs(h) % 2_000_000_000);
+}
+
+export function synthesizeOperatorRequestEvents(runners = []) {
+  const out = [];
+  for (const r of runners) {
+    const log = r?.metadata_json?.local_factory?.operator_fix?.log;
+    if (!Array.isArray(log) || log.length === 0) continue;
+    for (const entry of log) {
+      if (!entry || !entry.kind) continue;
+      const phrase = OPERATOR_KIND_TO_PHRASE[entry.kind] || entry.kind;
+      const baseMsg = entry.message || phrase;
+      // Make sure the canonical English keyword (claude command started,
+      // validation passed, …) appears in the message so the keyword
+      // classifier picks it up regardless of the runner's Korean tail.
+      const lc = baseMsg.toLowerCase();
+      const phraseLc = phrase.toLowerCase();
+      const hasKeyword = phraseLc
+        .split(/\s+/)
+        .every((tok) => lc.includes(tok));
+      const message = hasKeyword ? baseMsg : `${phrase} — ${baseMsg}`;
+      out.push({
+        id: operatorEntryId(entry),
+        type: entry.severity === "error" ? "error" : "agent_message",
+        message,
+        payload: {
+          source: "operator_request",
+          kind: entry.kind,
+          severity: entry.severity,
+          diagnostic_code: entry.diagnostic_code,
+          ...(entry.payload || {}),
+        },
+        created_at: entry.at,
+        agent_id: null,
+        task_id: null,
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // In-page handoff events. AgentRouteLayer calls back when a card
 // starts/finishes its trip; ControlTowerPage funnels those through this
 // helper before merging into the SystemLog.

@@ -87,6 +87,9 @@ export default function CycleEffectivenessPanel({ runners = [] }) {
     ce?.implementation_ticket_selected_feature || "(미선택)";
   const ticketPreview = ce?.implementation_ticket_preview || "";
   const validationStatus = ce?.validation_status || "skipped";
+  const claudeApplyStatus = ce?.last_claude_apply_status || "skipped";
+  const claudeApplyDidRun =
+    claudeApplyStatus === "applied" || claudeApplyStatus === "no_changes";
   const commitShort = ce?.commit_hash_short || null;
   const pushStatus = ce?.push_status || null;
   const noCodeChangeReason = ce?.no_code_change_reason || null;
@@ -214,6 +217,14 @@ export default function CycleEffectivenessPanel({ runners = [] }) {
             <Pill color="#94a3b8" dim>SKIPPED</Pill>
           )}
         </div>
+        {!claudeApplyDidRun && (
+          <div className="mt-1 flex items-center gap-1.5 text-[10.5px] tracking-wider">
+            <Pill color="#fb923c">개발 단계 미실행</Pill>
+            <span className="text-slate-400">
+              claude_apply={claudeApplyStatus} — 이번 사이클은 코드 변경 없이 종료됩니다.
+            </span>
+          </div>
+        )}
         <div className="mt-1 text-[11px] tracking-wider text-slate-300">
           선정 기능: <span className="font-bold">{ticketFeature}</span>
         </div>

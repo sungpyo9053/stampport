@@ -200,6 +200,14 @@ STATUS_SCRIPT = _env("LOCAL_FACTORY_STATUS_SCRIPT", default=str(REPO_ROOT / "scr
 POLL_INTERVAL_SEC = float(_env("LOCAL_RUNNER_POLL_INTERVAL", default="3.0"))
 HEARTBEAT_INTERVAL_SEC = float(_env("LOCAL_RUNNER_HEARTBEAT_INTERVAL", default="15.0"))
 
+# Marker placed alongside PAUSE_MARKER when the runner pauses the bash
+# factory loop on behalf of the API (continuous_mode=false / desired=
+# paused). Lets the runner know it owns this pause and can lift it
+# automatically when the API flips the flag back. Operator-written
+# PAUSE_MARKER files (manual pause) leave this file absent and the
+# runner refuses to clear them.
+CONTINUOUS_PAUSE_MARKER = RUNTIME_DIR / "factory.continuous_paused"
+
 # Factory Watchdog state file. Written by the watchdog thread, read by
 # heartbeat builders. Off by default — must be opted in via
 # FACTORY_WATCHDOG_ENABLED=true.
@@ -283,6 +291,43 @@ def _request(method: str, path: str, body: dict | None = None) -> dict | None:
         return None
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[runner] {method} {path} failed: {e}\n")
+        return None
+
+
+def _admin_request(method: str, path: str, body: dict | None = None) -> dict | None:
+    """Same as _request but uses LOCAL_RUNNER_ADMIN_TOKEN for the
+    factory-mutation endpoints (POST /factory/continuous, /factory/stop,
+    /factory/desired). Falls back silently when unset — the API
+    treats CONTROL_TOWER_ADMIN_TOKEN-unset as simulation mode and lets
+    the call through, which is the normal local-development case.
+    """
+    url = f"{CONTROL_TOWER_URL.rstrip('/')}{path}"
+    data = None if body is None else json.dumps(body).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    admin_token = os.environ.get("LOCAL_RUNNER_ADMIN_TOKEN", "").strip()
+    if admin_token:
+        headers["Authorization"] = f"Bearer {admin_token}"
+    elif RUNNER_TOKEN:
+        # Better than nothing — the request still goes through, and the
+        # API logs a "simulation mode" warning if no admin token is set
+        # on its side.
+        headers["Authorization"] = f"Bearer {RUNNER_TOKEN}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")[:200]
+        sys.stderr.write(f"[runner] admin {method} {path} → HTTP {e.code}: {body_text}\n")
+        return None
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[runner] admin {method} {path} failed: {e}\n")
         return None
 
 
@@ -989,6 +1034,104 @@ def _log_event(line: str) -> None:
             f.write(f"[{_utc_now_z()}] {line}\n")
     except OSError as e:
         sys.stderr.write(f"[runner] log_event failed: {e}\n")
+
+
+def _set_continuous_pause(reason: str) -> bool:
+    """Apply runner-managed pause: write both PAUSE_MARKER (read by
+    the bash factory loop) and CONTINUOUS_PAUSE_MARKER (so the runner
+    knows it owns this pause). No-op if both already exist. Returns
+    True when the pause state changed."""
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        changed = False
+        if not PAUSE_MARKER.is_file():
+            PAUSE_MARKER.write_text(
+                f"runner-managed pause at {_utc_now_z()}: {reason}\n",
+                encoding="utf-8",
+            )
+            changed = True
+        if not CONTINUOUS_PAUSE_MARKER.is_file():
+            CONTINUOUS_PAUSE_MARKER.write_text(
+                f"continuous_off at {_utc_now_z()}: {reason}\n",
+                encoding="utf-8",
+            )
+            changed = True
+        return changed
+    except OSError as e:
+        sys.stderr.write(f"[runner] continuous pause write failed: {e}\n")
+        return False
+
+
+def _clear_continuous_pause() -> bool:
+    """Lift runner-managed pause. Only acts when CONTINUOUS_PAUSE_MARKER
+    is present — otherwise the PAUSE_MARKER was set by the operator and
+    we leave it alone. Returns True when the pause state changed."""
+    if not CONTINUOUS_PAUSE_MARKER.is_file():
+        return False
+    changed = False
+    try:
+        if PAUSE_MARKER.is_file():
+            PAUSE_MARKER.unlink()
+            changed = True
+    except OSError:
+        pass
+    try:
+        CONTINUOUS_PAUSE_MARKER.unlink()
+        changed = True
+    except OSError:
+        pass
+    return changed
+
+
+_LAST_FACTORY_RECONCILE_AT: float = 0.0
+FACTORY_RECONCILE_INTERVAL_SEC = 30.0
+
+
+def _reconcile_continuous_mode() -> None:
+    """Bridge API factory state → local bash-loop pause marker.
+
+    Pulls GET /factory/status and translates the result into
+    factory.paused presence/absence so flipping continuous_mode on the
+    dashboard actually halts (or releases) the local cycle loop.
+
+    Throttled to FACTORY_RECONCILE_INTERVAL_SEC so we don't hammer the
+    API every poll. Best-effort — a 5xx / network error just leaves
+    the local state untouched until next tick.
+    """
+    global _LAST_FACTORY_RECONCILE_AT
+    now = time.time()
+    if now - _LAST_FACTORY_RECONCILE_AT < FACTORY_RECONCILE_INTERVAL_SEC:
+        return
+    _LAST_FACTORY_RECONCILE_AT = now
+
+    snap = _request("GET", "/factory/status")
+    if not isinstance(snap, dict):
+        return
+
+    continuous_mode = bool(snap.get("continuous_mode"))
+    desired = (snap.get("desired_status") or "").strip().lower()
+    actual = (snap.get("status") or "").strip().lower()
+
+    # The dashboard's intent: if Continuous is OFF, the operator wants
+    # the loop to stop after the current cycle. desired_status reflects
+    # the same intent more directly when the operator explicitly
+    # paused/stopped.
+    want_paused = (not continuous_mode) or desired in {"paused", "idle"}
+
+    if want_paused:
+        if _set_continuous_pause(
+            reason=f"continuous_mode={continuous_mode} desired={desired} actual={actual}"
+        ):
+            _log_event(
+                f"factory bridge · pause applied (continuous={continuous_mode}, "
+                f"desired={desired})"
+            )
+    else:
+        if _clear_continuous_pause():
+            _log_event(
+                f"factory bridge · pause lifted (continuous={continuous_mode}, "
+                f"desired={desired})"
+            )
 
 
 def _expected_qa_report_paths() -> tuple[Path, Path | None]:
@@ -2955,6 +3098,100 @@ def _h_operator_fix_and_publish(payload: dict) -> tuple[bool, str]:
 
 OPERATOR_REQUEST_MAX_CHARS = 6000
 
+# How long _h_operator_request will pause the bash factory loop and
+# wait for an in-flight cycle to wrap before giving up. Operator
+# requests have priority over cycles, but we still respect any cycle
+# that's mid-stage so the working tree doesn't tear.
+OPERATOR_REQUEST_PAUSE_WAIT_SEC = float(
+    os.environ.get("LOCAL_RUNNER_OPERATOR_PAUSE_WAIT_SEC", "300") or "300"
+)
+# Cap on the operator_fix_state log array so heartbeat metadata stays
+# small. The newest WATCHDOG_LOG_CAP-sized window is what the dashboard
+# renders.
+OPERATOR_REQUEST_LOG_CAP = 30
+
+
+def _op_emit(
+    *,
+    kind: str,
+    message: str,
+    severity: str = "info",
+    diagnostic_code: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Append a structured event to operator_fix_state.json.log[] and
+    drop a parallel line into local_factory.log so System Log via
+    log_tail picks it up immediately. Each entry's `message` is
+    keyword-classifier-friendly (e.g. "Claude command started",
+    "validation passed", "git push completed") so the dashboard
+    automatically buckets it into Claude / Build / Git / Error.
+    """
+    cur = _read_operator_fix_state() or {}
+    log = list(cur.get("log") or [])
+    entry = {
+        "at": _utc_now_z(),
+        "kind": kind,
+        "message": message,
+        "severity": severity,
+        "diagnostic_code": diagnostic_code,
+    }
+    if extra:
+        entry["payload"] = extra
+    log.append(entry)
+    cur["log"] = log[-OPERATOR_REQUEST_LOG_CAP:]
+    _save_operator_fix_state(cur)
+    _log_event(f"operator_request · {kind} · {message}")
+
+
+def _op_save_diagnostics(
+    diagnostic_code: str,
+    *,
+    failed_stage: str | None,
+    failed_reason: str,
+    suggested_action: str,
+    extra: dict | None = None,
+) -> None:
+    """Mirror command_diagnostics.json with the structured codes the
+    spec calls out (factory_running_blocked / claude_not_started /
+    claude_process_failed / validation_failed / git_push_failed /
+    no_changes). The dashboard's command_diagnostics block already
+    surfaces these without further changes."""
+    payload = {
+        "last_command": "operator_request",
+        "status": "failed" if diagnostic_code != "no_changes" else "warning",
+        "failed_stage": failed_stage,
+        "diagnostic_code": diagnostic_code,
+        "failed_reason": failed_reason,
+        "suggested_action": suggested_action,
+        "occurred_at": _utc_now_z(),
+    }
+    if extra:
+        payload.update(extra)
+    _save_command_diagnostics(payload)
+
+
+def _wait_for_factory_idle(timeout_sec: float) -> tuple[bool, str]:
+    """Poll factory_state.json until status leaves "running" or the
+    timeout expires. Returns (ok, last_status). The caller has
+    already written PAUSE_MARKER so the bash loop won't start a new
+    cycle — we're only waiting for the current one to wrap.
+
+    Returns ok=True even when status is "skipped"/"docs_only"/"failed":
+    those are all "cycle wrapped, working tree settled". Only a
+    timeout returns False.
+    """
+    poll_interval = 5.0
+    waited = 0.0
+    last_status = ""
+    while waited < timeout_sec:
+        st = (_read_factory_state() or {}).get("status") or ""
+        last_status = st
+        if st != "running":
+            return True, st
+        time.sleep(poll_interval)
+        waited += poll_interval
+    return False, last_status
+
 
 def _resolve_claude_command() -> list[str]:
     """Parse LOCAL_RUNNER_CLAUDE_COMMAND into argv. Empty/missing →
@@ -3052,12 +3289,26 @@ applied | committed | pushed | aborted | failed
 
 
 def _h_operator_request(payload: dict) -> tuple[bool, str]:
-    """Autonomous operator-request handler. Persists the request to
-    .runtime/operator_request.md and hands it off to Claude Code via
-    LOCAL_RUNNER_CLAUDE_COMMAND. Claude itself runs build/QA/commit/
-    push — the runner only enforces the cycle-not-running guard plus
-    a single-flight per-request lock via the operator_fix_state file
-    so two clicks from the dashboard can't double-fire.
+    """Autonomous operator-request handler.
+
+    Operator requests are user-driven commands and have priority over
+    the autonomous factory cycle. Flow:
+
+      1. Single-flight check (refuse a parallel request).
+      2. If a cycle is RUNNING, write the runner-managed pause marker,
+         flip API continuous_mode=false, and wait up to
+         OPERATOR_REQUEST_PAUSE_WAIT_SEC for the cycle to wrap. Only
+         report `factory_running_blocked` if the wait times out — never
+         simply because a cycle is in flight.
+      3. Persist the request, invoke Claude Code, and emit lifecycle
+         events to operator_fix_state.json.log[] at every step
+         (operator_request_received → claude_command_started →
+         claude_command_completed / failed → validation_started →
+         validation_passed / failed → commit_created → push_completed).
+      4. On any failure path, write structured command_diagnostics with
+         a diagnostic_code from {factory_running_blocked,
+         claude_not_started, claude_process_failed, validation_failed,
+         git_push_failed, no_changes}.
     """
     prompt_raw = (payload or {}).get("prompt") or (payload or {}).get("request") or ""
     if not isinstance(prompt_raw, str) or not prompt_raw.strip():
@@ -3066,20 +3317,6 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
     auto_cp_raw = (payload or {}).get("auto_commit_push", True)
     auto_commit_push = bool(auto_cp_raw) if not isinstance(auto_cp_raw, str) \
         else auto_cp_raw.strip().lower() in {"true", "1", "yes", "on"}
-
-    # Refuse to run while a cycle is mid-flight — Claude editing files
-    # under the cycle would corrupt both.
-    state = _read_factory_state() or {}
-    if state.get("status") == "running":
-        msg = "factory 사이클 실행 중 — operator_request 거부 (잠시 후 다시 시도)"
-        _save_operator_fix_state({
-            "status": "failed",
-            "started_at": _utc_now_z(),
-            "allow_publish": auto_commit_push,
-            "publish_status": "blocked",
-            "last_message": msg,
-        })
-        return False, msg
 
     # Single-flight: refuse a second operator_request while the first
     # is still in-flight. A double-click on the dashboard would
@@ -3091,22 +3328,15 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
             "이미 operator_request 가 실행 중입니다 — already_running. "
             "이전 요청이 끝난 뒤 다시 시도하세요."
         )
-        # Don't overwrite the running row's started_at; just stamp a
-        # rejection marker for the heartbeat consumers.
-        _save_operator_fix_state({
-            "last_message": msg,
-        })
+        _save_operator_fix_state({"last_message": msg})
         return False, msg
 
     started_at = _utc_now_z()
     request_redacted, redactions = _redact_request_text(prompt_raw)
     truncated = request_redacted.strip()[:OPERATOR_REQUEST_MAX_CHARS]
-    _write_operator_request_md(
-        truncated,
-        allow_publish=auto_commit_push,
-        priority="normal",
-        redactions=redactions,
-    )
+
+    # Reset operator_fix_state to "running" with an empty event log so
+    # the dashboard renders a fresh timeline for this request.
     _save_operator_fix_state({
         "status": "running",
         "request_path": str(OPERATOR_REQUEST_FILE),
@@ -3115,9 +3345,76 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         "priority": "operator_request",
         "redactions": redactions,
         "publish_status": "not_requested",
-        "last_message": "Claude CLI 호출 중 (operator_request)",
+        "last_message": "operator_request 수신",
         "changed_files": [],
+        "log": [],
     })
+    _op_emit(
+        kind="operator_request_received",
+        message="operator request received — Claude 작업 지시 수신",
+        extra={
+            "auto_commit_push": auto_commit_push,
+            "redactions": redactions,
+            "request_chars": len(truncated),
+        },
+    )
+
+    # Step A — make sure the factory cycle is not currently writing to
+    # the working tree. operator_request has priority over the cycle:
+    # we pause the bash loop AND flip API continuous_mode off, then
+    # wait for any in-flight cycle to wrap. Only a timeout earns the
+    # factory_running_blocked diagnostic — a cycle that wraps within
+    # the wait is treated as a clean handoff.
+    state = _read_factory_state() or {}
+    if state.get("status") == "running":
+        _op_emit(
+            kind="factory_pause_requested",
+            message="factory 사이클 실행 중 — pause + continuous_mode=false 적용 후 대기",
+            severity="warn",
+        )
+        _set_continuous_pause(reason="operator_request priority")
+        _admin_request("POST", "/factory/continuous", {"enabled": False})
+        ok_wait, last_status = _wait_for_factory_idle(
+            OPERATOR_REQUEST_PAUSE_WAIT_SEC
+        )
+        if not ok_wait:
+            msg = (
+                f"factory 사이클이 {int(OPERATOR_REQUEST_PAUSE_WAIT_SEC)}s 안에 "
+                f"끝나지 않음 (last_status={last_status}) — operator_request 보류"
+            )
+            _op_save_diagnostics(
+                "factory_running_blocked",
+                failed_stage="pause_and_wait",
+                failed_reason=msg,
+                suggested_action=(
+                    "factory 사이클이 끝난 뒤 다시 시도하거나, 운영자가 직접 "
+                    "factory를 stop 하세요."
+                ),
+            )
+            _op_emit(
+                kind="operator_request_blocked",
+                message=msg,
+                severity="error",
+                diagnostic_code="factory_running_blocked",
+            )
+            _save_operator_fix_state({
+                "status": "failed",
+                "publish_status": "blocked",
+                "last_message": msg,
+            })
+            return False, msg
+        _op_emit(
+            kind="factory_pause_confirmed",
+            message=f"factory 사이클 wrap 완료 (status={last_status}) — operator_request 진행",
+        )
+
+    # Step B — write request md and prepare prompt.
+    _write_operator_request_md(
+        truncated,
+        allow_publish=auto_commit_push,
+        priority="normal",
+        redactions=redactions,
+    )
 
     prompt = OPERATOR_REQUEST_PROMPT_TEMPLATE.format(
         request=truncated,
@@ -3135,9 +3432,14 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         )
     )
 
-    # Snapshot the diff BEFORE Claude runs so we can report what was
-    # touched even when Claude's final markdown is incomplete.
+    # Snapshot before — diff against this to know what Claude touched.
     before_changed = set(_git_changed_files())
+
+    _op_emit(
+        kind="claude_command_started",
+        message=f"Claude command started (timeout={int(timeout_sec)}s)",
+        extra={"argv0": argv[0] if argv else None},
+    )
 
     try:
         r = subprocess.run(
@@ -3149,6 +3451,21 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         )
     except subprocess.TimeoutExpired:
         msg = f"claude CLI timeout after {timeout_sec}s"
+        _op_save_diagnostics(
+            "claude_process_failed",
+            failed_stage="claude_subprocess",
+            failed_reason=msg,
+            suggested_action=(
+                "FACTORY_CLAUDE_OPERATOR_REQUEST_TIMEOUT_SEC 를 늘리거나, "
+                "요청 본문을 더 작게 쪼개서 다시 시도"
+            ),
+        )
+        _op_emit(
+            kind="claude_command_failed",
+            message=f"Claude command failed — {msg}",
+            severity="error",
+            diagnostic_code="claude_process_failed",
+        )
         _save_operator_fix_state({
             "status": "failed",
             "publish_status": "blocked",
@@ -3157,6 +3474,21 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         return False, msg
     except FileNotFoundError as e:
         msg = f"claude CLI 실행 실패: {e}"
+        _op_save_diagnostics(
+            "claude_not_started",
+            failed_stage="claude_subprocess",
+            failed_reason=msg,
+            suggested_action=(
+                "claude 바이너리가 PATH에 있는지 확인하거나, "
+                "LOCAL_RUNNER_CLAUDE_COMMAND 환경변수에 절대 경로를 지정하세요."
+            ),
+        )
+        _op_emit(
+            kind="claude_command_failed",
+            message=f"Claude command failed — {msg}",
+            severity="error",
+            diagnostic_code="claude_not_started",
+        )
         _save_operator_fix_state({
             "status": "failed",
             "publish_status": "blocked",
@@ -3174,6 +3506,23 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
     if r.returncode != 0:
         tail = out[-400:] if out else "(no output)"
         msg = f"claude CLI returncode={r.returncode}: {tail}"
+        _op_save_diagnostics(
+            "claude_process_failed",
+            failed_stage="claude_subprocess",
+            failed_reason=msg,
+            suggested_action=(
+                "Claude 출력 끝부분의 오류 메시지를 확인하고, 권한/디스크/네트워크 "
+                "오류면 해당 항목 수정 후 재시도"
+            ),
+            extra={"stderr_tail": _tail_text(r.stderr, 12)},
+        )
+        _op_emit(
+            kind="claude_command_failed",
+            message=f"Claude command failed — returncode={r.returncode}",
+            severity="error",
+            diagnostic_code="claude_process_failed",
+            extra={"stderr_tail": _tail_text(r.stderr, 12)},
+        )
         _save_operator_fix_state({
             "status": "failed",
             "publish_status": "blocked",
@@ -3182,32 +3531,176 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         })
         return False, msg
 
-    # Best-effort parse of Claude's structured tail. We only use this
-    # to label the operator_fix_state row — the runner did not run
-    # the commit itself, Claude did. The state file is the operator's
-    # rear-view mirror, not a gate.
+    _op_emit(
+        kind="claude_command_completed",
+        message=f"Claude command completed — 변경 파일 {len(new_or_changed)}개",
+        extra={"changed_files": new_or_changed[:30]},
+    )
+
+    # Step C — runner-side validation. Cheap: py_compile on changed
+    # *.py files. Web/JS validation stays Claude's responsibility (full
+    # npm build is too slow to run synchronously here).
+    _op_emit(
+        kind="validation_started",
+        message="validation started — runner py_compile pass",
+    )
+    py_targets = [f for f in new_or_changed if f.endswith(".py")]
+    validation_failed_files: list[str] = []
+    validation_message = ""
+    for rel in py_targets:
+        abs_path = REPO_ROOT / rel
+        if not abs_path.is_file():
+            continue
+        try:
+            r_v = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(abs_path)],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            validation_failed_files.append(rel)
+            validation_message += f"\n{rel}: validation invocation failed — {e}"
+            continue
+        if r_v.returncode != 0:
+            validation_failed_files.append(rel)
+            validation_message += (
+                f"\n{rel}:\n"
+                f"{_tail_text((r_v.stdout or '') + (r_v.stderr or ''), 6)}"
+            )
+
+    if validation_failed_files:
+        _op_save_diagnostics(
+            "validation_failed",
+            failed_stage="post_claude_validation",
+            failed_reason=(
+                f"py_compile 실패 ({len(validation_failed_files)}개): "
+                + ", ".join(validation_failed_files[:5])
+            ),
+            suggested_action="해당 파일의 syntax 오류를 수정한 뒤 다시 operator_request 실행",
+            extra={"failed_files": validation_failed_files},
+        )
+        _op_emit(
+            kind="validation_failed",
+            message=(
+                f"validation failed — py_compile 실패 "
+                f"{len(validation_failed_files)}개"
+            ),
+            severity="error",
+            diagnostic_code="validation_failed",
+            extra={"failed_files": validation_failed_files},
+        )
+        _save_operator_fix_state({
+            "status": "failed",
+            "publish_status": "blocked",
+            "changed_files": new_or_changed,
+            "last_message": (
+                f"runner-side py_compile 실패 ({len(validation_failed_files)}개)"
+                + (validation_message[:400] if validation_message else "")
+            ),
+        })
+        return False, "validation_failed"
+
+    _op_emit(
+        kind="validation_passed",
+        message=(
+            f"validation passed — py_compile {len(py_targets)}개 파일 통과"
+            if py_targets
+            else "validation passed — Python 변경 없음, 추가 검증 생략"
+        ),
+        severity="success",
+    )
+
+    # Step D — parse Claude's structured tail. Claude itself drives
+    # commit/push; we observe the markdown report and emit
+    # commit_created / push_completed events accordingly.
     pushed = bool(re.search(r"pushed to main\s*[:：]\s*yes", out, re.IGNORECASE))
+    commit_match = re.search(
+        r"commit\s+hash\s*[:：]\s*([0-9a-fA-F]{7,40})", out
+    )
+    commit_short = commit_match.group(1)[:8] if commit_match else None
     aborted = "aborted" in out.lower() or "거부" in out
+
+    if commit_short:
+        _op_emit(
+            kind="commit_created",
+            message=f"commit created — {commit_short}",
+            severity="success",
+            extra={"commit_hash": commit_short},
+        )
     if pushed:
-        status = "published"
-        publish_status = "published"
-    elif aborted:
-        status = "qa_failed"
-        publish_status = "blocked"
-    else:
-        status = "applied"
+        _op_emit(
+            kind="push_completed",
+            message="git push completed — origin/main",
+            severity="success",
+        )
+
+    # Step E — final classification + diagnostics for the no-changes /
+    # push-not-happened branches.
+    if not new_or_changed:
+        _op_save_diagnostics(
+            "no_changes",
+            failed_stage="post_claude",
+            failed_reason="Claude 가 working tree 를 변경하지 않았습니다.",
+            suggested_action=(
+                "요청 본문에 더 구체적인 수정 지시를 넣거나, 이미 적용된 변경이 "
+                "있는지 확인"
+            ),
+        )
+        _op_emit(
+            kind="operator_request_no_changes",
+            message="operator request — Claude 가 변경 없음으로 종료",
+            severity="warn",
+            diagnostic_code="no_changes",
+        )
         publish_status = "not_requested"
+        final_status = "applied"
+    elif aborted:
+        publish_status = "blocked"
+        final_status = "qa_failed"
+    elif auto_commit_push and not pushed and not aborted:
+        # Claude was authorized to push but didn't. Treat as a soft
+        # git_push_failed signal so the operator knows the change is
+        # sitting in the working tree without being committed.
+        _op_save_diagnostics(
+            "git_push_failed",
+            failed_stage="claude_commit_push",
+            failed_reason=(
+                "auto_commit_push=true 였지만 Claude 가 main 으로 push 하지 않았습니다."
+            ),
+            suggested_action=(
+                "Claude 응답의 거부 사유를 확인하고 publish_changes 로 직접 push "
+                "하거나, 변경을 수동 검토"
+            ),
+        )
+        _op_emit(
+            kind="git_push_failed",
+            message="git push failed — Claude 가 push 하지 않음",
+            severity="error",
+            diagnostic_code="git_push_failed",
+        )
+        publish_status = "blocked"
+        final_status = "applied"
+    elif pushed:
+        publish_status = "published"
+        final_status = "published"
+    else:
+        publish_status = "not_requested"
+        final_status = "applied"
 
     _save_operator_fix_state({
-        "status": status,
+        "status": final_status,
         "publish_status": publish_status,
         "changed_files": new_or_changed,
+        "last_commit_hash": commit_short,
         "last_message": (out[-400:] if out else "Claude 응답 없음"),
     })
 
     summary = (
-        f"operator_request 완료 (status={status}, "
-        f"changed_files={len(new_or_changed)})"
+        f"operator_request 완료 (status={final_status}, "
+        f"changed_files={len(new_or_changed)}, "
+        f"commit={commit_short or '—'}, push={'yes' if pushed else 'no'})"
     )
     return True, summary
 
@@ -3760,17 +4253,48 @@ def _watchdog_diagnose() -> dict:
 
 
 def _watchdog_action_pause_factory(reason: str) -> str:
-    """Write the pause marker the start script reads at next bounce.
-    Cheap and reversible — operator can resume via the dashboard."""
+    """Pause the factory at every level we can reach:
+
+    1. Local bash factory loop — write factory.paused marker (the loop
+       short-circuits before launching the next cycle.py).
+    2. Control Tower API — flip continuous_mode=false so the API
+       watchdog stops auto-restarting the orchestrator.
+    3. Control Tower API — request_stop so a currently-running cycle
+       wraps at the next checkpoint.
+
+    Best-effort: any individual leg failing leaves the others intact.
+    Returns a short status line for the watchdog event log.
+    """
+    parts: list[str] = []
     try:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         PAUSE_MARKER.write_text(
             f"watchdog auto-pause at {_utc_now_z()}: {reason}\n",
             encoding="utf-8",
         )
-        return "pause marker written"
+        # Mark this as runner-managed so the continuous-mode bridge can
+        # later lift the pause if the operator turns Continuous back on.
+        CONTINUOUS_PAUSE_MARKER.write_text(
+            f"watchdog auto-pause at {_utc_now_z()}: {reason}\n",
+            encoding="utf-8",
+        )
+        parts.append("pause marker written")
     except OSError as e:
-        return f"pause marker write failed: {e}"
+        parts.append(f"pause marker write failed: {e}")
+
+    cont = _admin_request("POST", "/factory/continuous", {"enabled": False})
+    if isinstance(cont, dict):
+        parts.append("api continuous_mode=false")
+    else:
+        parts.append("api continuous_mode flip failed")
+
+    stop = _admin_request("POST", "/factory/stop")
+    if isinstance(stop, dict):
+        parts.append("api stop requested")
+    else:
+        parts.append("api stop request failed")
+
+    return " · ".join(parts)
 
 
 def _watchdog_action_release_deploy_lock() -> str:
@@ -4583,6 +5107,7 @@ def _build_operator_fix_meta() -> dict:
             "publish_status": "not_requested",
             "last_message": None,
             "changed_files": [],
+            "log": [],
         }
 
     request_path = state.get("request_path") or str(OPERATOR_REQUEST_FILE)
@@ -4615,6 +5140,11 @@ def _build_operator_fix_meta() -> dict:
         "publish_status": state.get("publish_status") or "not_requested",
         "last_commit_hash": state.get("last_commit_hash"),
         "last_message": state.get("last_message"),
+        # Lifecycle event log written by _op_emit during operator_request.
+        # The dashboard's SystemLog reads this via cycleEventSynth so each
+        # operator_request shows operator_request_received → claude_*
+        # → validation_* → commit_created → push_completed.
+        "log": list(state.get("log") or [])[-OPERATOR_REQUEST_LOG_CAP:],
     }
 
 
@@ -5060,6 +5590,11 @@ def main() -> None:
         now = time.time()
         if now - last_heartbeat > HEARTBEAT_INTERVAL_SEC:
             heartbeat()
+            # Bridge API factory state → local PAUSE marker so the
+            # dashboard's "Continuous OFF" actually halts the bash
+            # factory loop. Throttled internally; safe to call every
+            # heartbeat tick.
+            _reconcile_continuous_mode()
             last_heartbeat = now
         cmd = claim_next()
         if cmd:

@@ -206,6 +206,15 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Operator Request lifecycle — events synthesized from
+  // operator_fix.log[]. Place these BEFORE the generic Claude/Git rules
+  // so the more specific phrases win.
+  [/operator\s+request\s+received/i,                        { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
+  [/operator\s+request\s+blocked/i,                         { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/operator\s+request\s+(—|-).*no\s+code\s+change/i,       { category: "Claude", actor: "claude", severity: "warn",    phase: "skipped"   }],
+  [/operator\s+request\s+(—|-).*factory\s+pause/i,          { category: "Runner", actor: "factory", severity: "warn",   phase: "info"      }],
+  [/git\s+push\s+failed/i,                                  { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+
   // Factory Watchdog (Doctor) — the runner's self-monitoring loop.
   // These come from cycleEventSynth.js synthesizing watchdog.log
   // entries into events. Specific phrases first so "watchdog auto

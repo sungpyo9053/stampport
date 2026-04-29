@@ -22,6 +22,7 @@ import {
   makeHandoffEvent,
   synthesizeCycleEvents,
   synthesizeDeployEvents,
+  synthesizeOperatorRequestEvents,
   synthesizeWatchdogEvents,
 } from "../utils/cycleEventSynth.js";
 
@@ -266,6 +267,7 @@ export default function ControlTowerPage() {
             ...synthesizeCycleEvents(runners),
             ...synthesizeDeployEvents(runners),
             ...synthesizeWatchdogEvents(runners),
+            ...synthesizeOperatorRequestEvents(runners),
             ...handoffLog,
           ]}
         />
