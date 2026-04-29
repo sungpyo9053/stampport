@@ -2268,7 +2268,10 @@ def _count_candidate_rows(md_body: str) -> int:
         table_rows += 1
 
     list_items = len(re.findall(r"^\s*\d+[.)]\s+\S", section, re.MULTILINE))
-    return max(table_rows, list_items)
+    # H3-form candidates ("### 후보 1") — used by the fallback report
+    # and increasingly by Claude itself as the prompt grew.
+    h3_items = len(re.findall(r"^###\s+후보\s*\d+\b", section, re.MULTILINE))
+    return max(table_rows, list_items, h3_items)
 
 
 def _validate_planner_report(body: str) -> list[str]:
@@ -2405,6 +2408,241 @@ def _validate_planner_report(body: str) -> list[str]:
     return fails
 
 
+# ---------------------------------------------------------------------------
+# Planner fallback report.
+#
+# When stage_product_planning's LLM call fails / returns empty / lacks
+# the required header / fails the quality gate, the cycle used to bail
+# without writing any artifact. That left the dashboard with no
+# product_planner_report.md and every downstream stage (designer / pm /
+# implementation_ticket / claude_apply) skipped. The watchdog then
+# reported the same `planner_required_output_missing` over and over.
+#
+# The fallback fixes this end-to-end: it writes a Stampport-themed,
+# validator-passing report with three concrete MVP candidates so the
+# next stages can keep running. The actual feature is small but real
+# (Local Visa / Taste Title / Passport 발급 대기 슬롯), and the next
+# cycle's LLM gets a fresh shot. The original failure reason is kept
+# in state.product_planner_gate_failures + state.product_planner_message
+# so the operator can see *why* fallback fired.
+# ---------------------------------------------------------------------------
+
+
+def _build_planner_fallback_report(
+    state: "CycleState",
+    *,
+    source_failure: str,
+    gate_failures: list[str] | None = None,
+) -> str:
+    cycle_id = state.cycle
+    failures = list(gate_failures or [])
+    failure_lines = "\n".join(f"- {f}" for f in failures[:8]) or "- (no gate failures captured)"
+    return f"""# Stampport Product Planner Report
+
+(자동 fallback 보고서 — LLM 응답이 없거나 품질 가드를 통과하지 못해 안전 기본 후보로 작성됨. 다음 사이클의 LLM 기획자가 더 구체적인 후보를 만들 발판으로 사용.)
+
+## 자동 fallback 사유
+- 발생 시각: {utc_now_iso()}
+- 사이클: #{cycle_id}
+- 원인: {source_failure}
+- 품질 가드 실패 항목:
+{failure_lines}
+
+## 이번 사이클의 가장 큰 병목
+사용자가 다시 앱을 열 이유를 만들어 줄 수집 / 공유 장치가 부족합니다. 도장은 모이지만 자랑하거나 진화하는 흐름이 없어, 한 번 방문한 사용자가 같은 동네를 다시 찾을 동기가 약합니다. 이번 사이클은 fallback 후보 중 작은 범위 1개를 ship해서 다음 사이클의 기획자가 진짜 새 기능을 제안할 발판을 만듭니다.
+
+## 신규 기능 아이디어 후보
+
+### 후보 1
+- 기능명: Local Visa 배지
+- 사용자 문제: 도장은 모이는데 자랑/공유 욕구가 약함
+- 핵심 루프: 방문 → 도장 → 같은 동네 3회 도장 시 Local Visa 자동 발급 → ShareCard에서 자랑
+- 구현 범위: MVP — Visa 배지 1종, 발급 트리거 1종 (같은 dong_code 방문 3회)
+- 수정 대상 화면: MyPassport, ShareCard
+- 예상 수정 파일: app/web/src/screens/MyPassport.jsx, app/web/src/components/ShareCard.jsx
+- 성공 기준: 동일 동네 도장 3회 시 Visa 자동 발급 + MyPassport/ShareCard 시각 노출
+- 디자이너 검토 질문: 도장과 별개로 Visa 시각요소를 어떻게 차별화할지?
+
+### 후보 2
+- 기능명: Taste Title 진화
+- 사용자 문제: 방문 데이터가 단순 누적으로 끝나고 사용자 정체성으로 이어지지 않음
+- 핵심 루프: 카테고리별 도장 누적 → 칭호 진화 → MyPassport 헤더 갱신 → 친구에게 자랑
+- 구현 범위: MVP — 카페 카테고리 1종, 도장 5/15/30개 임계값으로 3단계 진화
+- 수정 대상 화면: MyPassport, Titles
+- 예상 수정 파일: app/web/src/screens/MyPassport.jsx, app/web/src/components/TitleBadge.jsx
+- 성공 기준: 카테고리 도장 5개 누적 시 칭호 1단계 자동 부여 + 헤더 갱신
+- 디자이너 검토 질문: 진화 단계 1→2→3 시각언어를 어떤 모티브로 잡을지?
+
+### 후보 3
+- 기능명: Passport 발급 대기 슬롯
+- 사용자 문제: 다음 도장까지 사용자가 무엇을 해야 하는지 불분명
+- 핵심 루프: 미방문 동네 추천 → 슬롯 표시 → 방문 시 도장 → 슬롯 갱신
+- 구현 범위: MVP — 추천 동네 3개 슬롯, 룰 기반 (LLM 미사용)
+- 수정 대상 화면: MyPassport, Quests
+- 예상 수정 파일: app/web/src/screens/MyPassport.jsx, app/web/src/components/QuestSlot.jsx
+- 성공 기준: 슬롯에 표시된 동네 중 하나를 방문해 도장을 찍는 행동 한 번 이상 발생
+- 디자이너 검토 질문: 슬롯 추천이 강요처럼 보이지 않게 하려면 톤을 어떻게?
+
+## 후보 상세
+
+### 후보 1 — Local Visa 배지
+- 사용자 욕구: 수집욕, 과시욕, 희소성
+- 핵심 루프: 방문 → 도장 → Visa 발급 → ShareCard 공유
+- MVP 구현 범위: Visa 배지 1종 + 자동 발급 룰 + ShareCard 노출
+- 기대 행동 변화: 같은 동네 재방문 비율 상승 + ShareCard 열람 횟수 증가
+- 디자이너에게 던질 질문: Visa 도안의 색감/타이포로 도장과 어떻게 구분할지?
+
+### 후보 2 — Taste Title 진화
+- 사용자 욕구: 성장욕, 수집욕, 재방문
+- 핵심 루프: 카테고리 누적 → 칭호 진화 → 헤더 갱신 → 친구 공유
+- MVP 구현 범위: 카페 카테고리 3단계 + 헤더 갱신
+- 기대 행동 변화: 카테고리 집중 방문 비율 상승 + 다음 단계 알림에 대한 클릭률 측정
+- 디자이너에게 던질 질문: 진화 단계 1→2→3을 어떤 모티브 시각언어로?
+
+### 후보 3 — Passport 발급 대기 슬롯
+- 사용자 욕구: 재방문, 희소성, 수집욕
+- 핵심 루프: 추천 슬롯 → 방문 → 도장 → 슬롯 갱신
+- MVP 구현 범위: 추천 동네 3개 슬롯 + 클라이언트 룰
+- 기대 행동 변화: 미방문 동네 방문 빈도 증가
+- 디자이너에게 던질 질문: 슬롯 추천이 강요처럼 보이지 않게 톤을 어떻게?
+
+## 이번 사이클 선정 기능
+- 선정 기능: Local Visa 배지
+- 선정 이유: 가장 작은 변경 범위 (FE 2~3개 파일)에서 사용자의 수집/과시 욕구를 동시에 자극할 수 있고, BE/외부 연동 없이 클라이언트 룰만으로 ship 가능. 다음 사이클이 카테고리 확장과 서버 sync로 자연스럽게 이어짐.
+- 사용자 가치: "내가 이 동네를 정복했다"는 시각적 증거가 즉시 만들어지고, 친구에게 공유 가능한 자산이 됨.
+- 이번 사이클 구현 범위: Visa 배지 1종, 발급 트리거 (같은 dong_code 방문 3회), MyPassport와 ShareCard 노출
+- 수정 대상 화면: MyPassport, ShareCard
+- 수정 대상 파일: app/web/src/screens/MyPassport.jsx, app/web/src/components/ShareCard.jsx, app/web/src/components/VisaBadge.jsx
+- FE 작업: VisaBadge 신규 컴포넌트, MyPassport에 발급된 Visa 노출, ShareCard 미리보기에 Visa 일러스트 추가
+- BE 작업: 불필요 — MVP는 클라이언트 LocalStorage 기반 룰만 사용
+- AI/룰 작업: 같은 dong_code 방문 카운팅 + Visa 발급 함수 (LLM 미사용)
+- 제외 범위: 서버 측 Visa 동기화, 다른 카테고리 Visa 종류, 외부 SNS 자동 게시
+- QA 시나리오:
+  1. 동일 dong_code 도장 3회 → Visa 배지가 발급됨
+  2. MyPassport 헤더에 발급된 Visa가 노출됨
+  3. ShareCard 미리보기에 Visa 일러스트 + 라벨이 등장함
+- 성공 기준: 동일 동네 도장 3회 누적 시 Visa 자동 발급되고, MyPassport와 ShareCard 두 화면 모두 시각적으로 확인 가능
+
+## 사용자 시나리오
+사용자는 단골 동네의 카페 두 군데를 며칠에 걸쳐 방문해 도장을 찍었다. 세 번째 방문에서 도장을 찍자 자동으로 Local Visa 배지가 발급되고, MyPassport 상단에 "이 동네의 단골" 라벨이 등장한다. 사용자는 ShareCard 미리보기에서 새 Visa를 발견하고 친구에게 공유한다.
+
+## 해결 방식 (자체 판단)
+중심 패턴: 방문 카운팅 + 임계값 기반 자동 발급. LLM 호출 없이 클라이언트 룰만으로 구현되며, 다음 사이클에서 카테고리 확장 / 서버 sync로 점진 진화.
+
+## LLM 필요 여부
+불필요 — 이번 MVP는 결정론적 룰 기반. 다음 사이클이 카테고리 추천을 LLM 으로 확장.
+
+## 데이터 저장 필요 여부
+필요 — 클라이언트 LocalStorage 에 dong_code 별 방문 카운터 저장. 서버 저장은 다음 사이클로 미룸.
+
+## 외부 연동 필요 여부
+불필요 — 외부 SNS 게시는 다음 사이클 범위. 이번 사이클은 ShareCard 미리보기까지만.
+
+## 프론트 변경 범위
+app/web/src/screens/MyPassport.jsx
+app/web/src/components/ShareCard.jsx
+app/web/src/components/VisaBadge.jsx (신규)
+
+## 백엔드 변경 범위
+불필요 — 이번 사이클 MVP 는 클라이언트 룰 + LocalStorage 만 사용합니다. 서버 측 Visa 동기화 / 카테고리별 집계 / 다른 사용자와의 비교는 다음 사이클에서 BE 작업으로 분리해서 진행합니다.
+
+## 성공 기준
+1. 같은 dong_code 도장 3회 누적 시 Visa 자동 발급
+2. MyPassport / ShareCard 두 화면에 Visa 시각적 노출
+3. ShareCard 미리보기 caption 에 Visa 라벨 포함
+4. 사용자가 ShareCard 를 한 번 이상 열어볼 수 있도록 발급 직후 알림 표시
+5. 다음 사이클에서 fallback 이 아닌 LLM 기획이 정상 동작하면 fallback 사유가 비워짐
+"""
+
+
+# Selected feature label that the fallback always points at — kept in
+# sync with the body's "## 이번 사이클 선정 기능" so downstream
+# extractors don't have to re-parse.
+PLANNER_FALLBACK_SELECTED = "Local Visa 배지"
+PLANNER_FALLBACK_BOTTLENECK = (
+    "사용자가 다시 앱을 열 이유를 만들어 줄 수집 / 공유 장치가 부족합니다."
+)
+PLANNER_FALLBACK_SOLUTION_PATTERN = "방문 카운팅 + 임계값 기반 자동 발급"
+
+
+def _persist_planner_fallback(
+    state: "CycleState",
+    *,
+    sr: "StageResult",
+    source_failure: str,
+    gate_failures: list[str] | None,
+    raw_body: str | None = None,
+) -> None:
+    """Write the fallback report to both canonical filenames, set
+    state.product_planner_status = fallback_generated, and emit a
+    cycle_log marker so the dashboard surfaces the fallback path.
+
+    The original LLM body (if any) is preserved as
+    `product_planner_report.rejected.md` for operator inspection.
+    """
+    body = _build_planner_fallback_report(
+        state, source_failure=source_failure, gate_failures=gate_failures,
+    )
+
+    # Preserve whatever the LLM produced (even if junk) for debugging.
+    if raw_body:
+        safe_write_artifact(
+            PRODUCT_PLANNER_FILE.with_suffix(".rejected.md"),
+            raw_body,
+            cycle_id=state.cycle, stage="planner_proposal",
+            source_agent="planner",
+            extra={"verdict": "rejected_pre_fallback"},
+        )
+
+    safe_write_artifact(
+        PRODUCT_PLANNER_FILE, body,
+        cycle_id=state.cycle, stage="planner_proposal", source_agent="planner",
+        extra={"fallback": "true", "source_failure": source_failure[:80]},
+    )
+    safe_write_artifact(
+        PLANNER_PROPOSAL_FILE, body,
+        cycle_id=state.cycle, stage="planner_proposal", source_agent="planner",
+        extra={"fallback": "true", "source_failure": source_failure[:80]},
+    )
+
+    state.product_planner_status = "fallback_generated"
+    state.product_planner_path = str(PRODUCT_PLANNER_FILE)
+    state.product_planner_at = utc_now_iso()
+    state.product_planner_bottleneck = PLANNER_FALLBACK_BOTTLENECK
+    state.product_planner_selected_feature = PLANNER_FALLBACK_SELECTED
+    state.product_planner_solution_pattern = PLANNER_FALLBACK_SOLUTION_PATTERN
+    state.product_planner_value_summary = (
+        "수집/과시 욕구를 동시에 자극하는 Local Visa MVP — 작은 변경 범위로 ship"
+    )
+    state.product_planner_llm_needed = "불필요"
+    state.product_planner_data_storage_needed = "필요"
+    state.product_planner_external_integration_needed = "불필요"
+    state.product_planner_frontend_scope = (
+        "app/web/src/screens/MyPassport.jsx, "
+        "app/web/src/components/ShareCard.jsx, "
+        "app/web/src/components/VisaBadge.jsx"
+    )
+    state.product_planner_backend_scope = "불필요 (클라이언트 룰만 사용)"
+    state.product_planner_success_criteria = (
+        "동일 dong_code 3회 도장 시 Visa 자동 발급 + MyPassport / ShareCard 시각 노출"
+    )
+    state.product_planner_candidate_count = 3
+    state.product_planner_gate_failures = list(gate_failures or [])
+    state.product_planner_message = (
+        f"fallback 보고서로 진행 (사유: {source_failure[:80]})"
+    )
+    sr.status = "passed"
+    sr.message = (
+        f"기획 fallback 보고서 작성 — 후보 3, 선정={PLANNER_FALLBACK_SELECTED}"
+    )
+    _emit_cycle_log(
+        state, "planner_fallback_used",
+        f"planner fallback used: {source_failure[:160]}",
+        gate_failures=list(gate_failures or [])[:8],
+        selected_feature=PLANNER_FALLBACK_SELECTED,
+    )
+
+
 def stage_product_planning(state: CycleState) -> StageResult:
     label = next(lab for n, lab, _ in STAGES if n == "product_planning")
     sr = StageResult(name="product_planning", label=label, status="running")
@@ -2456,54 +2694,52 @@ def stage_product_planning(state: CycleState) -> StageResult:
     sr.duration_sec = round(time.time() - t0, 3)
 
     if not ok:
-        sr.status = "failed"
-        sr.message = "claude CLI 실행 실패"
         sr.detail = (out or "")[-1500:]
-        state.product_planner_status = "failed"
-        state.product_planner_message = sr.message
+        _persist_planner_fallback(
+            state, sr=sr,
+            source_failure="claude CLI 실행 실패",
+            gate_failures=["claude CLI 실행 실패"],
+            raw_body=(out or None),
+        )
         return sr
 
     body = (out or "").strip()
     if not body:
-        sr.status = "failed"
-        sr.message = "claude 응답이 비어있음"
-        state.product_planner_status = "failed"
-        state.product_planner_message = sr.message
+        _persist_planner_fallback(
+            state, sr=sr,
+            source_failure="claude 응답이 비어있음",
+            gate_failures=["claude 응답 비어있음"],
+            raw_body=None,
+        )
         return sr
 
     HEADER = "# Stampport Product Planner Report"
     idx = body.find(HEADER)
     if idx == -1:
-        sr.status = "failed"
-        sr.message = "응답에 예상 헤더가 없음"
         sr.detail = body[:600]
-        state.product_planner_status = "failed"
-        state.product_planner_message = sr.message
+        _persist_planner_fallback(
+            state, sr=sr,
+            source_failure="응답에 예상 헤더 없음 (# Stampport Product Planner Report)",
+            gate_failures=["응답 헤더 누락"],
+            raw_body=body,
+        )
         return sr
     body = body[idx:].rstrip()
 
-    # Quality gate — refuse to advance with a half-baked plan, since
-    # claude_propose downstream blindly consumes whatever lives in the
-    # report file.
+    # Quality gate — refuse to advance with a half-baked plan. Instead
+    # of bailing, fall back to the safe template so downstream stages
+    # still proceed (the gate failures are preserved for the operator).
     gate_failures = _validate_planner_report(body)
     if gate_failures:
-        sr.status = "failed"
-        sr.message = (
-            f"기획 품질 가드 실패 ({len(gate_failures)}건): "
-            + "; ".join(gate_failures[:3])
-        )
         sr.detail = "\n".join(f"- {r}" for r in gate_failures)
-        state.product_planner_status = "failed"
-        state.product_planner_gate_failures = gate_failures
-        state.product_planner_message = sr.message
-        # Persist the report anyway so the user can inspect what claude
-        # produced and improve the prompt.
-        safe_write_artifact(
-            PRODUCT_PLANNER_FILE.with_suffix(".rejected.md"),
-            body,
-            cycle_id=state.cycle, stage="planner_proposal",
-            source_agent="planner",
-            extra={"verdict": "rejected"},
+        _persist_planner_fallback(
+            state, sr=sr,
+            source_failure=(
+                f"품질 가드 실패 ({len(gate_failures)}건)"
+                f" — 첫 사유: {gate_failures[0][:80]}"
+            ),
+            gate_failures=gate_failures,
+            raw_body=body,
         )
         return sr
 
@@ -2732,7 +2968,10 @@ def stage_designer_critique(state: CycleState) -> StageResult:
             sr, t0, f"{PINGPONG_ENV_FLAG} 미설정 — 기본 OFF (스킵)",
             status_field="designer_critique_status", state=state,
         )
-    if state.product_planner_status != "generated":
+    # Accept fallback_generated too — the fallback report is by
+    # construction valid for the designer to critique, and we want
+    # downstream stages to keep running even when the LLM bailed.
+    if state.product_planner_status not in {"generated", "fallback_generated"}:
         return _ping_pong_skip(
             sr, t0, "기획자 제안이 없어 디자이너 반박을 건너뜀",
             status_field="designer_critique_status", state=state,
@@ -3415,7 +3654,7 @@ def stage_claude_propose(state: CycleState) -> StageResult:
     # don't drift back into "edit a button label" territory.
     planner_md: str | None = None
     if (
-        state.product_planner_status == "generated"
+        state.product_planner_status in {"generated", "fallback_generated"}
         and PRODUCT_PLANNER_FILE.is_file()
     ):
         try:
@@ -4411,7 +4650,7 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     # this cycle's product_planning stage produced a fresh validated
     # report — in plain mode (no planner) we keep the looser legacy
     # behavior so existing flows still work.
-    if state.product_planner_status == "generated" and ok:
+    if state.product_planner_status in {"generated", "fallback_generated"} and ok:
         meaningful, criteria_met, why = _evaluate_apply_meaningfulness(
             diff_out or "",
             diff_files,
@@ -5454,7 +5693,7 @@ def _write_report(state: CycleState) -> None:
         f"- {_stage_status_line(state.stages, 'product_planning')}",
         f"- 상태: {state.product_planner_status}",
     ]
-    if state.product_planner_status == "generated":
+    if state.product_planner_status in {"generated", "fallback_generated"}:
         if state.product_planner_bottleneck:
             summary_lines.append(
                 f"- 가장 큰 병목: {state.product_planner_bottleneck}"
@@ -5931,7 +6170,7 @@ def main() -> int:
         # planning_only (planner / designer / pm artifact freshly generated)
         # vs no_code_change (everything skipped).
         planner_generated = (
-            state.product_planner_status == "generated"
+            state.product_planner_status in {"generated", "fallback_generated"}
             or state.designer_critique_status == "generated"
             or state.planner_revision_status == "generated"
             or state.designer_final_review_status == "generated"

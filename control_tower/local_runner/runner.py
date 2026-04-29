@@ -5840,7 +5840,9 @@ def _pipeline_classify_stages(cycle_state: dict) -> tuple[str | None, str | None
     current: str | None = None
 
     def _gen(key: str) -> bool:
-        return (cycle_state.get(key) or "") == "generated"
+        # Accept both the strict LLM-generated state and the fallback
+        # report state — both produce a valid file on disk.
+        return (cycle_state.get(key) or "") in {"generated", "fallback_generated"}
 
     # File-presence fallback so a successful prior cycle whose state
     # got reset (e.g. cycle.py crashed mid-write) doesn't show up as
@@ -7494,7 +7496,7 @@ def _build_local_factory_meta() -> dict:
             # Whether Product Planner Mode produced something this run
             # OR has a leftover report from a prior run on disk.
             "enabled": (
-                state.get("product_planner_status") == "generated"
+                state.get("product_planner_status") in {"generated", "fallback_generated"}
                 or planner_exists
             ),
             "status": state.get("product_planner_status"),
