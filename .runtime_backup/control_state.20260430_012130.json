@@ -1,0 +1,61 @@
+{
+  "status": "ready_to_publish",
+  "summary": "code shipped + qa passed — commit/push required",
+  "diagnostic_code": "publish_required",
+  "failed_stage": null,
+  "blocking_reason": "commit/push required — publish_changes / deploy_to_server 명령 대기",
+  "next_action": "코드 변경 + QA 통과 — commit/push 만 남음. deploy_to_server (또는 publish_changes) 명령으로 배포 진행.",
+  "should_stop_continuous": false,
+  "updated_at": "2026-04-29T16:20:36.735341Z",
+  "factory_status_raw": "planning_only",
+  "source_updated_at": {
+    "factory_state": "2026-04-29T15:25:56.184115Z",
+    "publish_state": "2026-04-27T17:39:21.893168Z",
+    "pipeline_state": "2026-04-29T16:20:36.659409Z",
+    "forward_progress_state": "2026-04-29T16:20:36.686221Z",
+    "agent_accountability": "2026-04-29T16:20:36.692493Z"
+  },
+  "stale_filtered": [],
+  "liveness": {
+    "runner_online": true,
+    "heartbeat_at": "2026-04-29T16:16:31.387205Z",
+    "runner_stale": false
+  },
+  "execution_kernel": {
+    "status": "healthy",
+    "operator_request_status": "noop_success",
+    "claude_started": true,
+    "last_failed_stage": null,
+    "last_error": null,
+    "stale_state_mismatch": false
+  },
+  "pipeline": {
+    "status": "progressing",
+    "current_stage": "git_commit",
+    "last_success_stage": "validation_qa",
+    "failed_stage": null,
+    "diagnostic_code": "no_changes_to_validate",
+    "required_output": null,
+    "required_output_exists": false,
+    "elapsed_sec": 0,
+    "stage_timeout_sec": 0
+  },
+  "agent_accountability": {
+    "status": "ready_to_publish",
+    "blocking_agent": "deploy",
+    "blocking_reason": "commit/push required — publish_changes / deploy_to_server 명령 대기",
+    "meaningful_change": true,
+    "implementation_ticket_exists": true
+  },
+  "deploy": {
+    "status": "ready",
+    "changed_files_count": 3,
+    "qa_status": "passed",
+    "last_failed_stage": null,
+    "commit_hash": null,
+    "push_status": "failed",
+    "actions_status": null,
+    "actions_conclusion": null,
+    "actions_run_url": null
+  }
+}
