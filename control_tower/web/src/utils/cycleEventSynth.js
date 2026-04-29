@@ -198,6 +198,71 @@ export function synthesizeDeployEvents(runners = []) {
 }
 
 // ---------------------------------------------------------------------------
+// Watchdog log → System Log events.
+//
+// The runner heartbeat carries a structured `watchdog.log` array at
+//   metadata.local_factory.watchdog.log
+// with entries like { at, kind, message, severity, diagnostic_code }.
+// Each kind maps to one of the `watchdog ...` keyword phrases the
+// eventClassifier recognizes (watchdog detected issue / watchdog auto
+// repair started / watchdog escalated / watchdog healthy …).
+//
+// Stable negative ids per (kind, at, message) so React keys don't
+// collide with API events or other synthetic streams.
+// ---------------------------------------------------------------------------
+
+const WATCHDOG_KIND_TO_PHRASE = {
+  watchdog_check_started:           "watchdog check started",
+  watchdog_check_completed:         "watchdog check completed",
+  watchdog_detected_issue:          "watchdog detected issue",
+  watchdog_auto_repair_started:     "watchdog auto repair started",
+  watchdog_auto_repair_step:        "watchdog auto repair step",
+  watchdog_auto_repair_completed:   "watchdog auto repair completed",
+  watchdog_auto_repair_skipped:     "watchdog auto repair skipped",
+  watchdog_escalated:               "watchdog escalated",
+  watchdog_disabled:                "watchdog disabled",
+  watchdog_healthy:                 "watchdog healthy",
+};
+
+function watchdogEntryId(entry) {
+  const seed = `wd|${entry.kind || ""}|${entry.at || ""}|${(entry.message || "").slice(0, 32)}`;
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+  return -1 - (Math.abs(h) % 2_000_000_000);
+}
+
+export function synthesizeWatchdogEvents(runners = []) {
+  const out = [];
+  for (const r of runners) {
+    const log = r?.metadata_json?.local_factory?.watchdog?.log;
+    if (!Array.isArray(log) || log.length === 0) continue;
+    for (const entry of log) {
+      if (!entry || !entry.kind) continue;
+      const phrase = WATCHDOG_KIND_TO_PHRASE[entry.kind] || entry.kind;
+      const baseMsg = entry.message || phrase;
+      const lc = baseMsg.toLowerCase();
+      const message = lc.includes("watchdog") ? baseMsg : `${phrase} — ${baseMsg}`;
+      out.push({
+        id: watchdogEntryId(entry),
+        type: entry.severity === "error" ? "error" : "agent_message",
+        message,
+        payload: {
+          source: "watchdog",
+          kind: entry.kind,
+          severity: entry.severity,
+          diagnostic_code: entry.diagnostic_code,
+          ...(entry.payload || {}),
+        },
+        created_at: entry.at,
+        agent_id: null,
+        task_id: null,
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // In-page handoff events. AgentRouteLayer calls back when a card
 // starts/finishes its trip; ControlTowerPage funnels those through this
 // helper before merging into the SystemLog.

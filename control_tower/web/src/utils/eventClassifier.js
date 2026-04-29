@@ -157,6 +157,7 @@ export const SYSTEM_LOG_CATEGORIES = [
   "QA",
   "Git",
   "Deploy",
+  "Doctor",
   "Error",
 ];
 
@@ -205,6 +206,20 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Factory Watchdog (Doctor) — the runner's self-monitoring loop.
+  // These come from cycleEventSynth.js synthesizing watchdog.log
+  // entries into events. Specific phrases first so "watchdog auto
+  // repair completed" doesn't get swallowed by a more generic match.
+  [/watchdog\s+escalated/i,                                { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/watchdog\s+auto\s+repair\s+(failed|error)/i,           { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/watchdog\s+auto\s+repair\s+skipped/i,                  { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
+  [/watchdog\s+auto\s+repair\s+started/i,                  { category: "Doctor", actor: "system", severity: "warn",    phase: "started"   }],
+  [/watchdog\s+auto\s+repair\s+completed/i,                { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/watchdog\s+detected\s+issue/i,                         { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+  [/watchdog\s+healthy/i,                                  { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/watchdog\s+disabled/i,                                 { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
+  [/watchdog\s+check\s+(started|completed)/i,              { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
+
   // Claude lifecycle.
   [/claude\s+apply\s+started/i,                           { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
   [/claude\s+apply\s+changed\s+files/i,                   { category: "Claude", actor: "claude", severity: "success", phase: "completed" }],

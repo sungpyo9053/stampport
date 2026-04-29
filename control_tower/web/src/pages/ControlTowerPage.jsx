@@ -7,6 +7,7 @@ import PipelineTimeline from "../components/PipelineTimeline.jsx";
 import OperatorCommandPanel from "../components/OperatorCommandPanel.jsx";
 import SystemLogPanel from "../components/SystemLogPanel.jsx";
 import CycleEffectivenessPanel from "../components/CycleEffectivenessPanel.jsx";
+import WatchdogPanel from "../components/WatchdogPanel.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -21,6 +22,7 @@ import {
   makeHandoffEvent,
   synthesizeCycleEvents,
   synthesizeDeployEvents,
+  synthesizeWatchdogEvents,
 } from "../utils/cycleEventSynth.js";
 
 const POLL_MS = 1500;
@@ -263,6 +265,7 @@ export default function ControlTowerPage() {
             ...events,
             ...synthesizeCycleEvents(runners),
             ...synthesizeDeployEvents(runners),
+            ...synthesizeWatchdogEvents(runners),
             ...handoffLog,
           ]}
         />
@@ -288,6 +291,7 @@ export default function ControlTowerPage() {
         </div>
 
         <aside className="flex flex-col gap-3">
+          <WatchdogPanel runners={runners} />
           <CycleEffectivenessPanel runners={runners} />
           <PingPongBoard events={events} runners={runners} />
           <ArtifactBoard events={events} factory={factory} />

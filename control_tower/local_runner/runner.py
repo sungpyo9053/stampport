@@ -200,6 +200,18 @@ STATUS_SCRIPT = _env("LOCAL_FACTORY_STATUS_SCRIPT", default=str(REPO_ROOT / "scr
 POLL_INTERVAL_SEC = float(_env("LOCAL_RUNNER_POLL_INTERVAL", default="3.0"))
 HEARTBEAT_INTERVAL_SEC = float(_env("LOCAL_RUNNER_HEARTBEAT_INTERVAL", default="15.0"))
 
+# Factory Watchdog state file. Written by the watchdog thread, read by
+# heartbeat builders. Off by default — must be opted in via
+# FACTORY_WATCHDOG_ENABLED=true.
+WATCHDOG_STATE_FILE = RUNTIME_DIR / "factory_watchdog.json"
+# How many entries the watchdog keeps in its rolling event log on disk.
+WATCHDOG_LOG_CAP = 30
+# Minimum gap between auto-triggered smoke tests. The smoke test
+# commits + pushes a single line to docs/factory-smoke-test.md so the
+# operator can confirm "git push works end-to-end" without invoking
+# Claude.
+WATCHDOG_SMOKE_TEST_COOLDOWN_SEC = 30 * 60
+
 _running = True
 
 # Process identity, captured once at boot. RUNNER_STARTED_AT lets the
@@ -3283,6 +3295,854 @@ def _record_command_result(name: str, cid: int, ok: bool, message: str) -> None:
     _INFLIGHT_COMMAND = None
 
 
+# ---------------------------------------------------------------------------
+# Factory Watchdog
+#
+# Periodic self-monitor that reads the same state files the dashboard
+# reads (factory_state.json, factory_publish.json, operator_fix_state.json,
+# qa_diagnostics.json, command_diagnostics.json), classifies the factory
+# health into a diagnostic_code, and — when the operator opted in via
+# FACTORY_WATCHDOG_ENABLED=true — performs a small set of *safe* auto
+# repairs (pause factory, clear stale deploy lock, reset deploy_progress,
+# rerun smoke test).
+#
+# Bounded by:
+#   - per-diagnostic cooldown (FACTORY_WATCHDOG_REPAIR_COOLDOWN_SEC,
+#     default 600s) so the same fix doesn't loop every tick.
+#   - max-repeat (FACTORY_WATCHDOG_MAX_REPEAT, default 3) — after that
+#     the watchdog status flips to "broken" and refuses further auto
+#     repairs until an operator clears it.
+#   - smoke-test cooldown (WATCHDOG_SMOKE_TEST_COOLDOWN_SEC, 30 min) so
+#     the runner can't pile commits onto the repo.
+#
+# Hard exclusions (never auto-run, only suggested to the operator):
+#   git reset --hard, git clean, force push, .env / nginx / systemd /
+#   DB / production-file edits, arbitrary code edits.
+# ---------------------------------------------------------------------------
+
+import threading
+
+_WATCHDOG_THREAD: "threading.Thread | None" = None
+_WATCHDOG_STOP = threading.Event()
+_WATCHDOG_LAST_REPAIR_AT: dict[str, float] = {}
+_WATCHDOG_REPEAT_COUNT: dict[str, int] = {}
+_WATCHDOG_LAST_SMOKE_AT: float = 0.0
+_WATCHDOG_LOG_LOCK = threading.Lock()
+
+
+def _watchdog_env_enabled() -> bool:
+    v = os.environ.get("FACTORY_WATCHDOG_ENABLED", "false").strip().lower()
+    return v in {"true", "1", "yes", "on"}
+
+
+def _watchdog_interval_sec() -> float:
+    try:
+        return max(15.0, float(os.environ.get("FACTORY_WATCHDOG_INTERVAL_SEC", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _watchdog_stuck_command_sec() -> float:
+    try:
+        return max(60.0, float(os.environ.get("FACTORY_WATCHDOG_STUCK_COMMAND_SEC", "600")))
+    except ValueError:
+        return 600.0
+
+
+def _watchdog_repair_cooldown_sec() -> float:
+    try:
+        return max(60.0, float(os.environ.get("FACTORY_WATCHDOG_REPAIR_COOLDOWN_SEC", "600")))
+    except ValueError:
+        return 600.0
+
+
+def _watchdog_max_repeat() -> int:
+    try:
+        return max(1, int(os.environ.get("FACTORY_WATCHDOG_MAX_REPEAT", "3")))
+    except ValueError:
+        return 3
+
+
+def _read_watchdog_state() -> dict:
+    if not WATCHDOG_STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(WATCHDOG_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_watchdog_state(state: dict) -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        WATCHDOG_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write watchdog state: {e}\n")
+
+
+def _watchdog_log_event(
+    state: dict,
+    *,
+    kind: str,
+    message: str,
+    severity: str = "info",
+    diagnostic_code: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """Append a watchdog event to both .runtime/local_factory.log (for
+    operators tailing the file) and the in-memory log array on the state
+    dict. The state dict is the caller's working copy — they persist
+    after this returns."""
+    now = _utc_now_z()
+    entry = {
+        "at": now,
+        "kind": kind,
+        "message": message,
+        "severity": severity,
+        "diagnostic_code": diagnostic_code,
+    }
+    if extra:
+        entry["payload"] = extra
+    log = list(state.get("log") or [])
+    log.append(entry)
+    state["log"] = log[-WATCHDOG_LOG_CAP:]
+    # Also drop into local_factory.log so System Log via _log_tail picks
+    # it up even before the heartbeat reaches the API.
+    _log_event(f"watchdog · {kind} · {message}")
+    return entry
+
+
+# --- Diagnosis helpers ------------------------------------------------------
+
+
+def _watchdog_command_inflight_age_sec() -> float | None:
+    """Returns seconds the current command has been running, or None if
+    no command is in flight."""
+    cur = _INFLIGHT_COMMAND
+    if not cur:
+        return None
+    started = float(cur.get("started_at") or 0.0)
+    if started <= 0:
+        return None
+    return max(0.0, time.time() - started)
+
+
+def _watchdog_recent_deploy_failures(publish_state: dict) -> int:
+    dp = publish_state.get("deploy_progress") or {}
+    prev = list(dp.get("previous_attempts") or [])
+    failed = sum(1 for a in prev if (a or {}).get("status") == "failed")
+    if (dp.get("status") == "failed"):
+        failed += 1
+    return failed
+
+
+def _watchdog_recent_operator_failures(operator_state: dict) -> int:
+    """The runner only persists the *last* operator_request outcome, so
+    we can't count history straight from disk. Use the in-memory
+    _LAST_COMMAND_RESULT for the operator_request slot when present, and
+    treat a current `failed` row as 1."""
+    n = 0
+    if (operator_state.get("status") in {"failed", "qa_failed"}):
+        n += 1
+    last = _LAST_COMMAND_RESULT.get("operator_request")
+    if last and last.get("ok") is False:
+        # Don't double-count if it's the same as operator_state — but we
+        # can't tell for sure. One fail is enough to surface a warning.
+        pass
+    return n
+
+
+def _watchdog_cycle_loop_count(cycle_state: dict, kinds: set[str]) -> int:
+    """How many of the trailing cycle_log entries match `kinds`."""
+    log = cycle_state.get("cycle_log") or []
+    if not isinstance(log, list):
+        return 0
+    n = 0
+    for entry in reversed(log):
+        if not isinstance(entry, dict):
+            break
+        if entry.get("kind") in kinds:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _watchdog_factory_idle_sec(cycle_state: dict) -> float | None:
+    """Seconds since the factory state was last updated. Returns None
+    when there's no timestamp to compare against."""
+    iso = cycle_state.get("updated_at") or cycle_state.get("finished_at")
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        ts = datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return max(0.0, (datetime.utcnow() - ts).total_seconds())
+
+
+def _watchdog_diagnose() -> dict:
+    """Read the on-disk state files and classify the factory's health
+    into one diagnostic_code. Returns the structured result the spec
+    requires:
+
+      {
+        "diagnostic_code": str,
+        "severity": "info" | "warning" | "error",
+        "root_cause": str,
+        "evidence": list[str],
+        "safe_auto_fix_available": bool,
+        "suggested_action": str,
+      }
+    """
+    cycle_state = _read_factory_state() or {}
+    publish_state = _read_publish_state() or {}
+    operator_state = _read_operator_fix_state() or {}
+    qa_diag = _read_qa_diagnostics() or {}
+    cmd_diag = _read_command_diagnostics() or {}
+
+    evidence: list[str] = []
+
+    # 1. current_command_stuck — the runner is sitting on a single
+    # command well past the stuck threshold. Detected only when the
+    # watchdog runs in a separate thread; in main-loop mode, the global
+    # is None while _execute() blocks.
+    age = _watchdog_command_inflight_age_sec()
+    if age is not None and age > _watchdog_stuck_command_sec():
+        cur = _INFLIGHT_COMMAND or {}
+        return {
+            "diagnostic_code": "current_command_stuck",
+            "severity": "error",
+            "root_cause": (
+                f"명령 `{cur.get('name')}` (cid={cur.get('cid')}) 가 "
+                f"{int(age)}s 째 진행 중 — stuck threshold 초과"
+            ),
+            "evidence": [f"inflight_age_sec={int(age)}"],
+            "safe_auto_fix_available": True,
+            "suggested_action": (
+                "deploy_progress 를 failed 로 정리하고 deploy lock 해제. "
+                "필요 시 운영자가 runner 재시작."
+            ),
+        }
+
+    # 2. duplicate_deploy_commands — same deploy_to_server cid landing
+    # within the dedupe window OR multiple recent attempts piling up.
+    dp = publish_state.get("deploy_progress") or {}
+    prev_attempts = list(dp.get("previous_attempts") or [])
+    if dp.get("is_active") and len(prev_attempts) >= 2:
+        recent_active_age = (
+            time.time()
+            - (datetime.strptime(
+                (dp.get("started_at") or _utc_now_z())[:19],
+                "%Y-%m-%dT%H:%M:%S",
+            ).timestamp())
+        ) if dp.get("started_at") else 0
+        if recent_active_age > _watchdog_stuck_command_sec():
+            evidence.append(f"deploy_progress.is_active=true age={int(recent_active_age)}s")
+            evidence.append(f"previous_attempts={len(prev_attempts)}")
+            return {
+                "diagnostic_code": "duplicate_deploy_commands",
+                "severity": "warning",
+                "root_cause": (
+                    "deploy_progress 가 활성 상태로 멈춰 있고 직전 시도가 "
+                    f"{len(prev_attempts)}건 — 큐에 중복 명령이 끼었을 가능성"
+                ),
+                "evidence": evidence,
+                "safe_auto_fix_available": True,
+                "suggested_action": "deploy lock 해제 + deploy_progress 초기화",
+            }
+
+    # 3. deploy_failed_repeatedly — last 3 deploy attempts failed.
+    failed_recent = _watchdog_recent_deploy_failures(publish_state)
+    if failed_recent >= 3:
+        evidence.append(f"recent_deploy_failures={failed_recent}")
+        evidence.append(
+            f"last_failed_reason={dp.get('failed_reason') or 'unknown'}"
+        )
+        return {
+            "diagnostic_code": "deploy_failed_repeatedly",
+            "severity": "error",
+            "root_cause": (
+                f"최근 deploy 시도 {failed_recent}건 실패 — 사이클을 일시정지하고 "
+                "운영자가 원인 확인 필요"
+            ),
+            "evidence": evidence,
+            "safe_auto_fix_available": True,
+            "suggested_action": "factory pause + deploy lock 해제. 위험 조치는 운영자 확인 필요.",
+        }
+
+    # 4. operator_request_failed_repeatedly — operator_fix_state shows
+    # a failed run AND the last command_diagnostics row references the
+    # same.
+    if (
+        operator_state.get("status") in {"failed", "qa_failed"}
+        and (operator_state.get("last_message") or "")
+    ):
+        last_msg = operator_state.get("last_message") or ""
+        evidence.append(f"operator_status={operator_state.get('status')}")
+        evidence.append(f"operator_last_message={last_msg[:120]}")
+        # Detect "claude not started" — a sub-case worth its own code.
+        if (
+            "claude" in last_msg.lower()
+            and ("실행 실패" in last_msg or "FileNotFound" in last_msg
+                 or "not found" in last_msg.lower())
+        ):
+            return {
+                "diagnostic_code": "claude_not_started",
+                "severity": "error",
+                "root_cause": "Claude CLI 가 실행되지 않음 — 환경 변수 / PATH 확인 필요",
+                "evidence": evidence,
+                "safe_auto_fix_available": False,
+                "suggested_action": (
+                    "LOCAL_RUNNER_CLAUDE_COMMAND 환경 변수 / claude CLI 설치 상태 확인. "
+                    "smoke test 로 commit/push 파이프라인은 별도 검증 가능."
+                ),
+            }
+        return {
+            "diagnostic_code": "operator_request_failed_repeatedly",
+            "severity": "warning",
+            "root_cause": "operator_request 가 최근 실패 상태로 남아 있음",
+            "evidence": evidence,
+            "safe_auto_fix_available": True,
+            "suggested_action": "smoke test 실행으로 commit/push 파이프라인 점검",
+        }
+
+    # 5. qa_gate_stuck — qa_diagnostics says the gate is broken in a
+    # specific way (path mismatch / report missing after run).
+    qa_code = (qa_diag.get("diagnostic_code") or "").strip()
+    if qa_code in {
+        "qa_report_missing_after_run",
+        "qa_report_path_mismatch",
+        "qa_exception_before_report",
+    }:
+        evidence.append(f"qa_diagnostic_code={qa_code}")
+        if qa_diag.get("failed_command"):
+            evidence.append(f"failed_command={qa_diag.get('failed_command')}")
+        return {
+            "diagnostic_code": "qa_gate_stuck",
+            "severity": "error",
+            "root_cause": f"QA Gate diagnostic={qa_code}",
+            "evidence": evidence,
+            "safe_auto_fix_available": False,
+            "suggested_action": (
+                qa_diag.get("suggested_action")
+                or "QA Gate 경로/환경 점검 — runner.py 와 cycle.py 의 RUNTIME 경로 일치 여부 확인"
+            ),
+        }
+
+    # 6. qa_report_missing_repeatedly — QA decided multiple times that
+    # the report was missing before run.
+    if qa_code == "qa_report_missing_before_run":
+        evidence.append(f"qa_diagnostic_code={qa_code}")
+        return {
+            "diagnostic_code": "qa_report_missing_repeatedly",
+            "severity": "warning",
+            "root_cause": "QA report가 매번 누락 — cycle.py 의 stage_qa_gate 가 실행되지 않거나 경로 불일치",
+            "evidence": evidence,
+            "safe_auto_fix_available": False,
+            "suggested_action": "factory_state.json 의 qa_status 확인, 필요 시 cycle 재시작",
+        }
+
+    # 7. planning_only_loop / no_code_change_loop — cycle_log shows
+    # repeated planning-only or no-code-change cycles.
+    planning_n = _watchdog_cycle_loop_count(cycle_state, {"cycle_planning_only"})
+    if planning_n >= 3:
+        evidence.append(f"trailing_planning_only_cycles={planning_n}")
+        return {
+            "diagnostic_code": "planning_only_loop",
+            "severity": "warning",
+            "root_cause": f"최근 사이클 {planning_n}회 연속 planning_only — 코드 변경이 발생하지 않음",
+            "evidence": evidence,
+            "safe_auto_fix_available": True,
+            "suggested_action": "factory pause + 운영자가 product_planner_report.md / pm_decision.md 확인",
+        }
+    nochange_n = _watchdog_cycle_loop_count(
+        cycle_state,
+        {"cycle_produced_no_code_change", "cycle_produced_docs_only"},
+    )
+    if nochange_n >= 3:
+        evidence.append(f"trailing_no_code_change_cycles={nochange_n}")
+        return {
+            "diagnostic_code": "no_code_change_loop",
+            "severity": "warning",
+            "root_cause": f"최근 사이클 {nochange_n}회 연속 코드 변경 없음",
+            "evidence": evidence,
+            "safe_auto_fix_available": True,
+            "suggested_action": "factory pause + 운영자가 implementation_ticket / claude_apply 결과 확인",
+        }
+
+    # 8. github_actions_not_triggered — last deploy reached
+    # actions_triggered but failed_at_status indicates push didn't go
+    # through.
+    if dp.get("status") == "failed" and dp.get("failed_stage") == "actions_dispatch":
+        evidence.append("deploy_progress.failed_stage=actions_dispatch")
+        return {
+            "diagnostic_code": "github_actions_not_triggered",
+            "severity": "warning",
+            "root_cause": "deploy push 는 됐지만 GitHub Actions trigger 가 실패",
+            "evidence": evidence,
+            "safe_auto_fix_available": False,
+            "suggested_action": "GitHub repo 의 Actions 탭 확인 — 워크플로우 활성 상태 / 최근 실행 점검",
+        }
+
+    # 9. git_dirty_unpublished — working tree dirty but no recent push.
+    dirty = _git_changed_files()
+    if dirty:
+        last_push_at_iso = publish_state.get("last_push_at")
+        last_push_age = None
+        if last_push_at_iso:
+            try:
+                ts = datetime.strptime(last_push_at_iso[:19], "%Y-%m-%dT%H:%M:%S")
+                last_push_age = (datetime.utcnow() - ts).total_seconds()
+            except ValueError:
+                last_push_age = None
+        if last_push_age is None or last_push_age > 6 * 3600:
+            evidence.append(f"dirty_files={len(dirty)}")
+            evidence.append(f"last_push_age_sec={int(last_push_age) if last_push_age else 'never'}")
+            return {
+                "diagnostic_code": "git_dirty_unpublished",
+                "severity": "info",
+                "root_cause": (
+                    f"working tree 에 {len(dirty)}개 변경 파일이 있고 최근 push 가 없음"
+                ),
+                "evidence": evidence,
+                "safe_auto_fix_available": False,
+                "suggested_action": "운영자가 변경 내용 검토 후 publish_changes 실행 — 자동 git 조작 금지",
+            }
+
+    # 10. factory_idle_too_long — cycle hasn't moved in a long time
+    # and is not actively running.
+    idle_sec = _watchdog_factory_idle_sec(cycle_state)
+    if (
+        cycle_state.get("status") not in {"running", "paused"}
+        and idle_sec is not None
+        and idle_sec > 6 * 3600
+    ):
+        evidence.append(f"idle_sec={int(idle_sec)}")
+        return {
+            "diagnostic_code": "factory_idle_too_long",
+            "severity": "info",
+            "root_cause": f"factory 가 {int(idle_sec/60)}분간 idle — 운영자가 시작 명령 필요",
+            "evidence": evidence,
+            "safe_auto_fix_available": False,
+            "suggested_action": "수동으로 start_factory 실행 또는 사이클 점검",
+        }
+
+    # 11. command diagnostics surface a recent failure we haven't
+    # already classified above.
+    if cmd_diag.get("status") == "failed":
+        evidence.append(f"last_command={cmd_diag.get('last_command')}")
+        evidence.append(f"failed_stage={cmd_diag.get('failed_stage')}")
+        return {
+            "diagnostic_code": cmd_diag.get("diagnostic_code") or "unknown",
+            "severity": "warning",
+            "root_cause": cmd_diag.get("failed_reason") or "최근 명령이 실패",
+            "evidence": evidence,
+            "safe_auto_fix_available": False,
+            "suggested_action": cmd_diag.get("suggested_action")
+            or "운영자가 command_diagnostics.json 의 상세 내용 확인",
+        }
+
+    return {
+        "diagnostic_code": "healthy",
+        "severity": "info",
+        "root_cause": "factory healthy",
+        "evidence": [],
+        "safe_auto_fix_available": False,
+        "suggested_action": "조치 필요 없음",
+    }
+
+
+# --- Safe repair actions ----------------------------------------------------
+
+
+def _watchdog_action_pause_factory(reason: str) -> str:
+    """Write the pause marker the start script reads at next bounce.
+    Cheap and reversible — operator can resume via the dashboard."""
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        PAUSE_MARKER.write_text(
+            f"watchdog auto-pause at {_utc_now_z()}: {reason}\n",
+            encoding="utf-8",
+        )
+        return "pause marker written"
+    except OSError as e:
+        return f"pause marker write failed: {e}"
+
+
+def _watchdog_action_release_deploy_lock() -> str:
+    if not DEPLOY_LOCK_FILE.is_file():
+        return "deploy lock 없음 — skip"
+    try:
+        DEPLOY_LOCK_FILE.unlink()
+        return "deploy lock 해제"
+    except OSError as e:
+        return f"deploy lock 해제 실패: {e}"
+
+
+def _watchdog_action_reset_deploy_progress(reason: str) -> str:
+    try:
+        _set_deploy_progress(
+            "failed",
+            failed_stage="watchdog_reset",
+            failed_reason=reason,
+            suggested_action="운영자가 원인 확인 후 다시 deploy",
+            log_message=f"watchdog 자동 리셋: {reason}",
+        )
+        return "deploy_progress 를 failed 로 정리"
+    except Exception as e:  # noqa: BLE001
+        return f"deploy_progress 정리 실패: {e}"
+
+
+def _watchdog_action_smoke_test() -> tuple[bool, str]:
+    """Append a heartbeat line to docs/factory-smoke-test.md, then
+    commit + push. Verifies the repo's git pipeline works without
+    invoking Claude. Bounded by WATCHDOG_SMOKE_TEST_COOLDOWN_SEC.
+    """
+    global _WATCHDOG_LAST_SMOKE_AT
+    if (time.time() - _WATCHDOG_LAST_SMOKE_AT) < WATCHDOG_SMOKE_TEST_COOLDOWN_SEC:
+        return False, "smoke test cooldown 중"
+
+    smoke_path = REPO_ROOT / "docs" / "factory-smoke-test.md"
+    try:
+        smoke_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = smoke_path.read_text(encoding="utf-8") if smoke_path.is_file() else (
+            "# Factory Smoke Test\n\n"
+            "Watchdog 가 commit/push 파이프라인이 살아 있는지 확인하기 위해 "
+            "이 파일에 한 줄씩 timestamp 를 기록합니다.\n\n"
+        )
+        line = f"- watchdog smoke test at {_utc_now_z()}\n"
+        smoke_path.write_text(existing + line, encoding="utf-8")
+    except OSError as e:
+        return False, f"smoke test 파일 쓰기 실패: {e}"
+
+    rel_path = "docs/factory-smoke-test.md"
+    ok_add, out_add = _git("add", rel_path, timeout=10)
+    if not ok_add:
+        return False, f"git add 실패: {_tail_text(out_add)}"
+    ok_commit, out_commit = _git(
+        "commit", "-m", "Watchdog smoke test", timeout=20,
+    )
+    if not ok_commit and "nothing to commit" not in (out_commit or ""):
+        return False, f"git commit 실패: {_tail_text(out_commit)}"
+    ok_push, out_push = _git("push", "origin", "main", timeout=30)
+    if not ok_push:
+        return False, f"git push 실패: {_tail_text(out_push)}"
+
+    _WATCHDOG_LAST_SMOKE_AT = time.time()
+    return True, "smoke test 통과 (commit + push 성공)"
+
+
+def _watchdog_apply_safe_repair(diag: dict, state: dict) -> list[str]:
+    """Run the safe auto-fix actions appropriate for this diagnostic.
+    Returns a list of human-readable action labels for the state file."""
+    code = diag["diagnostic_code"]
+    actions: list[str] = []
+
+    if code in {"planning_only_loop", "no_code_change_loop", "deploy_failed_repeatedly"}:
+        msg = _watchdog_action_pause_factory(reason=code)
+        actions.append(f"pause_factory · {msg}")
+
+    if code in {
+        "duplicate_deploy_commands",
+        "current_command_stuck",
+        "deploy_failed_repeatedly",
+    }:
+        msg_l = _watchdog_action_release_deploy_lock()
+        actions.append(f"release_deploy_lock · {msg_l}")
+        msg_r = _watchdog_action_reset_deploy_progress(reason=code)
+        actions.append(f"reset_deploy_progress · {msg_r}")
+
+    if code == "operator_request_failed_repeatedly":
+        ok, msg_s = _watchdog_action_smoke_test()
+        actions.append(f"smoke_test · ({'ok' if ok else 'skip/fail'}) {msg_s}")
+
+    for label in actions:
+        _watchdog_log_event(
+            state,
+            kind="watchdog_auto_repair_step",
+            message=label,
+            severity="info" if "실패" not in label else "warning",
+            diagnostic_code=code,
+        )
+
+    return actions
+
+
+# --- Tick orchestration -----------------------------------------------------
+
+
+def _watchdog_tick() -> None:
+    """One pass of the watchdog: diagnose, decide, repair, persist."""
+    state = _read_watchdog_state()
+    if not isinstance(state, dict):
+        state = {}
+
+    enabled = _watchdog_env_enabled()
+    state["enabled"] = enabled
+    if not enabled:
+        # Persist a "disabled" marker once so the dashboard can show
+        # "Watchdog OFF" without staring at last week's healthy row.
+        if state.get("status") != "disabled":
+            state["status"] = "disabled"
+            state["last_checked_at"] = _utc_now_z()
+            _watchdog_log_event(
+                state,
+                kind="watchdog_disabled",
+                message="FACTORY_WATCHDOG_ENABLED=false — 자동 감시 비활성",
+                severity="info",
+            )
+            _save_watchdog_state(state)
+        return
+
+    _watchdog_log_event(
+        state, kind="watchdog_check_started", message="watchdog tick start"
+    )
+    state["last_checked_at"] = _utc_now_z()
+    state["status"] = "watching"
+
+    try:
+        diag = _watchdog_diagnose()
+    except Exception as e:  # noqa: BLE001
+        diag = {
+            "diagnostic_code": "unknown",
+            "severity": "error",
+            "root_cause": f"diagnose raised: {e}",
+            "evidence": [],
+            "safe_auto_fix_available": False,
+            "suggested_action": "운영자가 runner 로그 확인 필요",
+        }
+
+    code = diag["diagnostic_code"]
+    state["last_diagnostic_code"] = code
+    state["severity"] = diag["severity"]
+    state["root_cause"] = diag["root_cause"]
+    state["evidence"] = diag.get("evidence") or []
+    state["suggested_actions"] = (
+        [diag["suggested_action"]] if diag.get("suggested_action") else []
+    )
+
+    if code == "healthy":
+        state["status"] = "healthy"
+        state["repeat_count"] = 0
+        state["auto_repair_blocked_reason"] = None
+        state["safe_actions_taken"] = []
+        _watchdog_log_event(
+            state, kind="watchdog_healthy", message="공장 healthy", severity="info",
+        )
+        _watchdog_log_event(
+            state, kind="watchdog_check_completed", message="watchdog tick done",
+        )
+        _save_watchdog_state(state)
+        return
+
+    _watchdog_log_event(
+        state,
+        kind="watchdog_detected_issue",
+        message=f"{code} — {diag['root_cause']}",
+        severity=diag["severity"],
+        diagnostic_code=code,
+        extra={"evidence": diag.get("evidence")},
+    )
+
+    # Cooldown / repeat tracking.
+    cooldown_sec = _watchdog_repair_cooldown_sec()
+    max_repeat = _watchdog_max_repeat()
+    last_repair_at = _WATCHDOG_LAST_REPAIR_AT.get(code, 0.0)
+    cooldown_remaining = max(0.0, cooldown_sec - (time.time() - last_repair_at))
+    repeat_count = _WATCHDOG_REPEAT_COUNT.get(code, 0)
+    state["repeat_count"] = repeat_count
+    state["cooldown_until"] = (
+        _utc_now_z() if cooldown_remaining == 0
+        else (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+              + f"+{int(cooldown_remaining)}s")
+    )
+
+    in_flight = _INFLIGHT_COMMAND is not None
+    if in_flight:
+        state["status"] = "watching"
+        state["auto_repair_blocked_reason"] = "command in flight — heavy repair skip"
+        _watchdog_log_event(
+            state,
+            kind="watchdog_auto_repair_skipped",
+            message="명령 실행 중이라 heavy repair skip",
+            severity="info",
+            diagnostic_code=code,
+        )
+        _watchdog_log_event(
+            state, kind="watchdog_check_completed", message="watchdog tick done",
+        )
+        _save_watchdog_state(state)
+        return
+
+    if repeat_count >= max_repeat:
+        state["status"] = "broken"
+        state["auto_repair_blocked_reason"] = (
+            f"같은 진단 {repeat_count}회 반복 — 자동 복구 중단"
+        )
+        _watchdog_log_event(
+            state,
+            kind="watchdog_escalated",
+            message=f"{code} 가 {repeat_count}회 반복 — 운영자 확인 필요",
+            severity="error",
+            diagnostic_code=code,
+        )
+        _watchdog_log_event(
+            state, kind="watchdog_check_completed", message="watchdog tick done",
+        )
+        _save_watchdog_state(state)
+        return
+
+    if cooldown_remaining > 0:
+        state["status"] = "watching"
+        state["auto_repair_blocked_reason"] = (
+            f"cooldown 중 ({int(cooldown_remaining)}s 남음)"
+        )
+        _watchdog_log_event(
+            state,
+            kind="watchdog_auto_repair_skipped",
+            message=f"cooldown 중이라 자동 복구 skip ({int(cooldown_remaining)}s 남음)",
+            severity="info",
+            diagnostic_code=code,
+        )
+        _watchdog_log_event(
+            state, kind="watchdog_check_completed", message="watchdog tick done",
+        )
+        _save_watchdog_state(state)
+        return
+
+    if not diag.get("safe_auto_fix_available"):
+        state["status"] = "degraded"
+        state["auto_repair_blocked_reason"] = "safe_auto_fix_available=false"
+        _watchdog_log_event(
+            state,
+            kind="watchdog_escalated",
+            message=f"{code} — 자동 복구 불가, 운영자 확인 필요",
+            severity="warning",
+            diagnostic_code=code,
+        )
+        _watchdog_log_event(
+            state, kind="watchdog_check_completed", message="watchdog tick done",
+        )
+        _save_watchdog_state(state)
+        return
+
+    # Apply safe repair.
+    state["status"] = "repairing"
+    _watchdog_log_event(
+        state,
+        kind="watchdog_auto_repair_started",
+        message=f"{code} 자동 복구 시작",
+        severity="info",
+        diagnostic_code=code,
+    )
+    actions = _watchdog_apply_safe_repair(diag, state)
+    state["safe_actions_taken"] = actions
+    state["last_repair_at"] = _utc_now_z()
+    _WATCHDOG_LAST_REPAIR_AT[code] = time.time()
+    _WATCHDOG_REPEAT_COUNT[code] = repeat_count + 1
+    state["repeat_count"] = _WATCHDOG_REPEAT_COUNT[code]
+    state["auto_repair_blocked_reason"] = None
+    state["status"] = "watching"
+    _watchdog_log_event(
+        state,
+        kind="watchdog_auto_repair_completed",
+        message=f"{code} 자동 복구 완료 ({len(actions)}건)",
+        severity="info",
+        diagnostic_code=code,
+    )
+    _watchdog_log_event(
+        state, kind="watchdog_check_completed", message="watchdog tick done",
+    )
+    _save_watchdog_state(state)
+
+
+def _watchdog_loop() -> None:
+    """Daemon-thread entrypoint. Sleeps for the configured interval
+    between ticks and exits when _WATCHDOG_STOP is set."""
+    sys.stderr.write(
+        f"[runner] watchdog thread started · interval={_watchdog_interval_sec()}s · "
+        f"enabled={_watchdog_env_enabled()}\n"
+    )
+    # Run the first tick almost immediately so the dashboard has data.
+    initial_delay = 5.0
+    if _WATCHDOG_STOP.wait(initial_delay):
+        return
+    while not _WATCHDOG_STOP.is_set():
+        try:
+            _watchdog_tick()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[runner] watchdog tick raised: {e}\n")
+        # Re-read interval each loop so an env var change is picked up
+        # at the next tick (the user can flip enabled=true at runtime).
+        _WATCHDOG_STOP.wait(_watchdog_interval_sec())
+
+
+def _start_watchdog_thread() -> None:
+    global _WATCHDOG_THREAD
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        return
+    _WATCHDOG_STOP.clear()
+    t = threading.Thread(
+        target=_watchdog_loop,
+        daemon=True,
+        name="factory-watchdog",
+    )
+    _WATCHDOG_THREAD = t
+    t.start()
+
+
+def _build_watchdog_meta() -> dict:
+    """Heartbeat metadata block under `local_factory.watchdog`. Always
+    present so the dashboard can decide enabled/disabled rendering on
+    its own, without inferring from absence."""
+    state = _read_watchdog_state()
+    if not state:
+        return {
+            "enabled": _watchdog_env_enabled(),
+            "status": "disabled" if not _watchdog_env_enabled() else "watching",
+            "last_checked_at": None,
+            "last_repair_at": None,
+            "last_diagnostic_code": None,
+            "severity": "info",
+            "root_cause": None,
+            "evidence": [],
+            "safe_actions_taken": [],
+            "suggested_actions": [],
+            "repeat_count": 0,
+            "cooldown_until": None,
+            "auto_repair_blocked_reason": None,
+            "log": [],
+            "interval_sec": _watchdog_interval_sec(),
+            "stuck_command_sec": _watchdog_stuck_command_sec(),
+            "repair_cooldown_sec": _watchdog_repair_cooldown_sec(),
+            "max_repeat": _watchdog_max_repeat(),
+        }
+    return {
+        "enabled": bool(state.get("enabled")),
+        "status": state.get("status") or "watching",
+        "last_checked_at": state.get("last_checked_at"),
+        "last_repair_at": state.get("last_repair_at"),
+        "last_diagnostic_code": state.get("last_diagnostic_code"),
+        "severity": state.get("severity") or "info",
+        "root_cause": state.get("root_cause"),
+        "evidence": state.get("evidence") or [],
+        "safe_actions_taken": state.get("safe_actions_taken") or [],
+        "suggested_actions": state.get("suggested_actions") or [],
+        "repeat_count": int(state.get("repeat_count") or 0),
+        "cooldown_until": state.get("cooldown_until"),
+        "auto_repair_blocked_reason": state.get("auto_repair_blocked_reason"),
+        "log": list(state.get("log") or [])[-WATCHDOG_LOG_CAP:],
+        "interval_sec": _watchdog_interval_sec(),
+        "stuck_command_sec": _watchdog_stuck_command_sec(),
+        "repair_cooldown_sec": _watchdog_repair_cooldown_sec(),
+        "max_repeat": _watchdog_max_repeat(),
+    }
+
+
 def _read_factory_state() -> dict | None:
     """Read .runtime/factory_state.json — written by cycle.py.
 
@@ -3606,6 +4466,7 @@ def _build_local_factory_meta() -> dict:
         "publish_blocker": _build_publish_blocker_meta(state),
         "qa_gate": _build_qa_meta(state),
         "command_diagnostics": _build_command_diagnostics_meta(),
+        "watchdog": _build_watchdog_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See
@@ -4189,6 +5050,11 @@ def main() -> None:
         f"[runner] starting · runner_id={RUNNER_ID} · "
         f"control={CONTROL_TOWER_URL} · poll={POLL_INTERVAL_SEC}s\n"
     )
+    # Boot the watchdog thread regardless of FACTORY_WATCHDOG_ENABLED so
+    # the dashboard can render an explicit "disabled" status. The thread
+    # itself short-circuits when disabled.
+    _start_watchdog_thread()
+
     last_heartbeat = 0.0
     while _running:
         now = time.time()
@@ -4201,6 +5067,7 @@ def main() -> None:
             # Loop tight — there might be more commands queued.
             continue
         time.sleep(POLL_INTERVAL_SEC)
+    _WATCHDOG_STOP.set()
     sys.stderr.write("[runner] stopped.\n")
 
 
