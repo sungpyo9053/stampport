@@ -249,6 +249,9 @@ const WATCHDOG_KIND_TO_PHRASE = {
   supervisor_qa_rejected:                "QA rejected",
   supervisor_deploy_rejected:            "Deploy rejected",
   supervisor_agent_rejected:             "Agent retry required",
+  // Control State aggregator — single source of truth verdict.
+  control_state_aggregated:              "Control state aggregated",
+  control_state_continuous_stopped:      "Continuous stopped by control_state",
   // Forward Progress Detector — same channel.
   forward_progress_check_started:        "Forward progress check started",
   forward_progress_blocked:              "Forward progress blocked",

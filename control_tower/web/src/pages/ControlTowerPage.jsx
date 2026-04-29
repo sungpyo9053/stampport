@@ -10,6 +10,7 @@ import CycleEffectivenessPanel from "../components/CycleEffectivenessPanel.jsx";
 import WatchdogPanel from "../components/WatchdogPanel.jsx";
 import PipelineRecoveryPanel from "../components/PipelineRecoveryPanel.jsx";
 import AgentAccountabilityPanel from "../components/AgentAccountabilityPanel.jsx";
+import OverallStatusBar from "../components/OverallStatusBar.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -250,6 +251,12 @@ export default function ControlTowerPage() {
           ⚠ 컨트롤타워 API 연결 오류 · {apiError}
         </div>
       )}
+
+      {/* Single source of truth for "is the factory healthy / making
+          progress / can the operator go home" — every other panel
+          reads sub-fields of this. Never says HEALTHY when sub-systems
+          disagree (the aggregator picks the strictest verdict). */}
+      <OverallStatusBar runners={runners} />
 
       {/* Pipeline chip — secondary status only */}
       <PipelineTimeline

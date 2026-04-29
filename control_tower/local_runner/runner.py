@@ -5008,6 +5008,45 @@ def _watchdog_tick() -> None:
             severity="info",
         )
 
+    # Control State aggregation — single source of truth. Runs after
+    # pipeline / forward_progress / supervisor have all written their
+    # sub-states so the verdict reflects the latest tick.
+    cs_state = _control_state_aggregate(_build_runner_meta())
+    if cs_state:
+        cs_status = cs_state.get("status") or "unknown"
+        _watchdog_log_event(
+            state,
+            kind="control_state_aggregated",
+            message=(
+                f"Control state · {cs_status} — "
+                f"{(cs_state.get('summary') or '')[:160]}"
+            ),
+            severity=(
+                "success" if cs_status in {"running", "completed", "idle"}
+                else "warning" if cs_status in {"blocked"}
+                else "error" if cs_status in {"failed", "operator_required"}
+                else "info"
+            ),
+            diagnostic_code=cs_state.get("diagnostic_code"),
+        )
+        # Drive continuous-stop directly from the unified verdict.
+        # This is the "blocked / failed / operator_required → continuous
+        # OFF" rule the spec calls out.
+        if cs_state.get("should_stop_continuous"):
+            note = _watchdog_action_pause_factory(
+                reason=f"control_state·{cs_state.get('diagnostic_code') or cs_status}"
+            )
+            _watchdog_log_event(
+                state,
+                kind="control_state_continuous_stopped",
+                message=(
+                    f"Continuous stopped by control_state — {cs_status}: "
+                    f"{note[:160]}"
+                ),
+                severity="warning",
+                diagnostic_code=cs_state.get("diagnostic_code"),
+            )
+
     try:
         diag = _watchdog_diagnose()
     except Exception as e:  # noqa: BLE001
@@ -5803,24 +5842,45 @@ def _pipeline_classify_stages(cycle_state: dict) -> tuple[str | None, str | None
     def _gen(key: str) -> bool:
         return (cycle_state.get(key) or "") == "generated"
 
+    # File-presence fallback so a successful prior cycle whose state
+    # got reset (e.g. cycle.py crashed mid-write) doesn't show up as
+    # planner_required_output_missing. Both filenames are accepted —
+    # cycle.py writes both per planner_proposal protocol.
+    def _planner_artifact_present() -> bool:
+        return any(
+            (RUNTIME_DIR / name).is_file()
+            for name in ("product_planner_report.md", "planner_proposal.md")
+        )
+
+    def _designer_artifact_present() -> bool:
+        return any(
+            (RUNTIME_DIR / name).is_file()
+            for name in ("designer_critique.md", "designer_final_review.md")
+        )
+
+    def _pm_artifact_present() -> bool:
+        return (RUNTIME_DIR / "pm_decision.md").is_file()
+
     # 1. planner_proposal
-    if _gen("product_planner_status"):
+    if _gen("product_planner_status") or _planner_artifact_present():
         last_success = "planner_proposal"
     else:
         return last_success, "planner_proposal"
 
     # 2. designer_review — pingpong stages produce designer_critique +
-    # designer_final_review. Either being generated is enough.
+    # designer_final_review. Either being generated OR the file present
+    # is enough.
     if (
         _gen("designer_critique_status")
         or _gen("designer_final_review_status")
+        or _designer_artifact_present()
     ):
         last_success = "designer_review"
     else:
         return last_success, "designer_review"
 
     # 3. pm_decision
-    if _gen("pm_decision_status"):
+    if _gen("pm_decision_status") or _pm_artifact_present():
         last_success = "pm_decision"
     else:
         return last_success, "pm_decision"
@@ -6986,6 +7046,51 @@ def _build_agent_accountability_meta() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Control State aggregator wrapper.
+# Single source-of-truth verdict — read by the dashboard's
+# OverallStatusBar so every panel speaks one language.
+# ---------------------------------------------------------------------------
+
+
+def _control_state_aggregate(runner_meta: dict | None = None) -> dict | None:
+    try:
+        from . import control_state as _cs
+    except ImportError as e:
+        sys.stderr.write(f"[runner] control_state import failed: {e}\n")
+        return None
+    try:
+        return _cs.aggregate(runner_meta)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[runner] control_state.aggregate raised: {e}\n")
+        return None
+
+
+def _control_state_read() -> dict:
+    try:
+        from . import control_state as _cs
+    except ImportError:
+        return {}
+    try:
+        return _cs.read_state() or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _build_control_state_meta() -> dict:
+    """Heartbeat metadata block under `local_factory.control_state`.
+    Reads the file the watchdog last wrote — keeps heartbeats cheap."""
+    rep = _control_state_read()
+    if not rep:
+        return {
+            "available": False,
+            "status": "idle",
+            "summary": "control_state 가 아직 작성되지 않음",
+        }
+    rep["available"] = True
+    return rep
+
+
 def _build_operator_request_health_meta() -> dict:
     """Compose `local_factory.operator_request_health` — the dashboard's
     one-stop view of "is the operator_request loop healthy or holding a
@@ -7422,6 +7527,7 @@ def _build_local_factory_meta() -> dict:
         "forward_progress": _build_forward_progress_meta(),
         "agent_accountability": _build_agent_accountability_meta(),
         "operator_request_health": _build_operator_request_health_meta(),
+        "control_state": _build_control_state_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See

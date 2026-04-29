@@ -206,6 +206,10 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Control State aggregator — top-level verdict.
+  [/control\s+state\s+aggregated/i,                         { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
+  [/continuous\s+stopped\s+by\s+control_?state/i,           { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+
   // Agent Supervisor (Product Director / 공장장).
   [/agent\s+supervisor\s+review\s+started/i,                { category: "Doctor", actor: "system", severity: "info",    phase: "started"   }],
   [/agent\s+supervisor\s+review\s+completed/i,              { category: "Doctor", actor: "system", severity: "info",    phase: "completed" }],
