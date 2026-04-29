@@ -9,6 +9,7 @@ import SystemLogPanel from "../components/SystemLogPanel.jsx";
 import CycleEffectivenessPanel from "../components/CycleEffectivenessPanel.jsx";
 import WatchdogPanel from "../components/WatchdogPanel.jsx";
 import PipelineRecoveryPanel from "../components/PipelineRecoveryPanel.jsx";
+import AgentAccountabilityPanel from "../components/AgentAccountabilityPanel.jsx";
 import {
   fetchAgents,
   fetchEvents,
@@ -294,6 +295,7 @@ export default function ControlTowerPage() {
         </div>
 
         <aside className="flex flex-col gap-3">
+          <AgentAccountabilityPanel runners={runners} />
           <PipelineRecoveryPanel runners={runners} />
           <WatchdogPanel runners={runners} />
           <CycleEffectivenessPanel runners={runners} />

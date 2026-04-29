@@ -4660,6 +4660,117 @@ def _watchdog_tick() -> None:
                 diagnostic_code=fp_code,
             )
 
+    # Agent Supervisor — the meta-agent. Runs after FP so the
+    # accountability report reflects the latest meaningful_change /
+    # operator_required signals. We always emit a "review started"
+    # marker so the System Log shows the supervisor is active.
+    sup_report = None
+    _watchdog_log_event(
+        state,
+        kind="supervisor_review_started",
+        message="Agent Supervisor review started",
+        severity="info",
+    )
+    try:
+        sup_report = _supervisor_run()
+    except Exception as e:  # noqa: BLE001
+        _watchdog_log_event(
+            state,
+            kind="supervisor_review_failed",
+            message=f"Agent Supervisor raised: {e}",
+            severity="error",
+        )
+
+    if sup_report:
+        sup_overall = sup_report.get("overall_status") or "unknown"
+        sup_blocking = sup_report.get("blocking_agent")
+        sup_meaningful = bool(sup_report.get("meaningful_change"))
+        sup_ticket_ok = bool(sup_report.get("implementation_ticket_exists"))
+
+        if sup_overall == "pass":
+            _watchdog_log_event(
+                state,
+                kind="supervisor_pass",
+                message="Agent accountability passed — 모든 에이전트 기준 통과 + 의미 있는 변경",
+                severity="success",
+            )
+        else:
+            _watchdog_log_event(
+                state,
+                kind="supervisor_fail",
+                message=(
+                    f"Agent accountability failed — overall={sup_overall} "
+                    f"blocking={sup_blocking or '—'}: "
+                    f"{(sup_report.get('blocking_reason') or '')[:200]}"
+                ),
+                severity=(
+                    "warning" if sup_overall in {"retry_required", "planning_only"}
+                    else "error"
+                ),
+            )
+            if not sup_meaningful:
+                _watchdog_log_event(
+                    state,
+                    kind="supervisor_meaningful_missing",
+                    message="Meaningful change missing — 산출물만 있고 실제 코드 변경이 없음",
+                    severity="warning",
+                )
+            if not sup_ticket_ok:
+                _watchdog_log_event(
+                    state,
+                    kind="supervisor_ticket_missing",
+                    message="Implementation Ticket missing — PM 단계 재실행 필요",
+                    severity="warning",
+                )
+
+        # Per-agent reject markers — only the failed ones, to keep the
+        # System Log compact. retry_prompts ride on the agent row in
+        # heartbeat metadata, not the log entries.
+        REJECT_KIND = {
+            "planner":  ("supervisor_planner_rejected",  "Planner rejected"),
+            "designer": ("supervisor_designer_rejected", "Designer rejected"),
+            "pm":       ("supervisor_pm_rejected",       "PM rejected"),
+            "frontend": ("supervisor_frontend_rejected", "Frontend rejected"),
+            "backend":  ("supervisor_backend_rejected",  "Backend rejected"),
+            "ai":       ("supervisor_ai_rejected",       "AI rejected"),
+            "qa":       ("supervisor_qa_rejected",       "QA rejected"),
+            "deploy":   ("supervisor_deploy_rejected",   "Deploy rejected"),
+        }
+        for name, row in (sup_report.get("agents") or {}).items():
+            if not isinstance(row, dict):
+                continue
+            if not row.get("required_retry"):
+                continue
+            kind, label = REJECT_KIND.get(name, ("supervisor_agent_rejected", "Agent rejected"))
+            first_problem = (row.get("problems") or [""])[0]
+            _watchdog_log_event(
+                state,
+                kind=kind,
+                message=f"{label} — {first_problem[:160]}",
+                severity="warning",
+            )
+
+        if sup_blocking:
+            _watchdog_log_event(
+                state,
+                kind="supervisor_cycle_blocked",
+                message=(
+                    f"Cycle blocked by agent — {sup_blocking}: "
+                    f"{(sup_report.get('blocking_reason') or '')[:200]}"
+                ),
+                severity="warning",
+            )
+
+        _watchdog_log_event(
+            state,
+            kind="supervisor_review_completed",
+            message=(
+                f"Agent Supervisor review completed — overall={sup_overall} "
+                f"meaningful={sup_meaningful}"
+            ),
+            severity="info",
+        )
+
     try:
         diag = _watchdog_diagnose()
     except Exception as e:  # noqa: BLE001
@@ -6483,6 +6594,83 @@ def _forward_progress_diagnose() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Agent Supervisor — meta-agent that audits the *other* agents' work.
+# Runs on every watchdog tick and at the end of every cycle (via
+# cycle.py). Lives in agent_supervisor.py to avoid circular imports.
+# ---------------------------------------------------------------------------
+
+
+def _supervisor_run() -> dict | None:
+    """Best-effort wrapper around agent_supervisor.run_supervisor().
+    Returns the report dict, or None when the module isn't importable
+    (which only happens in degraded test environments)."""
+    try:
+        from . import agent_supervisor as _sup
+    except ImportError as e:
+        sys.stderr.write(f"[runner] agent_supervisor import failed: {e}\n")
+        return None
+    try:
+        return _sup.run_supervisor()
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[runner] agent_supervisor.run_supervisor raised: {e}\n")
+        return None
+
+
+def _supervisor_read_report() -> dict:
+    try:
+        from . import agent_supervisor as _sup
+    except ImportError:
+        return {}
+    try:
+        return _sup.read_report() or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _build_agent_accountability_meta() -> dict:
+    """Heartbeat metadata block under `local_factory.agent_accountability`.
+    Reads the persisted JSON the supervisor wrote on its last tick — the
+    runner doesn't run the supervisor here to keep heartbeats cheap;
+    that fires from the watchdog tick + cycle.py end-of-main."""
+    rep = _supervisor_read_report()
+    if not rep:
+        return {
+            "available": False,
+            "overall_status": "unknown",
+            "blocking_agent": None,
+            "blocking_reason": None,
+            "operator_required": False,
+            "agents": {},
+            "implementation_ticket_exists": False,
+            "meaningful_change": False,
+            "changed_files": [],
+            "affected_screens": [],
+            "affected_flows": [],
+            "qa_scenarios": [],
+            "next_action": "supervisor 가 아직 한 번도 실행되지 않았습니다.",
+        }
+    return {
+        "available": True,
+        "evaluated_at": rep.get("evaluated_at"),
+        "cycle_id": rep.get("cycle_id"),
+        "overall_status": rep.get("overall_status"),
+        "blocking_agent": rep.get("blocking_agent"),
+        "blocking_reason": rep.get("blocking_reason"),
+        "operator_required": bool(rep.get("operator_required")),
+        "agents": rep.get("agents") or {},
+        "implementation_ticket_exists": bool(rep.get("implementation_ticket_exists")),
+        "meaningful_change": bool(rep.get("meaningful_change")),
+        "changed_files": list(rep.get("changed_files") or [])[:30],
+        "affected_screens": list(rep.get("affected_screens") or []),
+        "affected_flows": list(rep.get("affected_flows") or []),
+        "qa_scenarios": list(rep.get("qa_scenarios") or []),
+        "commit_hash": rep.get("commit_hash"),
+        "push_status": rep.get("push_status"),
+        "next_action": rep.get("next_action"),
+    }
+
+
 def _build_forward_progress_meta() -> dict:
     """Heartbeat metadata block under `local_factory.forward_progress`.
     Always present so the dashboard can render the panel even before
@@ -6837,6 +7025,7 @@ def _build_local_factory_meta() -> dict:
         "watchdog": _build_watchdog_meta(),
         "pipeline_recovery": _build_pipeline_recovery_meta(),
         "forward_progress": _build_forward_progress_meta(),
+        "agent_accountability": _build_agent_accountability_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See

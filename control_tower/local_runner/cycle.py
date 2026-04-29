@@ -5821,6 +5821,71 @@ def main() -> int:
             "operator_request 로 수동 변경 지시를 내리세요."
         )
 
+    # Agent Supervisor gate — last chance to refuse a "succeeded" verdict
+    # when the agents produced artifacts but no real code change. Lives
+    # in agent_supervisor.py (stdlib-only, no import on runner.py).
+    #
+    # We persist factory_state.json BEFORE running the supervisor so it
+    # has the latest claude_apply_changed_files / qa_status / etc. The
+    # supervisor reads that file directly.
+    _write_state(state)
+    try:
+        from . import agent_supervisor as _supervisor
+        sup_report = _supervisor.run_supervisor()
+    except Exception as e:  # noqa: BLE001
+        _log(f"agent_supervisor failed: {e}")
+        sup_report = None
+
+    if sup_report:
+        sup_overall = sup_report.get("overall_status")
+        sup_blocking = sup_report.get("blocking_agent")
+        sup_meaningful = bool(sup_report.get("meaningful_change"))
+        sup_ticket_ok = bool(sup_report.get("implementation_ticket_exists"))
+
+        # Refuse to call this cycle "succeeded" when the supervisor
+        # didn't pass — even if claude_apply landed code changes, the
+        # supervisor may flag designer/QA/deploy retry. Downgrade to
+        # planning_only in that case.
+        if state.status == "succeeded" and sup_overall != "pass":
+            prior_status = state.status
+            if not sup_meaningful or not sup_ticket_ok:
+                state.status = "planning_only"
+                state.code_changed = False
+            else:
+                # meaningful + ticket but agent quality lacking — keep
+                # files-changed marker but force planning_only label.
+                state.status = "planning_only"
+            state.no_code_change_reason = (
+                f"supervisor:{sup_overall} blocking={sup_blocking or '—'}"
+            )
+            state.last_message = (
+                f"Agent Supervisor가 succeeded 판정을 거부했습니다 "
+                f"(overall={sup_overall}, blocking={sup_blocking or '—'}). "
+                f"prior={prior_status}"
+            )
+            state.suggested_action = (
+                sup_report.get("next_action")
+                or "Agent Supervisor 의 retry_prompt 에 따라 해당 에이전트 재실행"
+            )
+            _emit_cycle_log(
+                state, "supervisor_rejected",
+                f"supervisor rejected succeeded → planning_only: "
+                f"overall={sup_overall} blocking={sup_blocking}",
+                blocking_agent=sup_blocking,
+                overall_status=sup_overall,
+            )
+
+        # Always emit a cycle_log marker so the System Log shows that
+        # the supervisor ran for this cycle.
+        _emit_cycle_log(
+            state, "supervisor_review_completed",
+            f"Agent Supervisor review completed — overall={sup_overall} "
+            f"meaningful={sup_meaningful} ticket={sup_ticket_ok}",
+            overall_status=sup_overall,
+            blocking_agent=sup_blocking,
+            meaningful_change=sup_meaningful,
+        )
+
     state.current_stage = "report"
     state.current_task = "리포트 작성"
     state.progress = 100

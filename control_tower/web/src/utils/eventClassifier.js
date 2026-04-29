@@ -206,6 +206,24 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Agent Supervisor (Product Director / 공장장).
+  [/agent\s+supervisor\s+review\s+started/i,                { category: "Doctor", actor: "system", severity: "info",    phase: "started"   }],
+  [/agent\s+supervisor\s+review\s+completed/i,              { category: "Doctor", actor: "system", severity: "info",    phase: "completed" }],
+  [/agent\s+accountability\s+passed/i,                      { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/agent\s+accountability\s+failed/i,                      { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/planner\s+rejected/i,                                   { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/designer\s+rejected/i,                                  { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/pm\s+rejected/i,                                        { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/frontend\s+rejected/i,                                  { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/backend\s+rejected/i,                                   { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/(qa\s+rejected|qa\s+supervisor\s+rejected)/i,           { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/deploy\s+rejected/i,                                    { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/implementation\s+ticket\s+missing/i,                    { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/meaningful\s+change\s+missing/i,                        { category: "Error",  actor: "factory", severity: "warn",   phase: "skipped"   }],
+  [/cycle\s+blocked\s+by\s+agent/i,                         { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/cycle\s+allowed\s+to\s+implementation/i,                { category: "Doctor", actor: "factory", severity: "success",phase: "completed" }],
+  [/agent\s+retry\s+required/i,                             { category: "Doctor", actor: "factory", severity: "warn",   phase: "info"      }],
+
   // Forward Progress Detector — heartbeat ≠ progress.
   [/forward\s+progress\s+check\s+started/i,                 { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
   [/forward\s+progress\s+blocked/i,                         { category: "Error",  actor: "system", severity: "warn",    phase: "failed"    }],
