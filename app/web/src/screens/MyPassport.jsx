@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { useApp } from '../context/appContext.js';
 import { categoryLabel } from '../data/options.js';
 import { stampGradeFor } from '../utils/leveling.js';
+import VisaBadge from '../components/VisaBadge.jsx';
 
 function summarize(stamps, key) {
   const map = new Map();
@@ -88,6 +89,7 @@ export default function MyPassport({ navigate }) {
   );
   const recent = stamps.slice(0, 5);
   const activeQuest = quests.find((q) => !q.completed);
+  const visaList = earnedBadges.filter((b) => b.id.endsWith('_visa') || b.id === 'gwanak_explorer');
 
   // This-week stamp count — drives the "이번 주 N개의 도장을 찍었어요"
   // line on the character header.
@@ -168,6 +170,15 @@ export default function MyPassport({ navigate }) {
           </div>
         </div>
       </div>
+
+      {visaList.length > 0 && (
+        <div className="visa-strip">
+          <span className="visa-strip-label">획득한 비자</span>
+          <div className="visa-strip-row">
+            {visaList.map((b) => <VisaBadge key={b.id} badge={b} />)}
+          </div>
+        </div>
+      )}
 
       <button
         type="button"

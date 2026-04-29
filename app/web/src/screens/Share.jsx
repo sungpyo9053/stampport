@@ -2,11 +2,20 @@ import { useMemo, useState } from 'react';
 import { useApp } from '../context/appContext.js';
 import { categoryIcon, categoryLabel } from '../data/options.js';
 import { stampGradeFor, verificationDef } from '../utils/leveling.js';
+import VisaBadge from '../components/VisaBadge.jsx';
 
 export default function Share({ navigate, stampId }) {
   const { stampById, user, level, selectedTitle, badges } = useApp();
   const stamp = stampById(stampId);
   const [toast, setToast] = useState('');
+
+  const earnedVisa = useMemo(() => {
+    if (!stamp) return null;
+    return badges.find(
+      (b) => b.earned && (b.id.endsWith('_visa') || b.id === 'gwanak_explorer') &&
+        (b.name.includes(stamp.area) || b.description.includes(stamp.area))
+    ) || null;
+  }, [badges, stamp]);
 
   // We pick the badge with the highest progress ratio that involves
   // *this stamp's category or area* — gives the share card a "이 도장
@@ -126,6 +135,13 @@ export default function Share({ navigate, stampId }) {
             </div>
           </div>
         ) : null}
+
+        {earnedVisa && (
+          <div className="share-visa">
+            <VisaBadge badge={earnedVisa} />
+            <span className="share-visa-label">{earnedVisa.titleLabel} 비자 보유</span>
+          </div>
+        )}
 
         <div className="share-foot">
           <div className="share-id">
