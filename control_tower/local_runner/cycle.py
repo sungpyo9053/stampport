@@ -6341,6 +6341,57 @@ def main() -> int:
             meaningful_change=sup_meaningful,
         )
 
+    # Unattended e2e closure — write the auto-publish marker when the
+    # cycle finished with real shipped code + qa passed + a ticket. The
+    # runner's main loop (not cycle.py) owns the actual git commit/push
+    # so this stays a marker file rather than an inline subprocess —
+    # that keeps the import graph acyclic and lets the operator's
+    # LOCAL_RUNNER_ALLOW_PUBLISH / LOCAL_RUNNER_PUBLISH_DRY_RUN env
+    # gates remain authoritative.
+    if (
+        state.status == "succeeded"
+        and state.claude_apply_status == "applied"
+        and len(state.claude_apply_changed_files or []) > 0
+        and state.qa_status == "passed"
+        and state.implementation_ticket_status == "generated"
+    ):
+        selected_feature = (
+            state.implementation_ticket_selected_feature
+            or state.product_planner_selected_feature
+            or "Stampport cycle"
+        )
+        commit_subject = f"Factory cycle #{state.cycle}: {selected_feature}"[:72]
+        marker = {
+            "schema_version": 1,
+            "cycle_id": state.cycle,
+            "requested_at": utc_now_iso(),
+            "consumed": False,
+            "consumed_at": None,
+            "consume_attempts": 0,
+            "selected_feature": selected_feature,
+            "changed_files": list(state.claude_apply_changed_files or [])[:30],
+            "qa_status": state.qa_status,
+            "implementation_ticket_path": state.implementation_ticket_path,
+            "commit_subject": commit_subject,
+            "commit_body": (
+                f"Cycle #{state.cycle} 자동 공장 결과:\n"
+                f"- 선정 기능: {selected_feature}\n"
+                f"- 변경 파일 수: {len(state.claude_apply_changed_files or [])}\n"
+                f"- QA: {state.qa_status}\n"
+                f"\n자동 commit by control_tower runner — supervisor=ready_to_publish"
+            ),
+        }
+        marker_path = RUNTIME / "auto_publish_request.json"
+        if safe_write_json(marker_path, marker):
+            _emit_cycle_log(
+                state, "auto_publish_marker_written",
+                f"auto-publish marker requested — runner picks up next tick "
+                f"({len(marker['changed_files'])}개 파일, "
+                f"feature={selected_feature[:40]})",
+                cycle_id=state.cycle,
+                changed_files_count=len(marker["changed_files"]),
+            )
+
     state.current_stage = "report"
     state.current_task = "리포트 작성"
     state.progress = 100

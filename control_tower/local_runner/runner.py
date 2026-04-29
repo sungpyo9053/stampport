@@ -1086,6 +1086,18 @@ def _clear_continuous_pause() -> bool:
 _LAST_FACTORY_RECONCILE_AT: float = 0.0
 FACTORY_RECONCILE_INTERVAL_SEC = 30.0
 
+# Auto-publish marker that cycle.py drops when a successful cycle is
+# ready to ship. The runner's main loop polls this file and triggers
+# _h_publish_changes when the operator's safety env vars allow real
+# pushes. The marker carries the cycle_id + commit subject so the
+# runner can produce a meaningful commit message without re-reading
+# factory_state.
+AUTO_PUBLISH_MARKER_FILE = RUNTIME_DIR / "auto_publish_request.json"
+_LAST_AUTO_PUBLISH_TICK: float = 0.0
+# Don't re-poll the marker more than every 5 seconds — heavy publish
+# work shouldn't fire on every poll iteration.
+AUTO_PUBLISH_POLL_INTERVAL_SEC = 5.0
+
 
 def _reconcile_continuous_mode() -> None:
     """Bridge API factory state → local bash-loop pause marker.
@@ -1131,6 +1143,276 @@ def _reconcile_continuous_mode() -> None:
             _log_event(
                 f"factory bridge · pause lifted (continuous={continuous_mode}, "
                 f"desired={desired})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Auto-publish marker consumer.
+#
+# cycle.py drops .runtime/auto_publish_request.json when a successful
+# cycle is ready_to_publish. The runner picks it up here and fires
+# _h_publish_changes — but ONLY when the operator's safety env vars
+# allow real pushes. Defaults stay safe: a fresh runner never
+# auto-pushes unless `LOCAL_RUNNER_ALLOW_PUBLISH=true` AND
+# `LOCAL_RUNNER_PUBLISH_DRY_RUN=false` are set explicitly.
+#
+# Even when blocked by env, we still mark the marker as
+# `consumed_blocked` so the dashboard can surface "operator action
+# required" without re-firing every poll.
+# ---------------------------------------------------------------------------
+
+
+def _read_auto_publish_marker() -> dict | None:
+    if not AUTO_PUBLISH_MARKER_FILE.is_file():
+        return None
+    try:
+        return json.loads(AUTO_PUBLISH_MARKER_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_auto_publish_marker(marker: dict) -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        AUTO_PUBLISH_MARKER_FILE.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] auto_publish marker write failed: {e}\n")
+
+
+def _consume_auto_publish_marker() -> None:
+    """Poll the marker, run publish_changes when allowed, mark consumed."""
+    global _LAST_AUTO_PUBLISH_TICK
+    now = time.time()
+    if now - _LAST_AUTO_PUBLISH_TICK < AUTO_PUBLISH_POLL_INTERVAL_SEC:
+        return
+    _LAST_AUTO_PUBLISH_TICK = now
+
+    marker = _read_auto_publish_marker()
+    if not marker:
+        return
+
+    # Already-consumed markers stay on disk so the dashboard can
+    # introspect why publish ran. Skip them.
+    if marker.get("consumed"):
+        return
+
+    # Don't fight an already-failed deploy — give the operator a
+    # window to inspect.
+    publish_state = _read_publish_state()
+    last_push_status = publish_state.get("last_push_status")
+    if last_push_status == "failed":
+        # Mark consumed_blocked once so we don't re-fire on every tick.
+        marker["consumed"] = True
+        marker["consumed_at"] = _utc_now_z()
+        marker["consume_attempts"] = int(marker.get("consume_attempts") or 0) + 1
+        marker["result"] = "skipped_prior_push_failed"
+        _save_auto_publish_marker(marker)
+        _log_event(
+            "auto_publish marker skipped — prior push_status=failed "
+            "(operator inspect required)"
+        )
+        return
+
+    if not _publish_is_allowed():
+        marker["consumed"] = True
+        marker["consumed_at"] = _utc_now_z()
+        marker["consume_attempts"] = int(marker.get("consume_attempts") or 0) + 1
+        marker["result"] = "skipped_allow_publish_off"
+        _save_auto_publish_marker(marker)
+        _log_event(
+            "auto_publish marker skipped — LOCAL_RUNNER_ALLOW_PUBLISH "
+            "not enabled; ready_to_publish state preserved for operator click"
+        )
+        return
+
+    if _publish_is_dry_run():
+        marker["consumed"] = True
+        marker["consumed_at"] = _utc_now_z()
+        marker["consume_attempts"] = int(marker.get("consume_attempts") or 0) + 1
+        marker["result"] = "skipped_dry_run"
+        _save_auto_publish_marker(marker)
+        _log_event(
+            "auto_publish marker skipped — LOCAL_RUNNER_PUBLISH_DRY_RUN=true; "
+            "operator must flip to false to enable unattended publish"
+        )
+        return
+
+    # Bump attempts BEFORE the call so a crash inside publish leaves a
+    # consume_attempts > 0 trail.
+    marker["consume_attempts"] = int(marker.get("consume_attempts") or 0) + 1
+    _save_auto_publish_marker(marker)
+
+    _log_event(
+        f"auto_publish marker fire — cycle #{marker.get('cycle_id')} "
+        f"selected={marker.get('selected_feature') or 'unknown'}"
+    )
+
+    try:
+        # Mirror through the deploy progress so the dashboard sees the
+        # publish steps in real time. _h_publish_changes already drives
+        # deploy_progress.history when __track_deploy_progress is set.
+        publish_payload = {
+            "__track_deploy_progress": True,
+            "__cycle_id": marker.get("cycle_id"),
+            "__commit_subject": marker.get("commit_subject"),
+        }
+        ok, msg = _h_publish_changes(publish_payload)
+    except Exception as e:  # noqa: BLE001
+        ok, msg = False, f"auto_publish raised: {e}"
+
+    marker["consumed"] = True
+    marker["consumed_at"] = _utc_now_z()
+    marker["result"] = "succeeded" if ok else "failed"
+    marker["result_message"] = (msg or "")[:600]
+    _save_auto_publish_marker(marker)
+
+    if ok:
+        _log_event(f"auto_publish marker → publish success: {msg[:200]}")
+        # Best-effort GitHub Actions detection so the dashboard can
+        # show "actions pending / completed" without manual refresh.
+        try:
+            _check_github_actions_after_push()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[runner] gh actions probe failed: {e}\n")
+    else:
+        _log_event(f"auto_publish marker → publish FAILED: {msg[:200]}")
+
+
+# ---------------------------------------------------------------------------
+# GitHub Actions detection (minimal, gh-CLI only).
+#
+# After auto-publish pushes a commit, we want the dashboard to show
+# "pushed → actions pending → actions completed" without the operator
+# refreshing. The minimum useful signal is:
+#
+#   1. Right after push: deploy_progress.status="actions_triggered" +
+#      a `pending` row in publish_state.actions_status.
+#   2. Each subsequent watchdog tick: shell out to `gh run list
+#      --limit 5 --json status,conclusion,headSha,databaseId,name`
+#      and look for a run with the just-pushed commit. If found and
+#      status=completed → mark deploy completed; if conclusion is
+#      failure → mark failed.
+#
+# Stdlib-safe fallback: when `gh` isn't on PATH (or any subprocess
+# error), we just leave the status as "actions_pending" and surface
+# diagnostic_code=actions_pending. The operator can then use the
+# Actions URL link in the dashboard to verify manually.
+# ---------------------------------------------------------------------------
+
+
+def _gh_cli_available() -> bool:
+    return bool(shutil.which("gh"))
+
+
+def _check_github_actions_after_push() -> dict | None:
+    """One-shot probe immediately after a successful push. Sets
+    publish_state.actions_status and deploy_progress.status to
+    actions_triggered. Returns the actions snapshot for callers that
+    want to log it."""
+    pub_state = _read_publish_state()
+    commit_hash = pub_state.get("last_commit_hash") or ""
+    snapshot = {
+        "actions_status": "pending",
+        "actions_conclusion": None,
+        "actions_run_id": None,
+        "actions_run_url": None,
+        "checked_at": _utc_now_z(),
+        "commit_hash": commit_hash,
+        "gh_available": _gh_cli_available(),
+    }
+    if commit_hash and snapshot["gh_available"]:
+        try:
+            r = subprocess.run(
+                ["gh", "run", "list", "--limit", "8",
+                 "--json", "status,conclusion,headSha,databaseId,url,name"],
+                cwd=str(REPO_ROOT),
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                runs = json.loads(r.stdout or "[]")
+                # Find the run matching our commit (gh returns headSha).
+                match = next(
+                    (run for run in runs if run.get("headSha") == commit_hash),
+                    None,
+                )
+                if match:
+                    snapshot["actions_status"] = match.get("status") or "pending"
+                    snapshot["actions_conclusion"] = match.get("conclusion")
+                    snapshot["actions_run_id"] = match.get("databaseId")
+                    snapshot["actions_run_url"] = match.get("url")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+            snapshot["error"] = str(e)[:200]
+
+    _save_publish_state({"actions": snapshot})
+    return snapshot
+
+
+def _poll_github_actions_progress() -> None:
+    """Periodic probe — runs from watchdog tick when deploy is in
+    actions_triggered state. Updates publish_state.actions and
+    deploy_progress.status (completed / failed) when the run finishes.
+    No-op if gh is unavailable or no recent commit_hash.
+    """
+    pub_state = _read_publish_state()
+    actions = pub_state.get("actions") or {}
+    if actions.get("actions_status") == "completed":
+        return  # already terminal
+    commit_hash = pub_state.get("last_commit_hash") or actions.get("commit_hash")
+    if not commit_hash:
+        return
+    if not _gh_cli_available():
+        return  # leave as pending
+    try:
+        r = subprocess.run(
+            ["gh", "run", "list", "--limit", "8",
+             "--json", "status,conclusion,headSha,databaseId,url,name"],
+            cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return
+    if r.returncode != 0:
+        return
+    try:
+        runs = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return
+    match = next(
+        (run for run in runs if run.get("headSha") == commit_hash),
+        None,
+    )
+    if not match:
+        return
+    actions["actions_status"] = match.get("status") or "pending"
+    actions["actions_conclusion"] = match.get("conclusion")
+    actions["actions_run_id"] = match.get("databaseId")
+    actions["actions_run_url"] = match.get("url")
+    actions["checked_at"] = _utc_now_z()
+    _save_publish_state({"actions": actions})
+
+    # Promote to deploy_progress when terminal.
+    if actions["actions_status"] == "completed":
+        if actions["actions_conclusion"] == "success":
+            _set_deploy_progress(
+                "completed",
+                current_step=f"GitHub Actions success ({commit_hash[:8]})",
+                log_message=f"actions completed — {actions.get('actions_run_url')}",
+            )
+        else:
+            _set_deploy_progress(
+                "failed",
+                current_step=f"GitHub Actions failed ({commit_hash[:8]})",
+                failed_reason=(
+                    f"conclusion={actions.get('actions_conclusion')}"
+                ),
+                failed_stage="github_actions",
+                suggested_action=(
+                    f"Actions 로그 확인: {actions.get('actions_run_url') or 'gh run list'}"
+                ),
+                log_message="actions failed",
             )
 
 
@@ -8222,6 +8504,16 @@ def main() -> None:
             # heartbeat tick.
             _reconcile_continuous_mode()
             last_heartbeat = now
+        # Auto-publish marker consumer + GitHub Actions probe — both
+        # internally throttled so it's cheap to call every poll.
+        try:
+            _consume_auto_publish_marker()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[runner] auto_publish poll raised: {e}\n")
+        try:
+            _poll_github_actions_progress()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[runner] gh actions poll raised: {e}\n")
         cmd = claim_next()
         if cmd:
             _execute(cmd)

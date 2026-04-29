@@ -304,46 +304,69 @@ def _compute_deploy(
     else:
         qa_status = qa_status_raw
 
-    # Reclassify deploy when nothing changed.
-    if changed_count == 0:
-        if dp_status in {"failed", "completed", "actions_triggered"}:
-            deploy_status = "no_changes"
-        elif dp_status == "idle":
-            deploy_status = "idle"
+    push_succeeded = (publish_state or {}).get("last_push_status") in {"ok", "succeeded"}
+    actions_blob = (publish_state or {}).get("actions") or {}
+    actions_status = actions_blob.get("actions_status")
+    actions_conclusion = actions_blob.get("actions_conclusion")
+
+    # Decision order matters:
+    #   1. push_succeeded → pushed / actions_pending / completed (most recent
+    #      durable signal — overrides everything below)
+    #   2. changed_count == 0 → no_changes
+    #   3. dp_status==failed + qa_passed + no commit → stale, mark ready
+    #   4. dp_status==failed (real) → failed
+    #   5. dp_status==completed/deploying → mirror
+    #   6. fallback: ready / idle
+    failed_stage_clean: str | None = None
+    deploy_status: str
+    if push_succeeded:
+        if actions_status == "completed" and actions_conclusion == "success":
+            deploy_status = "completed"
+        elif actions_status == "completed":
+            deploy_status = "failed"
+            failed_stage_clean = "github_actions"
+        elif actions_status in {"in_progress", "queued", "waiting", "requested",
+                                "pending"}:
+            deploy_status = "actions_pending"
         else:
+            deploy_status = "pushed"
+    elif changed_count == 0:
+        # If a cycle actually ran and produced no changes, surface as
+        # `no_changes`. Only stay `idle` when there's no signal of any
+        # cycle activity at all (no QA, no apply attempt).
+        cycle_ran = (
+            qa_status_raw in {"passed", "failed"}
+            or (cycle_state.get("claude_apply_status") or "") in {"applied", "skipped"}
+        )
+        if cycle_ran or dp_status in {"failed", "completed", "actions_triggered"}:
             deploy_status = "no_changes"
-        failed_stage_clean = None
+        else:
+            deploy_status = "idle"
     elif (
         dp_status == "failed"
         and qa_status == "passed"
         and not (publish_state or {}).get("last_commit_hash")
     ):
-        # Stale deploy_progress.failed from an earlier cycle that
-        # should NOT poison this cycle's ready-to-publish verdict.
-        # The cycle just finished claude_apply + QA successfully but
-        # hasn't run publish_changes yet — surface as `ready` so the
-        # _resolve_overall layer can flip the top-level status to
-        # `ready_to_publish` instead of `failed`.
+        # Stale deploy_progress.failed from an earlier cycle — don't
+        # let it poison the ready_to_publish verdict.
         deploy_status = "ready"
-        failed_stage_clean = None
     elif dp_status == "failed":
         deploy_status = "failed"
         failed_stage_clean = failed_stage
     elif dp_status == "completed":
         deploy_status = "completed"
-        failed_stage_clean = None
     elif dp_status in {"deploying", "validating", "command_received",
                        "actions_triggered"}:
         deploy_status = "deploying"
-        failed_stage_clean = None
     else:
         deploy_status = "ready" if changed_count > 0 else "idle"
-        failed_stage_clean = None
 
-    # If command_diagnostics says no_changes_to_deploy, that's the
-    # canonical no-changes signal even if dp_status was stale.
+    # If command_diagnostics says no_changes_to_deploy AND we haven't
+    # already promoted via push, that's the canonical no-changes
+    # signal even if dp_status was stale.
     if (
-        cmd_diag.get("last_command") == "deploy_to_server"
+        not push_succeeded
+        and cmd_diag.get("last_command") == "deploy_to_server"
         and cmd_diag.get("diagnostic_code") == "no_changes_to_deploy"
     ):
         deploy_status = "no_changes"
@@ -358,6 +381,9 @@ def _compute_deploy(
         "last_failed_stage": failed_stage_clean,
         "commit_hash": (publish_state or {}).get("last_commit_hash"),
         "push_status": (publish_state or {}).get("last_push_status"),
+        "actions_status": actions_status,
+        "actions_conclusion": actions_conclusion,
+        "actions_run_url": actions_blob.get("actions_run_url"),
     }
 
 
@@ -377,6 +403,7 @@ def _resolve_overall(
     accountability_block: dict,
     deploy_block: dict,
     kernel_block: dict,
+    cycle_state: dict | None = None,
 ) -> tuple[str, str | None, str | None, str | None]:
     """Pick the strictest verdict across all sub-blocks. Returns
     (status, summary, diagnostic_code, blocking_reason)."""
@@ -389,6 +416,33 @@ def _resolve_overall(
     kernel_status = kernel_block.get("status")
     deploy_status = deploy_block.get("status")
     changed = deploy_block.get("changed_files_count", 0)
+
+    # Post-push winners — when commit/push actually succeeded, the
+    # cycle is at minimum "pushed" and possibly "completed". This
+    # branch dominates over everything except a hard operator_required
+    # signal so a stale supervisor verdict can't drag us back to
+    # blocked.
+    if deploy_status == "completed":
+        return (
+            "completed",
+            "factory cycle completed — push + GitHub Actions success",
+            "healthy",
+            None,
+        )
+    if deploy_status == "actions_pending":
+        return (
+            "running",
+            "push succeeded — GitHub Actions in progress",
+            "actions_pending",
+            "GitHub Actions completion 대기 중",
+        )
+    if deploy_status == "pushed":
+        return (
+            "running",
+            "push succeeded — GitHub Actions status unknown (gh CLI 미사용)",
+            "actions_pending",
+            "GitHub Actions 상태를 별도로 확인해주세요 (Actions URL 참조)",
+        )
 
     # Hardest signals first — operator_required wins over everything.
     if pipe_status == "operator_required":
@@ -408,13 +462,30 @@ def _resolve_overall(
 
     # Ready-to-publish — the cycle finished its development phase
     # successfully (changed_files > 0 + qa passed) but commit/push
-    # hasn't run yet. NOT a failure. Supervisor may have flagged
-    # `ready_to_publish` directly OR we infer it from sub-block fields
-    # so a stale supervisor verdict can't downgrade us.
+    # hasn't run yet. NOT a failure. Inferred from cycle_state
+    # directly so a missing/stale supervisor report can't downgrade
+    # the verdict. The 4 spec conditions:
+    #   - claude_apply_status == "applied"
+    #   - claude_apply_changed_files.length > 0
+    #   - qa_status == "passed"
+    #   - implementation_ticket_status == "generated"
+    cs = cycle_state or {}
+    cs_apply_status = (cs.get("claude_apply_status") or "").strip()
+    cs_changed = list(cs.get("claude_apply_changed_files") or [])
+    cs_qa = (cs.get("qa_status") or "").strip()
+    cs_ticket = (cs.get("implementation_ticket_status") or "").strip()
     deploy_qa_status = deploy_block.get("qa_status")
     deploy_commit = deploy_block.get("commit_hash")
     deploy_push = deploy_block.get("push_status")
-    cycle_shipped_code = (
+    cycle_shipped_code_strict = (
+        cs_apply_status == "applied"
+        and len(cs_changed) > 0
+        and cs_qa == "passed"
+        and cs_ticket == "generated"
+        and deploy_push not in {"ok", "succeeded"}
+        and not deploy_commit
+    )
+    cycle_shipped_code_loose = (
         changed > 0
         and deploy_qa_status == "passed"
         and deploy_push not in {"ok", "succeeded"}
@@ -422,7 +493,8 @@ def _resolve_overall(
     )
     if (
         acc_status == "ready_to_publish"
-        or (cycle_shipped_code and acc_meaningful and acc_ticket)
+        or cycle_shipped_code_strict
+        or (cycle_shipped_code_loose and acc_meaningful and acc_ticket)
     ):
         return (
             "ready_to_publish",
@@ -550,6 +622,61 @@ def _suggest_next_action(status: str, diagnostic: str | None,
     return "상태 확인 필요"
 
 
+def _iso_to_epoch(iso: str | None) -> float:
+    if not iso:
+        return 0.0
+    try:
+        return datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# State files older than this many seconds compared to factory_state's
+# updated_at are treated as stale and their failure/stuck signals are
+# ignored at the aggregator level (still kept on disk for inspection).
+STALE_STATE_THRESHOLD_SEC = 60.0
+
+
+def _filter_stale_state(
+    name: str,
+    sub_state: dict,
+    cycle_epoch: float,
+    stale_log: list[str],
+) -> dict:
+    """Return the sub_state with failure/stuck signals removed when it
+    is older than the canonical factory_state by more than the
+    threshold. Appends a human-readable line to `stale_log` so the
+    runner can emit a System Log marker."""
+    if not sub_state or cycle_epoch <= 0:
+        return sub_state
+    sub_epoch = _iso_to_epoch(sub_state.get("updated_at"))
+    if sub_epoch <= 0 or (cycle_epoch - sub_epoch) <= STALE_STATE_THRESHOLD_SEC:
+        return sub_state
+
+    has_failure_signal = any([
+        sub_state.get("failed_stage"),
+        (sub_state.get("status") or "") in {
+            "failed", "stuck", "blocked", "no_progress", "planning_only",
+            "operator_required", "broken", "degraded",
+        },
+        (sub_state.get("diagnostic_code") or "") not in {"", "healthy", "unknown"},
+    ])
+    if not has_failure_signal:
+        return sub_state
+
+    age = int(cycle_epoch - sub_epoch)
+    stale_log.append(
+        f"{name} updated {age}s before factory_state — failure signals ignored"
+    )
+    cleaned = dict(sub_state)
+    cleaned["failed_stage"] = None
+    cleaned["diagnostic_code"] = "healthy"
+    cleaned["status"] = "idle"
+    cleaned["_stale_filtered"] = True
+    cleaned["_stale_age_sec"] = age
+    return cleaned
+
+
 def aggregate(runner_meta: dict | None = None) -> dict:
     """Read every state file, compute the unified verdict, persist it
     to .runtime/control_state.json, and return the dict."""
@@ -558,9 +685,23 @@ def aggregate(runner_meta: dict | None = None) -> dict:
     publish_state = _read_json(runtime / "factory_publish.json") or {}
     cmd_diag = _read_json(runtime / "factory_command_diagnostics.json") or {}
     op_state = _read_json(runtime / "operator_fix_state.json") or {}
-    pipeline_state = _read_json(runtime / "pipeline_state.json") or {}
-    fp_state = _read_json(runtime / "forward_progress_state.json") or {}
+    pipeline_state_raw = _read_json(runtime / "pipeline_state.json") or {}
+    fp_state_raw = _read_json(runtime / "forward_progress_state.json") or {}
     supervisor_report = _read_json(runtime / "agent_accountability.json") or {}
+
+    # Stale-state filter — when the canonical factory_state.json is much
+    # newer than a sub-state's updated_at, the sub-state's failure
+    # signals are from a prior cycle and must NOT poison this cycle's
+    # verdict. We keep the data on disk for forensic inspection but
+    # nullify failure-shaped fields before passing into the resolver.
+    cycle_epoch = _iso_to_epoch(cycle_state.get("updated_at"))
+    stale_log: list[str] = []
+    pipeline_state = _filter_stale_state(
+        "pipeline_state", pipeline_state_raw, cycle_epoch, stale_log,
+    )
+    fp_state = _filter_stale_state(
+        "forward_progress_state", fp_state_raw, cycle_epoch, stale_log,
+    )
 
     # Direct aggregator-level diagnostic for the "claude_apply applied
     # but produced 0 files" case. The pipeline orchestrator usually
@@ -603,6 +744,7 @@ def aggregate(runner_meta: dict | None = None) -> dict:
         accountability,
         deploy,
         kernel,
+        cycle_state=cycle_state,
     )
 
     # Failed_stage at top level — pull from the most-specific source.
@@ -633,6 +775,17 @@ def aggregate(runner_meta: dict | None = None) -> dict:
         "should_stop_continuous": should_stop_continuous,
         "updated_at": _utc_now_iso(),
         "factory_status_raw": factory_status,
+        # Latest source-of-truth timestamps so the dashboard can render
+        # "stale runner" / "factory not updating" without computing
+        # them itself.
+        "source_updated_at": {
+            "factory_state": cycle_state.get("updated_at"),
+            "publish_state": publish_state.get("last_push_at"),
+            "pipeline_state": pipeline_state_raw.get("updated_at"),
+            "forward_progress_state": fp_state_raw.get("updated_at"),
+            "agent_accountability": supervisor_report.get("evaluated_at"),
+        },
+        "stale_filtered": stale_log,
         "liveness": liveness,
         "execution_kernel": kernel,
         "pipeline": pipeline,
