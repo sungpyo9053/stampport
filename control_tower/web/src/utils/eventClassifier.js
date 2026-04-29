@@ -254,11 +254,17 @@ const KEYWORD_TABLE = [
   // Operator Request lifecycle — events synthesized from
   // operator_fix.log[]. Place these BEFORE the generic Claude/Git rules
   // so the more specific phrases win.
-  [/operator\s+request\s+received/i,                        { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
-  [/operator\s+request\s+blocked/i,                         { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
-  [/operator\s+request\s+(—|-).*no\s+code\s+change/i,       { category: "Claude", actor: "claude", severity: "warn",    phase: "skipped"   }],
-  [/operator\s+request\s+(—|-).*factory\s+pause/i,          { category: "Runner", actor: "factory", severity: "warn",   phase: "info"      }],
-  [/git\s+push\s+failed/i,                                  { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/operator\s+request\s+received/i,                          { category: "Claude", actor: "claude", severity: "info",    phase: "started"   }],
+  [/operator\s+request\s+blocked/i,                           { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/operator_?request\s+state\s+mismatch\s+detected/i,        { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+  [/operator_?request\s+stale\s+failure\s+cleared/i,          { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/operator_?request\s+health\s+recovered/i,                 { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/operator\s+request\s+no[-\s]?op\s+completed/i,            { category: "Claude", actor: "claude", severity: "info",    phase: "completed" }],
+  [/operator\s+request\s+no\s+code\s+change\s+failed/i,       { category: "Error",  actor: "claude", severity: "warn",    phase: "failed"    }],
+  [/operator\s+request\s+aborted/i,                           { category: "Error",  actor: "claude", severity: "error",   phase: "failed"    }],
+  [/operator\s+request\s+(—|-).*no\s+code\s+change/i,         { category: "Claude", actor: "claude", severity: "warn",    phase: "skipped"   }],
+  [/operator\s+request\s+(—|-).*factory\s+pause/i,            { category: "Runner", actor: "factory", severity: "warn",   phase: "info"      }],
+  [/git\s+push\s+failed/i,                                    { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
 
   // Factory Watchdog (Doctor) — the runner's self-monitoring loop.
   // These come from cycleEventSynth.js synthesizing watchdog.log

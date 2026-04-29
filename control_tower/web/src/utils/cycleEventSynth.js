@@ -334,6 +334,13 @@ const OPERATOR_KIND_TO_PHRASE = {
   push_completed:              "git push completed",
   git_push_failed:             "git push failed",
   operator_request_no_changes: "operator request — no code change",
+  // Stale-state mismatch / no-op clarification events.
+  operator_request_noop_success:           "operator request no-op completed",
+  operator_request_no_code_change_failed:  "operator request no code change failed",
+  operator_request_aborted:                "operator request aborted",
+  operator_request_state_mismatch_detected:"operator_request state mismatch detected",
+  operator_request_stale_failure_cleared:  "operator_request stale failure cleared",
+  operator_request_health_recovered:       "operator_request health recovered",
 };
 
 function operatorEntryId(entry) {

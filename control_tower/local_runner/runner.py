@@ -3654,7 +3654,45 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
         r"commit\s+hash\s*[:：]\s*([0-9a-fA-F]{7,40})", out
     )
     commit_short = commit_match.group(1)[:8] if commit_match else None
-    aborted = "aborted" in out.lower() or "거부" in out
+
+    # Strict status parser. The earlier code did a bare substring match
+    # on "aborted" against the whole output, which falsely tripped when
+    # Claude echoed the prompt template's enum
+    # (`applied | committed | pushed | aborted | failed`) verbatim. We
+    # instead pull the FIRST non-blank line after the `## 상태` heading
+    # and reject any pipe-delimited enum line.
+    parsed_status = ""
+    parsed_summary = ""
+    m_status = re.search(r"##\s*상태\s*\n([^\n]+)", out)
+    if m_status:
+        line = m_status.group(1).strip().lower()
+        # If the line still contains the prompt's enum separator, ignore it.
+        if "|" in line and len(line) > 20:
+            line = ""
+        # Strip leading punctuation Claude sometimes leaves
+        # (e.g. "- applied" or "* applied").
+        line = re.sub(r"^[\-\*\•\s]+", "", line).strip()
+        parsed_status = line
+    m_summary = re.search(r"##\s*요약\s*\n([^\n#]+(?:\n[^\n#]+)?)", out)
+    if m_summary:
+        parsed_summary = m_summary.group(1).strip()
+
+    # Detect "this request was a no-op smoke / ping by design" — checks
+    # both the original request text AND Claude's summary line. Useful
+    # so a "테스트 해볼게요" message doesn't get classified as
+    # qa_failed when Claude correctly answered "no code change needed".
+    NOOP_SIGNALS = (
+        "테스트", "확인용", "동작 확인", "smoke", "ping", "alive",
+        "수신 확인", "수신·해석", "코드 변경 없이", "응답 확인",
+        "no-op", "noop", "작업 없음", "작업 안 함",
+    )
+    request_lc = (prompt_raw or "").lower()
+    summary_lc = parsed_summary.lower()
+    noop_intent = (
+        any(sig.lower() in request_lc for sig in NOOP_SIGNALS)
+        or any(sig.lower() in summary_lc for sig in NOOP_SIGNALS)
+    )
+    aborted_strict = parsed_status in {"aborted", "거부"}
 
     if commit_short:
         _op_emit(
@@ -3670,30 +3708,83 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
             severity="success",
         )
 
-    # Step E — final classification + diagnostics for the no-changes /
-    # push-not-happened branches.
+    # Step E — final classification. New status model:
+    #   noop_success          — Claude understood the test/ping and
+    #                            intentionally produced no code change
+    #   no_changes            — Claude returned with no file change but
+    #                            no clear noop intent (info, not failure)
+    #   no_code_change_failed — operator asked for a code change but no
+    #                            changed_files materialised
+    #   applied               — code changes landed without a push
+    #   published             — code changes landed AND pushed to main
+    #   qa_failed             — Claude itself reported aborted (e.g.
+    #                            QA / safety gate refused)
+    #   git_push_failed       — auto_commit_push=true but no push happened
+    #                            and Claude didn't say aborted
     if not new_or_changed:
-        _op_save_diagnostics(
-            "no_changes",
-            failed_stage="post_claude",
-            failed_reason="Claude 가 working tree 를 변경하지 않았습니다.",
-            suggested_action=(
-                "요청 본문에 더 구체적인 수정 지시를 넣거나, 이미 적용된 변경이 "
-                "있는지 확인"
-            ),
-        )
-        _op_emit(
-            kind="operator_request_no_changes",
-            message="operator request — Claude 가 변경 없음으로 종료",
-            severity="warn",
-            diagnostic_code="no_changes",
-        )
-        publish_status = "not_requested"
-        final_status = "applied"
-    elif aborted:
+        if noop_intent or parsed_status in {"applied", "noop", "noop_success"}:
+            # Spec rule A: test/ping requests with no code change must
+            # not land as qa_failed. Mark them noop_success so the
+            # watchdog skips the failure-loop branch entirely.
+            _op_save_diagnostics(
+                "operator_noop_success",
+                failed_stage=None,
+                failed_reason=None,
+                suggested_action="조치 필요 없음 — 요청은 정상 수신/해석되었습니다.",
+            )
+            _op_emit(
+                kind="operator_request_noop_success",
+                message="operator request no-op completed — 코드 변경 불필요 요청 정상 처리",
+                severity="info",
+                diagnostic_code="operator_noop_success",
+            )
+            publish_status = "not_requested"
+            final_status = "noop_success"
+        elif aborted_strict:
+            # Claude's `## 상태` line literally says aborted/거부 AND we
+            # don't see a noop intent — treat as a real refusal.
+            _op_save_diagnostics(
+                "operator_aborted",
+                failed_stage="claude_decision",
+                failed_reason=(
+                    parsed_summary
+                    or "Claude 가 요청을 거부했습니다 (## 상태 = aborted)."
+                ),
+                suggested_action=(
+                    "Claude 응답의 ## 거부 사유 확인 후 요청 본문을 보강해 재시도"
+                ),
+            )
+            _op_emit(
+                kind="operator_request_aborted",
+                message="operator request aborted — Claude 가 요청을 거부",
+                severity="error",
+                diagnostic_code="operator_aborted",
+            )
+            publish_status = "blocked"
+            final_status = "qa_failed"
+        else:
+            # Spec rule B: real code change was expected but none landed.
+            _op_save_diagnostics(
+                "operator_no_code_change",
+                failed_stage="claude_apply",
+                failed_reason="Claude 가 working tree 를 변경하지 않았습니다.",
+                suggested_action=(
+                    "실제 수정 대상 파일과 기대 변경을 포함해 다시 요청하세요. "
+                    "테스트/확인 메시지였다면 요청 본문에 명시하세요."
+                ),
+            )
+            _op_emit(
+                kind="operator_request_no_code_change_failed",
+                message="operator request no code change failed — 변경 요청이 실제 코드 변경으로 이어지지 못함",
+                severity="warning",
+                diagnostic_code="operator_no_code_change",
+            )
+            publish_status = "blocked"
+            final_status = "no_code_change_failed"
+    elif aborted_strict:
         publish_status = "blocked"
         final_status = "qa_failed"
-    elif auto_commit_push and not pushed and not aborted:
+    elif auto_commit_push and not pushed:
         # Claude was authorized to push but didn't. Treat as a soft
         # git_push_failed signal so the operator knows the change is
         # sitting in the working tree without being committed.
@@ -3715,7 +3806,7 @@ def _h_operator_request(payload: dict) -> tuple[bool, str]:
             diagnostic_code="git_push_failed",
         )
         publish_status = "blocked"
-        final_status = "applied"
+        final_status = "push_failed"
     elif pushed:
         publish_status = "published"
         final_status = "published"
@@ -4101,21 +4192,63 @@ def _watchdog_diagnose() -> dict:
             "suggested_action": "factory pause + deploy lock 해제. 위험 조치는 운영자 확인 필요.",
         }
 
-    # 4. operator_request_failed_repeatedly — operator_fix_state shows
-    # a failed run AND the last command_diagnostics row references the
-    # same.
-    if (
-        operator_state.get("status") in {"failed", "qa_failed"}
-        and (operator_state.get("last_message") or "")
-    ):
-        last_msg = operator_state.get("last_message") or ""
-        evidence.append(f"operator_status={operator_state.get('status')}")
+    # 4. operator_request health.
+    #
+    # Failure states (qa_failed / validation_failed / no_code_change_failed
+    # / push_failed / git_failed / failed) deserve a watchdog response.
+    # noop_success / no_changes / applied / published are healthy and
+    # must NOT trigger the operator_request_failed_repeatedly loop.
+    #
+    # We also detect stale_state_mismatch — operator_status=qa_failed
+    # while last_message clearly says "상태 applied / noop / published".
+    # That used to come from the bare-substring "aborted" misclassifier
+    # that's now fixed at the source, but the watchdog still needs to
+    # heal already-persisted bad state files without manual intervention.
+    OPERATOR_FAILURE_STATES = {
+        "failed",
+        "qa_failed",
+        "validation_failed",
+        "no_code_change_failed",
+        "push_failed",
+        "git_failed",
+    }
+    op_status = (operator_state.get("status") or "").strip()
+    last_msg = operator_state.get("last_message") or ""
+    last_msg_lc = last_msg.lower()
+    healthy_keywords = (
+        "상태 applied", "상태 noop", "상태 published",
+        "noop completed", "noop_success",
+        "코드 변경 없이",
+    )
+    indicates_healthy = any(k in last_msg_lc for k in healthy_keywords)
+
+    if op_status in OPERATOR_FAILURE_STATES and indicates_healthy:
+        # The status row says failed, but the last_message body shows
+        # the request actually succeeded as a no-op. That's the exact
+        # bug pattern the spec is fixing. Surface as stale_state_mismatch
+        # so the safe-repair branch can normalize the row.
+        evidence.append(f"operator_status={op_status}")
+        evidence.append(f"last_message_excerpt={last_msg[:160]}")
+        return {
+            "diagnostic_code": "stale_state_mismatch",
+            "severity": "info",
+            "root_cause": (
+                f"operator_request 상태는 {op_status} 인데 마지막 메시지는 "
+                "정상 처리(no-op / applied)로 보임 — stale 상태 정리 필요."
+            ),
+            "evidence": evidence,
+            "safe_auto_fix_available": True,
+            "suggested_action": "operator_fix_state.status 를 noop_success 로 정규화",
+        }
+
+    if op_status in OPERATOR_FAILURE_STATES:
+        evidence.append(f"operator_status={op_status}")
         evidence.append(f"operator_last_message={last_msg[:120]}")
         # Detect "claude not started" — a sub-case worth its own code.
         if (
-            "claude" in last_msg.lower()
+            "claude" in last_msg_lc
             and ("실행 실패" in last_msg or "FileNotFound" in last_msg
-                 or "not found" in last_msg.lower())
+                 or "not found" in last_msg_lc)
         ):
             return {
                 "diagnostic_code": "claude_not_started",
@@ -4131,7 +4264,9 @@ def _watchdog_diagnose() -> dict:
         return {
             "diagnostic_code": "operator_request_failed_repeatedly",
             "severity": "warning",
-            "root_cause": "operator_request 가 최근 실패 상태로 남아 있음",
+            "root_cause": (
+                f"operator_request 가 최근 {op_status} 상태로 남아 있음"
+            ),
             "evidence": evidence,
             "safe_auto_fix_available": True,
             "suggested_action": "smoke test 실행으로 commit/push 파이프라인 점검",
@@ -4414,9 +4549,111 @@ def _watchdog_apply_safe_repair(diag: dict, state: dict) -> list[str]:
         msg_r = _watchdog_action_reset_deploy_progress(reason=code)
         actions.append(f"reset_deploy_progress · {msg_r}")
 
+    if code == "stale_state_mismatch":
+        # Heal the operator_fix_state row whose status disagrees with
+        # its last_message body. Same heuristic as the orchestrator's
+        # normalize_operator_state action — kept inline here so the
+        # legacy watchdog path repairs without depending on a pipeline
+        # tick landing first.
+        try:
+            cur = _read_operator_fix_state() or {}
+            prior = cur.get("status")
+            msg_body = (cur.get("last_message") or "").lower()
+            if "상태 published" in msg_body or "pushed to main: yes" in msg_body:
+                new_status = "published"
+            elif "상태 applied" in msg_body or "코드 변경 없이" in msg_body:
+                new_status = "noop_success"
+            else:
+                new_status = "noop_success"
+            _op_emit(
+                kind="operator_request_state_mismatch_detected",
+                message=(
+                    f"operator_request state mismatch detected — "
+                    f"prior={prior}, message indicates {new_status}"
+                ),
+                severity="warn",
+            )
+            _save_operator_fix_state({
+                "status": new_status,
+                "publish_status": (
+                    "published" if new_status == "published"
+                    else "not_requested"
+                ),
+                "last_message": (
+                    f"[normalize] prior={prior} → {new_status} (watchdog stale 정리). "
+                    f"원본: {(cur.get('last_message') or '')[:300]}"
+                ),
+            })
+            _op_emit(
+                kind="operator_request_stale_failure_cleared",
+                message=(
+                    f"operator_request stale failure cleared — "
+                    f"{prior} → {new_status}"
+                ),
+                severity="info",
+            )
+            _op_emit(
+                kind="operator_request_health_recovered",
+                message="operator_request health recovered — Watchdog 정상화 완료",
+                severity="success",
+            )
+            actions.append(
+                f"normalize_operator_state · {prior} → {new_status}"
+            )
+        except Exception as e:  # noqa: BLE001
+            actions.append(f"normalize_operator_state (skip: {e})")
+
     if code == "operator_request_failed_repeatedly":
         ok, msg_s = _watchdog_action_smoke_test()
         actions.append(f"smoke_test · ({'ok' if ok else 'skip/fail'}) {msg_s}")
+        # If smoke test confirmed commit/push works, the persisted
+        # qa_failed / no_code_change_failed row from a prior buggy run
+        # is stale by definition. Normalize it so the watchdog stops
+        # rediscovering the same "failure" on the next tick.
+        if ok:
+            try:
+                cur = _read_operator_fix_state() or {}
+                prior = cur.get("status")
+                if prior in {
+                    "failed", "qa_failed", "validation_failed",
+                    "no_code_change_failed", "push_failed", "git_failed",
+                }:
+                    msg_body = (cur.get("last_message") or "").lower()
+                    if "상태 published" in msg_body or "pushed to main: yes" in msg_body:
+                        new_status = "published"
+                    elif "상태 applied" in msg_body or "코드 변경 없이" in msg_body:
+                        new_status = "noop_success"
+                    else:
+                        new_status = "noop_success"
+                    _save_operator_fix_state({
+                        "status": new_status,
+                        "publish_status": (
+                            "published" if new_status == "published"
+                            else "not_requested"
+                        ),
+                        "last_message": (
+                            f"[smoke-clear] prior={prior} → {new_status} "
+                            f"(commit/push 파이프라인 healthy 확인)."
+                        ),
+                    })
+                    _op_emit(
+                        kind="operator_request_stale_failure_cleared",
+                        message=(
+                            f"operator_request stale failure cleared — "
+                            f"{prior} → {new_status} (smoke test 통과)"
+                        ),
+                        severity="info",
+                    )
+                    _op_emit(
+                        kind="operator_request_health_recovered",
+                        message="operator_request health recovered — smoke test 후 정상화",
+                        severity="success",
+                    )
+                    actions.append(
+                        f"operator_state_clear · {prior} → {new_status}"
+                    )
+            except Exception as e:  # noqa: BLE001
+                actions.append(f"operator_state_clear (skip: {e})")
 
     for label in actions:
         _watchdog_log_event(
@@ -4799,7 +5036,7 @@ def _watchdog_tick() -> None:
         # claim "healthy" when the PipelineRecoveryPanel is asking for
         # human intervention.
         po_op_required = bool(
-            (pipeline_outcome or {}).get("result", {}).get("operator_required")
+            ((pipeline_outcome or {}).get("result") or {}).get("operator_required")
         )
         po_code = ((pipeline_outcome or {}).get("diagnosis") or {}).get(
             "diagnostic_code"
@@ -5406,6 +5643,32 @@ DIAGNOSTIC_REPAIR_MAP: dict[str, dict] = {
         "actions": ["operator_required"],
         "description": "operator_request 가 반복 실패 — 운영자 확인 필요.",
     },
+    "stale_state_mismatch": {
+        "stage": "claude_apply",
+        "actions": ["normalize_operator_state"],
+        "description": (
+            "operator_request 의 status 와 last_message 가 어긋남 (status=qa_failed "
+            "이지만 메시지는 applied/no-op). status 를 정규화합니다."
+        ),
+    },
+    "operator_no_code_change": {
+        "stage": "claude_apply",
+        "actions": ["operator_required"],
+        "description": (
+            "operator_request 가 코드 변경을 요구했지만 changed_files=0 — "
+            "수정 대상 파일과 기대 변경을 포함해 다시 요청 필요."
+        ),
+    },
+    "operator_noop_success": {
+        "stage": "claude_apply",
+        "actions": ["noop"],
+        "description": "operator_request 는 정상 no-op — 추가 조치 불요.",
+    },
+    "operator_aborted": {
+        "stage": "claude_apply",
+        "actions": ["operator_required"],
+        "description": "Claude 가 요청을 거부 — 거부 사유 확인 후 재요청.",
+    },
     "stale_runner": {
         "stage": "validation_qa",
         "actions": ["operator_required"],
@@ -5940,6 +6203,58 @@ def _pipeline_apply_recovery(
                 reason=f"orchestrator·{diag.get('diagnostic_code')}"
             )
             applied.append(f"pause_factory · {note}")
+        elif action == "normalize_operator_state":
+            # Heal a stale qa_failed row when the message body says
+            # the request actually completed as no-op / applied.
+            try:
+                cur = _read_operator_fix_state() or {}
+                prior = cur.get("status")
+                msg = (cur.get("last_message") or "").lower()
+                # Pick the "true" status from the message body. Default
+                # to noop_success which is the most common pattern.
+                if "상태 published" in msg or "pushed to main: yes" in msg:
+                    new_status = "published"
+                elif "상태 applied" in msg:
+                    new_status = "applied"
+                else:
+                    new_status = "noop_success"
+                _op_emit(
+                    kind="operator_request_state_mismatch_detected",
+                    message=(
+                        f"operator_request state mismatch detected — "
+                        f"prior={prior}, message indicates {new_status}"
+                    ),
+                    severity="warn",
+                )
+                _save_operator_fix_state({
+                    "status": new_status,
+                    "publish_status": (
+                        "published" if new_status == "published"
+                        else "not_requested"
+                    ),
+                    "last_message": (
+                        f"[normalize] prior={prior} → {new_status} (watchdog "
+                        f"stale 정리). 원본: {(cur.get('last_message') or '')[:300]}"
+                    ),
+                })
+                _op_emit(
+                    kind="operator_request_stale_failure_cleared",
+                    message=(
+                        f"operator_request stale failure cleared — "
+                        f"{prior} → {new_status}"
+                    ),
+                    severity="info",
+                )
+                _op_emit(
+                    kind="operator_request_health_recovered",
+                    message="operator_request health recovered — Watchdog 정상화 완료",
+                    severity="success",
+                )
+                applied.append(
+                    f"normalize_operator_state · {prior} → {new_status}"
+                )
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"normalize_operator_state ({e})")
         elif action == "claude_repair":
             if not _watchdog_allow_claude_repair():
                 skipped.append("claude_repair (FACTORY_WATCHDOG_ALLOW_CLAUDE_REPAIR=false)")
@@ -6671,6 +6986,86 @@ def _build_agent_accountability_meta() -> dict:
     }
 
 
+def _build_operator_request_health_meta() -> dict:
+    """Compose `local_factory.operator_request_health` — the dashboard's
+    one-stop view of "is the operator_request loop healthy or holding a
+    stale failure". Reads operator_fix_state.json + command_diagnostics
+    and never claims healthy when the persisted status is in a real
+    failure state.
+    """
+    op_state = _read_operator_fix_state() or {}
+    cmd_diag = _read_command_diagnostics() or {}
+
+    last_status = op_state.get("status") or "idle"
+    last_msg = op_state.get("last_message") or ""
+    last_msg_lc = last_msg.lower()
+
+    OPERATOR_FAILURE_STATES = {
+        "failed", "qa_failed", "validation_failed",
+        "no_code_change_failed", "push_failed", "git_failed",
+    }
+    OPERATOR_HEALTHY_STATES = {
+        "idle", "running", "applied", "published",
+        "noop_success", "no_changes",
+    }
+
+    healthy_keywords = (
+        "상태 applied", "상태 noop", "상태 published",
+        "noop completed", "noop_success", "코드 변경 없이",
+    )
+    indicates_healthy = any(k in last_msg_lc for k in healthy_keywords)
+    stale_state_mismatch = bool(
+        last_status in OPERATOR_FAILURE_STATES and indicates_healthy
+    )
+
+    if last_status == "running":
+        status = "degraded" if stale_state_mismatch else "unknown"
+    elif last_status in OPERATOR_HEALTHY_STATES:
+        status = "healthy"
+    elif stale_state_mismatch:
+        status = "degraded"
+    elif last_status in OPERATOR_FAILURE_STATES:
+        status = "broken"
+    else:
+        status = "unknown"
+
+    diagnostic_code = cmd_diag.get("diagnostic_code") if (
+        cmd_diag.get("last_command") == "operator_request"
+    ) else None
+    failed_stage = cmd_diag.get("failed_stage") if (
+        cmd_diag.get("last_command") == "operator_request"
+    ) else None
+    suggested = cmd_diag.get("suggested_action") if (
+        cmd_diag.get("last_command") == "operator_request"
+    ) else None
+    if stale_state_mismatch:
+        diagnostic_code = "stale_state_mismatch"
+        suggested = (
+            "operator_fix_state.status 를 noop_success / applied 로 정규화하면 "
+            "Watchdog 의 stale 실패 루프가 풀립니다."
+        )
+
+    claude_cmd = " ".join(_resolve_claude_command())
+
+    return {
+        "status": status,
+        "last_status": last_status,
+        "diagnostic_code": diagnostic_code,
+        "failed_stage": failed_stage,
+        "failed_reason": (
+            cmd_diag.get("failed_reason")
+            if cmd_diag.get("last_command") == "operator_request" else None
+        ),
+        "claude_command": claude_cmd,
+        "changed_files_count": len(op_state.get("changed_files") or []),
+        "stdout_tail": cmd_diag.get("stdout_tail"),
+        "stderr_tail": cmd_diag.get("stderr_tail"),
+        "suggested_action": suggested,
+        "stale_state_mismatch": stale_state_mismatch,
+        "last_checked_at": _utc_now_z(),
+    }
+
+
 def _build_forward_progress_meta() -> dict:
     """Heartbeat metadata block under `local_factory.forward_progress`.
     Always present so the dashboard can render the panel even before
@@ -7026,6 +7421,7 @@ def _build_local_factory_meta() -> dict:
         "pipeline_recovery": _build_pipeline_recovery_meta(),
         "forward_progress": _build_forward_progress_meta(),
         "agent_accountability": _build_agent_accountability_meta(),
+        "operator_request_health": _build_operator_request_health_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See
