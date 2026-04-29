@@ -222,6 +222,15 @@ const WATCHDOG_KIND_TO_PHRASE = {
   watchdog_escalated:               "watchdog escalated",
   watchdog_disabled:                "watchdog disabled",
   watchdog_healthy:                 "watchdog healthy",
+  // Pipeline Recovery Orchestrator entries — the watchdog mirrors them
+  // into its log so they surface in the same System Log feed.
+  pipeline_stage_failed:            "Stage failed",
+  pipeline_rollback:                "Rollback to stage",
+  pipeline_repair_started:          "Repair action started",
+  pipeline_repair_completed:        "Repair action completed",
+  pipeline_operator_required:       "Operator required",
+  pipeline_no_changes:              "No changes to validate",
+  pipeline_tick_failed:             "Pipeline tick failed",
 };
 
 function watchdogEntryId(entry) {
@@ -241,7 +250,15 @@ export function synthesizeWatchdogEvents(runners = []) {
       const phrase = WATCHDOG_KIND_TO_PHRASE[entry.kind] || entry.kind;
       const baseMsg = entry.message || phrase;
       const lc = baseMsg.toLowerCase();
-      const message = lc.includes("watchdog") ? baseMsg : `${phrase} — ${baseMsg}`;
+      const phraseLc = phrase.toLowerCase();
+      // Skip the prefix if the message already starts with the phrase
+      // OR mentions "watchdog" (legacy entries). Pipeline kinds use
+      // English phrases like "Stage failed" / "Repair action started"
+      // that the eventClassifier recognizes verbatim.
+      const message =
+        lc.includes("watchdog") || lc.startsWith(phraseLc)
+          ? baseMsg
+          : `${phrase} — ${baseMsg}`;
       out.push({
         id: watchdogEntryId(entry),
         type: entry.severity === "error" ? "error" : "agent_message",

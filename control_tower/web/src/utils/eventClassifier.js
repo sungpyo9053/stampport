@@ -206,6 +206,23 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Pipeline Recovery Orchestrator — events synthesized from
+  // pipeline_recovery state. The orchestrator's lifecycle drives the
+  // "Doctor" category alongside the watchdog.
+  [/pipeline\s+recovery\s+started/i,                        { category: "Doctor", actor: "system", severity: "info",    phase: "started"   }],
+  [/stage\s+failed/i,                                       { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/rollback\s+to\s+stage/i,                                { category: "Doctor", actor: "factory", severity: "warn",   phase: "info"      }],
+  [/repair\s+action\s+started/i,                            { category: "Doctor", actor: "system", severity: "info",    phase: "started"   }],
+  [/repair\s+action\s+completed/i,                          { category: "Doctor", actor: "system", severity: "success", phase: "completed" }],
+  [/repair\s+action\s+failed/i,                             { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/retry\s+exceeded/i,                                     { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/operator\s+required/i,                                  { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/no\s+changes\s+to\s+validate/i,                         { category: "Doctor", actor: "factory", severity: "info",   phase: "skipped"   }],
+  [/qa\s+on[-\s]?demand\s+started/i,                        { category: "QA",     actor: "factory", severity: "info",   phase: "started"   }],
+  [/claude\s+repair\s+started/i,                            { category: "Claude", actor: "claude",  severity: "info",   phase: "started"   }],
+  [/claude\s+repair\s+completed/i,                          { category: "Claude", actor: "claude",  severity: "success",phase: "completed" }],
+  [/pipeline\s+resumed/i,                                   { category: "Doctor", actor: "factory", severity: "success",phase: "completed" }],
+
   // Operator Request lifecycle — events synthesized from
   // operator_fix.log[]. Place these BEFORE the generic Claude/Git rules
   // so the more specific phrases win.

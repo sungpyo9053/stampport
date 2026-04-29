@@ -1754,6 +1754,52 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
 
     _progress("validating", step="브랜치 / Release Safety Gate 확인 중")
 
+    # 0. Anything to publish?
+    #
+    # Hoist the no-changes check ahead of every other gate. When git
+    # status is clean we have nothing to ship, and forcing the request
+    # through branch_check / publish_blocker_preflight / QA Gate would
+    # only produce noisy failure rows in deploy_progress / command_
+    # diagnostics that the dashboard later mis-reports as "QA Gate
+    # blocked the deploy". Surfacing this as `no_changes_to_deploy`
+    # lets the Pipeline Recovery Orchestrator treat it as "배포할 변경
+    # 없음" instead of "qa_gate failed".
+    changed = _git_changed_files()
+    if not changed:
+        _save_publish_state({
+            "last_push_status": "noop",
+            "last_push_at": _utc_now_z(),
+            "last_publish_message": "no changes to publish",
+            "last_failed_stage": None,
+            "last_attempt_started_at": started_at,
+        })
+        # Make sure deploy_progress reflects "completed without push" —
+        # never "failed" — so a previous QA failure row doesn't haunt
+        # the next operator click. The deploy_to_server caller will
+        # later overwrite this with `actions_triggered` only when
+        # something actually shipped.
+        if track_progress:
+            _set_deploy_progress(
+                "completed",
+                current_step="변경 없음 — 배포 스킵",
+                log_message="no changes to deploy — deploy_progress cleared",
+            )
+        # Mirror to command_diagnostics so the panel reads "no_changes_
+        # to_deploy" instead of falling back to a stale qa_gate row.
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "noop",
+            "failed_stage": None,
+            "diagnostic_code": "no_changes_to_deploy",
+            "failed_reason": None,
+            "suggested_action": (
+                "변경 파일이 없어 push 하지 않습니다 — 새 작업을 commit 한 뒤 다시 시도하세요."
+            ),
+            "occurred_at": _utc_now_z(),
+        })
+        _log_event("publish skipped: no changes to publish (no_changes_to_deploy)")
+        return True, "publish skipped: no changes to publish"
+
     # 1. Must be on main.
     branch = _git_current_branch()
     if branch != "main":
@@ -1770,18 +1816,6 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
     if not bk_ok:
         _record_failure("publish_blocker", bk_msg)
         return False, f"publish failed at publish_blocker: {bk_msg}"
-
-    # 2. Anything to publish?
-    changed = _git_changed_files()
-    if not changed:
-        _save_publish_state({
-            "last_push_status": "noop",
-            "last_push_at": _utc_now_z(),
-            "last_publish_message": "no changes to publish",
-            "last_failed_stage": None,
-            "last_attempt_started_at": started_at,
-        })
-        return True, "publish skipped: no changes to publish"
 
     # 3. Classify into buckets. Risky (secret-shaped) blocks; "blocked"
     # is now an empty bucket — deploy/CI/infra files ride along.
@@ -4428,6 +4462,91 @@ def _watchdog_tick() -> None:
     state["last_checked_at"] = _utc_now_z()
     state["status"] = "watching"
 
+    # Pipeline Recovery Orchestrator runs first — it owns the
+    # stage-aware classification (planner → designer → ... → deploy).
+    # Its decision/result is mirrored into the watchdog log so the
+    # System Log shows "Pipeline recovery started / Stage failed /
+    # Repair action started" entries the dashboard can group with the
+    # legacy watchdog events.
+    pipeline_outcome: dict | None = None
+    try:
+        pipeline_outcome = _pipeline_tick()
+    except Exception as e:  # noqa: BLE001
+        _watchdog_log_event(
+            state,
+            kind="pipeline_tick_failed",
+            message=f"pipeline orchestrator raised: {e}",
+            severity="error",
+        )
+
+    if pipeline_outcome:
+        po_diag = pipeline_outcome.get("diagnosis") or {}
+        po_decision = pipeline_outcome.get("decision")
+        po_result = pipeline_outcome.get("result") or {}
+        po_code = po_diag.get("diagnostic_code") or "unknown"
+        po_failed_stage = po_diag.get("failed_stage")
+        if po_code != "healthy":
+            _watchdog_log_event(
+                state,
+                kind="pipeline_stage_failed",
+                message=(
+                    f"Stage failed — {po_failed_stage} ({po_code}): "
+                    f"{(po_diag.get('root_cause') or '')[:200]}"
+                ),
+                severity=po_diag.get("severity") or "warning",
+                diagnostic_code=po_code,
+                extra={"failed_stage": po_failed_stage},
+            )
+        if po_decision and po_decision.get("rollback_to"):
+            _watchdog_log_event(
+                state,
+                kind="pipeline_rollback",
+                message=(
+                    f"Rollback to stage — {po_decision['rollback_to']} "
+                    f"(code={po_code})"
+                ),
+                severity="warning",
+                diagnostic_code=po_code,
+            )
+        if po_result.get("applied"):
+            _watchdog_log_event(
+                state,
+                kind="pipeline_repair_started",
+                message=(
+                    f"Repair action started — {', '.join(po_result['applied'])[:200]}"
+                ),
+                severity="info",
+                diagnostic_code=po_code,
+            )
+            _watchdog_log_event(
+                state,
+                kind="pipeline_repair_completed",
+                message=(
+                    f"Repair action completed — applied "
+                    f"{len(po_result['applied'])}건"
+                ),
+                severity="info",
+                diagnostic_code=po_code,
+            )
+        if po_result.get("operator_required"):
+            _watchdog_log_event(
+                state,
+                kind="pipeline_operator_required",
+                message=(
+                    f"Operator required — {(po_result.get('next_action') or po_code)[:200]}"
+                ),
+                severity="error",
+                diagnostic_code=po_code,
+            )
+        if po_code == "no_changes_to_deploy":
+            _watchdog_log_event(
+                state,
+                kind="pipeline_no_changes",
+                message="No changes to validate — 배포 없이 종료",
+                severity="info",
+                diagnostic_code=po_code,
+            )
+
     try:
         diag = _watchdog_diagnose()
     except Exception as e:  # noqa: BLE001
@@ -4450,16 +4569,39 @@ def _watchdog_tick() -> None:
     )
 
     if code == "healthy":
-        state["status"] = "healthy"
-        state["repeat_count"] = 0
-        state["auto_repair_blocked_reason"] = None
-        state["safe_actions_taken"] = []
-        _watchdog_log_event(
-            state, kind="watchdog_healthy", message="공장 healthy", severity="info",
+        # Orchestrator may still hold an open operator-required signal
+        # (e.g. retry budget exhausted, claude_repair gated). Reflect
+        # that in the watchdog status so the WatchdogPanel doesn't
+        # claim "healthy" when the PipelineRecoveryPanel is asking for
+        # human intervention.
+        po_op_required = bool(
+            (pipeline_outcome or {}).get("result", {}).get("operator_required")
         )
-        _watchdog_log_event(
-            state, kind="watchdog_check_completed", message="watchdog tick done",
-        )
+        po_code = ((pipeline_outcome or {}).get("diagnosis") or {}).get(
+            "diagnostic_code"
+        ) or "healthy"
+        if po_op_required and po_code not in {"healthy", "no_changes_to_deploy"}:
+            state["status"] = "degraded"
+            state["auto_repair_blocked_reason"] = (
+                f"pipeline orchestrator escalated ({po_code})"
+            )
+            _watchdog_log_event(
+                state,
+                kind="watchdog_check_completed",
+                message="watchdog tick done — orchestrator escalation in effect",
+                severity="warning",
+            )
+        else:
+            state["status"] = "healthy"
+            state["repeat_count"] = 0
+            state["auto_repair_blocked_reason"] = None
+            state["safe_actions_taken"] = []
+            _watchdog_log_event(
+                state, kind="watchdog_healthy", message="공장 healthy", severity="info",
+            )
+            _watchdog_log_event(
+                state, kind="watchdog_check_completed", message="watchdog tick done",
+            )
         _save_watchdog_state(state)
         return
 
@@ -4664,6 +4806,1078 @@ def _build_watchdog_meta() -> dict:
         "stuck_command_sec": _watchdog_stuck_command_sec(),
         "repair_cooldown_sec": _watchdog_repair_cooldown_sec(),
         "max_repeat": _watchdog_max_repeat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Recovery Orchestrator
+#
+# Stage-aware sibling of the Watchdog. Where the Watchdog answers
+# "is the factory healthy", the Orchestrator answers:
+#
+#   "What pipeline stage are we in? Which stage failed? What is the
+#    smallest safe action that gets us back on the rails?"
+#
+# Stages (in order):
+#   1. planner_proposal
+#   2. designer_review
+#   3. pm_decision
+#   4. implementation_ticket
+#   5. claude_apply
+#   6. validation_qa
+#   7. git_commit
+#   8. git_push
+#   9. github_actions
+#  10. server_verification
+#  11. browser_cache_verification
+#
+# State persisted to .runtime/pipeline_state.json (current diagnosis +
+# retry counters + last action) and .runtime/recovery_history.json
+# (append-only audit trail of every recovery decision).
+#
+# Repair actions are looked up from DIAGNOSTIC_REPAIR_MAP, which keeps
+# the policy (rollback_to / max_retry / action / description) declarative
+# rather than hidden inside if/elif chains. Auto-execution is bounded by:
+#   - per-stage max_retry (broken once exceeded)
+#   - FACTORY_WATCHDOG_ALLOW_CLAUDE_REPAIR for the claude_repair action
+#   - existing safe-pause/lock-release primitives for queue cleanup
+# ---------------------------------------------------------------------------
+
+PIPELINE_STATE_FILE = RUNTIME_DIR / "pipeline_state.json"
+RECOVERY_HISTORY_FILE = RUNTIME_DIR / "recovery_history.json"
+PIPELINE_HISTORY_CAP = 30
+PIPELINE_RECOVERY_CAP = 30
+
+# Pipeline contracts — declarative, not function references. Each entry
+# captures what the stage produces, what counts as failure, and the
+# rollback target the orchestrator should jump to when the stage fails.
+PIPELINE_CONTRACTS: list[dict] = [
+    {
+        "stage": "planner_proposal",
+        "input_required": [],
+        "output_required": ["product_planner_report.md"],
+        "diagnostic_codes": ["planner_output_missing", "planner_output_low_quality"],
+        "rollback_to": None,
+        "max_retry": 2,
+    },
+    {
+        "stage": "designer_review",
+        "input_required": ["planner_proposal"],
+        "output_required": ["designer_critique.md", "designer_final_review.md"],
+        "diagnostic_codes": [
+            "designer_output_missing", "designer_output_not_actionable",
+        ],
+        "rollback_to": "planner_proposal",
+        "max_retry": 2,
+    },
+    {
+        "stage": "pm_decision",
+        "input_required": ["designer_review"],
+        "output_required": ["pm_decision.md"],
+        "diagnostic_codes": ["pm_decision_missing"],
+        "rollback_to": "designer_review",
+        "max_retry": 2,
+    },
+    {
+        "stage": "implementation_ticket",
+        "input_required": ["pm_decision"],
+        "output_required": ["implementation_ticket.md"],
+        "diagnostic_codes": [
+            "implementation_ticket_missing", "implementation_ticket_invalid",
+        ],
+        "rollback_to": "pm_decision",
+        "max_retry": 2,
+    },
+    {
+        "stage": "claude_apply",
+        "input_required": ["implementation_ticket"],
+        "output_required": [],  # diff, not a single file
+        "diagnostic_codes": [
+            "claude_apply_skipped", "claude_not_started",
+            "claude_process_failed", "no_code_change",
+            "docs_only_change", "frontend_change_missing",
+            "backend_change_missing",
+        ],
+        "rollback_to": "implementation_ticket",
+        "max_retry": 2,
+    },
+    {
+        "stage": "validation_qa",
+        "input_required": ["claude_apply"],
+        "output_required": ["qa_report.md"],
+        "diagnostic_codes": [
+            "no_changes_to_validate", "qa_not_run",
+            "qa_report_missing_before_run", "qa_report_missing_after_run",
+            "qa_command_failed", "qa_exception_before_report",
+            "validation_failed",
+        ],
+        "rollback_to": "claude_apply",
+        "max_retry": 2,
+    },
+    {
+        "stage": "git_commit",
+        "input_required": ["validation_qa"],
+        "output_required": [],
+        "diagnostic_codes": [
+            "git_dirty_unpublished", "git_commit_failed",
+            "no_changes_to_commit",
+        ],
+        "rollback_to": "claude_apply",
+        "max_retry": 1,
+    },
+    {
+        "stage": "git_push",
+        "input_required": ["git_commit"],
+        "output_required": [],
+        "diagnostic_codes": ["git_push_failed", "non_fast_forward"],
+        "rollback_to": "git_commit",
+        "max_retry": 1,
+    },
+    {
+        "stage": "github_actions",
+        "input_required": ["git_push"],
+        "output_required": [],
+        "diagnostic_codes": [
+            "github_actions_not_triggered", "github_actions_failed",
+        ],
+        "rollback_to": "git_push",
+        "max_retry": 1,
+    },
+    {
+        "stage": "server_verification",
+        "input_required": ["github_actions"],
+        "output_required": [],
+        "diagnostic_codes": ["server_not_updated", "deploy_script_failed"],
+        "rollback_to": None,
+        "max_retry": 1,
+    },
+    {
+        "stage": "browser_cache_verification",
+        "input_required": ["server_verification"],
+        "output_required": [],
+        "diagnostic_codes": ["browser_cache_suspected"],
+        "rollback_to": None,
+        "max_retry": 1,
+    },
+]
+PIPELINE_STAGE_ORDER: list[str] = [c["stage"] for c in PIPELINE_CONTRACTS]
+PIPELINE_CONTRACT_BY_STAGE: dict[str, dict] = {
+    c["stage"]: c for c in PIPELINE_CONTRACTS
+}
+
+
+# Diagnostic → repair recipe. `action` is one of:
+#   noop, noop_clear_failed, operator_required, claude_repair,
+#   release_deploy_lock, reset_deploy_progress, pause_factory,
+#   cancel_inflight.
+# Multiple actions can be chained via a list under `actions`.
+DIAGNOSTIC_REPAIR_MAP: dict[str, dict] = {
+    # 기획/디자인/PM
+    "planner_output_missing": {
+        "stage": "planner_proposal",
+        "actions": ["operator_required"],
+        "description": "planner 산출물이 비어 있습니다 — 운영자 확인 필요.",
+    },
+    "planner_output_low_quality": {
+        "stage": "planner_proposal",
+        "actions": ["operator_required"],
+        "description": "planner 품질 낮음 — 운영자가 product goal / 입력 확인 필요.",
+    },
+    "designer_output_missing": {
+        "stage": "designer_review",
+        "actions": ["operator_required"],
+        "description": "designer 산출물 누락 — planner 단계로 되돌아가 재검토 필요.",
+    },
+    "designer_output_not_actionable": {
+        "stage": "designer_review",
+        "rollback_to": "designer_review",
+        "actions": ["operator_required"],
+        "description": "designer 산출물이 구체적이지 않음 — 운영자가 UI 파일/레이아웃 지시를 보강해 재요청 필요.",
+    },
+    "pm_decision_missing": {
+        "stage": "pm_decision",
+        "actions": ["operator_required"],
+        "description": "PM 결정 미작성 — 운영자가 PM 단계 확인 후 재실행.",
+    },
+    # 구현
+    "implementation_ticket_missing": {
+        "stage": "implementation_ticket",
+        "rollback_to": "pm_decision",
+        "actions": ["claude_repair"],
+        "description": "Implementation Ticket 누락 — PM 단계로 되돌아가 ticket 재생성 요청.",
+    },
+    "implementation_ticket_invalid": {
+        "stage": "implementation_ticket",
+        "rollback_to": "pm_decision",
+        "actions": ["claude_repair"],
+        "description": "Implementation Ticket 의 수정 대상 파일이 비어 있음 — 재작성 요청.",
+    },
+    "claude_apply_skipped": {
+        "stage": "claude_apply",
+        "rollback_to": "implementation_ticket",
+        "actions": ["claude_repair"],
+        "description": "claude_apply 가 skipped — Implementation Ticket 기반으로 직접 재실행.",
+    },
+    "claude_not_started": {
+        "stage": "claude_apply",
+        "actions": ["operator_required"],
+        "description": "Claude CLI 가 실행되지 않음 — PATH / LOCAL_RUNNER_CLAUDE_COMMAND 확인 필요.",
+    },
+    "claude_process_failed": {
+        "stage": "claude_apply",
+        "actions": ["operator_required"],
+        "description": "Claude 프로세스가 실패 — stderr tail 확인 후 재시도.",
+    },
+    "no_code_change": {
+        "stage": "claude_apply",
+        "actions": ["claude_repair"],
+        "description": "Claude 가 변경하지 않음 — 실제 app/web/src 또는 control_tower/web/src 파일을 수정하라고 재요청.",
+    },
+    "docs_only_change": {
+        "stage": "claude_apply",
+        "actions": ["claude_repair"],
+        "description": "docs/config 만 변경 — 실제 화면 코드 변경을 요청.",
+    },
+    "frontend_change_missing": {
+        "stage": "claude_apply",
+        "actions": ["claude_repair"],
+        "description": "프론트 변경이 필요한 ticket 인데 변경이 없음 — 재요청.",
+    },
+    "backend_change_missing": {
+        "stage": "claude_apply",
+        "actions": ["claude_repair"],
+        "description": "백엔드 변경이 필요한 ticket 인데 변경이 없음 — 재요청.",
+    },
+    # 검증
+    "no_changes_to_validate": {
+        "stage": "validation_qa",
+        "actions": ["noop_clear_failed"],
+        "description": "변경 파일 없음 — QA 실패로 처리하지 않고 배포 없음으로 종료.",
+    },
+    "no_changes_to_deploy": {
+        "stage": "validation_qa",
+        "actions": ["noop_clear_failed"],
+        "description": "배포할 변경이 없음 — deploy_progress 를 정상 종료 처리.",
+    },
+    "qa_not_run": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "QA 단계가 실행되지 않음 — 이전 단계 실패 메시지 확인.",
+    },
+    "qa_report_missing_before_run": {
+        "stage": "validation_qa",
+        "actions": ["noop"],
+        "description": "변경이 있으면 on-demand QA 가 자동 실행됩니다 — 결과 대기.",
+    },
+    "qa_report_missing_after_run": {
+        "stage": "validation_qa",
+        "actions": ["claude_repair"],
+        "description": "QA 실행 후에도 report 가 없음 — runner/cycle RUNTIME 경로 점검 + Claude Repair.",
+    },
+    "qa_command_failed": {
+        "stage": "validation_qa",
+        "actions": ["claude_repair"],
+        "description": "QA 검증 명령이 실패 — failed_command + stderr_tail 기반 코드 수정 요청.",
+    },
+    "qa_exception_before_report": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "QA 실행 중 예외 발생 — runner/cycle 코드 수정 후 재시도 (운영자 확인).",
+    },
+    "validation_failed": {
+        "stage": "validation_qa",
+        "actions": ["claude_repair"],
+        "description": "runner-side 검증 실패 — stderr tail 기반 코드 수정 요청.",
+    },
+    # Git
+    "git_dirty_unpublished": {
+        "stage": "git_commit",
+        "actions": ["operator_required"],
+        "description": "working tree 에 미배포 변경 — 운영자가 검토 후 publish.",
+    },
+    "git_commit_failed": {
+        "stage": "git_commit",
+        "actions": ["operator_required"],
+        "description": "git commit 실패 — git status / pre-commit hook 확인.",
+    },
+    "no_changes_to_commit": {
+        "stage": "git_commit",
+        "actions": ["noop_clear_failed"],
+        "description": "commit 할 변경이 없음 — failure 로 처리하지 않음.",
+    },
+    "git_push_failed": {
+        "stage": "git_push",
+        "actions": ["operator_required"],
+        "description": "git push 실패 — branch / ahead-behind 확인 후 안전한 재시도 또는 운영자 처리.",
+    },
+    "non_fast_forward": {
+        "stage": "git_push",
+        "actions": ["operator_required"],
+        "description": "non-fast-forward — 운영자가 직접 origin/main 과 정합 후 재시도.",
+    },
+    # 배포
+    "github_actions_not_triggered": {
+        "stage": "github_actions",
+        "actions": ["operator_required"],
+        "description": "최근 commit + Actions URL 확인 — workflow 가 활성 상태인지 점검.",
+    },
+    "github_actions_failed": {
+        "stage": "github_actions",
+        "actions": ["operator_required"],
+        "description": "Actions 워크플로우 실패 — Actions 탭에서 stderr 확인 후 재시도.",
+    },
+    "server_not_updated": {
+        "stage": "server_verification",
+        "actions": ["operator_required"],
+        "description": "서버 검증이 실패 — 검증 스크립트 또는 서버 상태 확인 필요.",
+    },
+    "deploy_script_failed": {
+        "stage": "server_verification",
+        "actions": ["operator_required"],
+        "description": "deploy 스크립트 실패 — 운영자가 SSH 로그 확인 필요.",
+    },
+    "browser_cache_suspected": {
+        "stage": "browser_cache_verification",
+        "actions": ["operator_required"],
+        "description": "브라우저 캐시로 인한 차이 의심 — hard reload + asset 해시 확인.",
+    },
+    # 운영
+    "current_command_stuck": {
+        "stage": "validation_qa",
+        "actions": ["release_deploy_lock", "reset_deploy_progress"],
+        "description": "명령이 stuck 임 — deploy lock 해제 + deploy_progress 정리.",
+    },
+    "duplicate_command_queue": {
+        "stage": "validation_qa",
+        "actions": ["release_deploy_lock", "reset_deploy_progress"],
+        "description": "중복 큐 — stale 항목 정리.",
+    },
+    "duplicate_deploy_commands": {
+        "stage": "validation_qa",
+        "actions": ["release_deploy_lock", "reset_deploy_progress"],
+        "description": "중복 deploy — lock 해제 후 정리.",
+    },
+    "deploy_failed_repeatedly": {
+        "stage": "github_actions",
+        "actions": ["pause_factory"],
+        "description": "deploy 가 반복 실패 — factory pause 후 운영자 확인 필요.",
+    },
+    "continuous_loop_no_code_change": {
+        "stage": "claude_apply",
+        "actions": ["pause_factory"],
+        "description": "사이클이 코드 변경 없이 반복 — continuous OFF + 운영자 확인.",
+    },
+    "planning_only_loop": {
+        "stage": "claude_apply",
+        "actions": ["pause_factory"],
+        "description": "기획만 반복 — claude_apply 가 진행되지 않음, factory pause.",
+    },
+    "no_code_change_loop": {
+        "stage": "claude_apply",
+        "actions": ["pause_factory"],
+        "description": "코드 변경 없이 반복 — factory pause.",
+    },
+    "operator_request_failed_repeatedly": {
+        "stage": "claude_apply",
+        "actions": ["operator_required"],
+        "description": "operator_request 가 반복 실패 — 운영자 확인 필요.",
+    },
+    "stale_runner": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "runner 가 부팅 이후 수정됨 — restart_runner / update_runner 후 재시도.",
+    },
+    "runner_offline": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "runner offline — Mac 에서 runner 재시작 필요.",
+    },
+    "git_dirty_unpublished_loop": {
+        "stage": "git_commit",
+        "actions": ["operator_required"],
+        "description": "git working tree 변경이 오래도록 push 되지 않음.",
+    },
+    "qa_gate_stuck": {
+        "stage": "validation_qa",
+        "actions": ["claude_repair"],
+        "description": "QA Gate 가 정상 동작하지 않음 — runner 와 cycle 의 RUNTIME 경로 점검.",
+    },
+    "factory_idle_too_long": {
+        "stage": "planner_proposal",
+        "actions": ["operator_required"],
+        "description": "factory idle 시간 초과 — 운영자가 시작 명령 필요.",
+    },
+    "unknown": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "원인 분류 실패 — 수동 점검 필요.",
+    },
+}
+
+# Diagnostic codes Claude Repair is allowed to attempt. These are the
+# code-bug-shaped failures where a bounded Claude prompt can plausibly
+# fix the underlying file.
+CLAUDE_REPAIR_ELIGIBLE_CODES: frozenset[str] = frozenset({
+    "qa_report_missing_after_run",
+    "qa_command_failed",
+    "claude_apply_skipped",
+    "no_code_change",
+    "docs_only_change",
+    "frontend_change_missing",
+    "backend_change_missing",
+    "implementation_ticket_invalid",
+    "implementation_ticket_missing",
+    "validation_failed",
+    "qa_gate_stuck",
+})
+
+
+# --- Pipeline state I/O ---------------------------------------------------
+
+
+def _read_pipeline_state() -> dict:
+    if not PIPELINE_STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(PIPELINE_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_pipeline_state(state: dict) -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        state["updated_at"] = _utc_now_z()
+        PIPELINE_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write pipeline_state: {e}\n")
+
+
+def _read_recovery_history() -> list[dict]:
+    if not RECOVERY_HISTORY_FILE.is_file():
+        return []
+    try:
+        data = json.loads(RECOVERY_HISTORY_FILE.read_text(encoding="utf-8"))
+        return list(data) if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _append_recovery_history(entry: dict) -> None:
+    cur = _read_recovery_history()
+    cur.append(entry)
+    cur = cur[-PIPELINE_RECOVERY_CAP:]
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        RECOVERY_HISTORY_FILE.write_text(
+            json.dumps(cur, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write recovery_history: {e}\n")
+
+
+# --- Diagnosis ------------------------------------------------------------
+
+
+def _pipeline_classify_stages(cycle_state: dict) -> tuple[str | None, str | None]:
+    """Walk the pipeline contracts in order and return
+    (last_success_stage, current_or_failed_stage) based on what cycle.py
+    persisted to factory_state.json. The orchestrator uses this as the
+    backbone for "where in the pipeline are we right now".
+    """
+    last_success: str | None = None
+    current: str | None = None
+
+    def _gen(key: str) -> bool:
+        return (cycle_state.get(key) or "") == "generated"
+
+    # 1. planner_proposal
+    if _gen("product_planner_status"):
+        last_success = "planner_proposal"
+    else:
+        return last_success, "planner_proposal"
+
+    # 2. designer_review — pingpong stages produce designer_critique +
+    # designer_final_review. Either being generated is enough.
+    if (
+        _gen("designer_critique_status")
+        or _gen("designer_final_review_status")
+    ):
+        last_success = "designer_review"
+    else:
+        return last_success, "designer_review"
+
+    # 3. pm_decision
+    if _gen("pm_decision_status"):
+        last_success = "pm_decision"
+    else:
+        return last_success, "pm_decision"
+
+    # 4. implementation_ticket
+    if _gen("implementation_ticket_status"):
+        last_success = "implementation_ticket"
+    else:
+        return last_success, "implementation_ticket"
+
+    # 5. claude_apply — applied (changes), skipped (didn't run), failed
+    apply_status = cycle_state.get("claude_apply_status") or "skipped"
+    apply_changed = list(cycle_state.get("claude_apply_changed_files") or [])
+    if apply_status == "applied" and apply_changed:
+        last_success = "claude_apply"
+    elif apply_status == "applied" and not apply_changed:
+        # Edge: applied label but no diff — treat as still-on-stage.
+        return last_success, "claude_apply"
+    else:
+        return last_success, "claude_apply"
+
+    # 6. validation_qa
+    qa_status = cycle_state.get("qa_status") or "skipped"
+    if qa_status == "passed":
+        last_success = "validation_qa"
+    elif qa_status == "failed":
+        return last_success, "validation_qa"
+    else:
+        # skipped / empty — pipeline hasn't reached QA yet.
+        return last_success, "validation_qa"
+
+    # 7-11 require deploy state, surfaced separately.
+    current = "git_commit"
+    return last_success, current
+
+
+def _pipeline_diagnose() -> dict:
+    """Walk on-disk state, decide (last_success_stage, current_stage,
+    failed_stage, diagnostic_code). Mirrors the watchdog diagnose but
+    is stage-aware.
+
+    Returns:
+      {
+        "current_stage": ...,
+        "last_success_stage": ...,
+        "failed_stage": ... | None,
+        "diagnostic_code": ... | "healthy",
+        "severity": "info" | "warning" | "error",
+        "evidence": [...],
+        "root_cause": "...",
+      }
+    """
+    cycle_state = _read_factory_state() or {}
+    publish_state = _read_publish_state() or {}
+    qa_diag = _read_qa_diagnostics() or {}
+    cmd_diag = _read_command_diagnostics() or {}
+
+    last_success, current_stage = _pipeline_classify_stages(cycle_state)
+    evidence: list[str] = []
+
+    # Honor explicit "no_changes_to_deploy" recorded by deploy_to_server.
+    if (cmd_diag.get("diagnostic_code") == "no_changes_to_deploy"):
+        return {
+            "current_stage": "validation_qa",
+            "last_success_stage": last_success,
+            "failed_stage": None,
+            "diagnostic_code": "no_changes_to_deploy",
+            "severity": "info",
+            "root_cause": "변경 파일 없음 — 배포할 것이 없습니다.",
+            "evidence": ["command_diagnostics.diagnostic_code=no_changes_to_deploy"],
+        }
+
+    # Stale runner trumps everything — operator should restart first.
+    is_stale, _ = _runner_is_stale_now()
+    if is_stale:
+        return {
+            "current_stage": current_stage,
+            "last_success_stage": last_success,
+            "failed_stage": current_stage,
+            "diagnostic_code": "stale_runner",
+            "severity": "warning",
+            "root_cause": "runner.py 가 부팅 이후 수정됨",
+            "evidence": ["runner code mtime > start"],
+        }
+
+    # implementation_ticket missing/invalid — high-leverage failure.
+    ticket_status = cycle_state.get("implementation_ticket_status") or "skipped"
+    if (
+        current_stage == "implementation_ticket"
+        and ticket_status in {"missing", "skipped"}
+        and last_success in {"pm_decision", "designer_review"}
+    ):
+        code = "implementation_ticket_missing"
+        if ticket_status == "skipped":
+            evidence.append(f"ticket_status=skipped reason="
+                            f"{cycle_state.get('implementation_ticket_skipped_reason')}")
+        else:
+            evidence.append(
+                f"ticket_status=missing — 수정 대상 파일 0개"
+            )
+        return {
+            "current_stage": current_stage,
+            "last_success_stage": last_success,
+            "failed_stage": current_stage,
+            "diagnostic_code": code,
+            "severity": "error",
+            "root_cause": "Implementation Ticket 의 수정 대상 파일이 비어 있어 다음 단계로 넘어가지 못했습니다.",
+            "evidence": evidence,
+        }
+
+    # claude_apply skipped — loop signal.
+    apply_status = cycle_state.get("claude_apply_status") or "skipped"
+    apply_changed = list(cycle_state.get("claude_apply_changed_files") or [])
+    if current_stage == "claude_apply" and apply_status == "skipped":
+        return {
+            "current_stage": current_stage,
+            "last_success_stage": last_success,
+            "failed_stage": current_stage,
+            "diagnostic_code": "claude_apply_skipped",
+            "severity": "warning",
+            "root_cause": (
+                cycle_state.get("claude_apply_skipped_reason")
+                or "claude_apply 가 실행되지 않았습니다."
+            ),
+            "evidence": [f"claude_apply_status=skipped"],
+        }
+
+    # docs_only_change
+    if cycle_state.get("docs_only"):
+        return {
+            "current_stage": "claude_apply",
+            "last_success_stage": last_success,
+            "failed_stage": "claude_apply",
+            "diagnostic_code": "docs_only_change",
+            "severity": "warning",
+            "root_cause": "변경이 docs/config 만이라 사용자 영향이 없습니다.",
+            "evidence": [f"changed_files={len(apply_changed)}"],
+        }
+
+    # no_code_change
+    if (
+        current_stage == "claude_apply"
+        and apply_status in {"applied", "no_changes"}
+        and not apply_changed
+    ):
+        return {
+            "current_stage": current_stage,
+            "last_success_stage": last_success,
+            "failed_stage": current_stage,
+            "diagnostic_code": "no_code_change",
+            "severity": "warning",
+            "root_cause": "Claude 가 변경하지 않았습니다.",
+            "evidence": [f"claude_apply_status={apply_status}"],
+        }
+
+    # QA Gate paths
+    qa_code = (qa_diag.get("diagnostic_code") or "").strip()
+    if qa_code in {
+        "qa_report_missing_after_run",
+        "qa_command_failed",
+        "qa_exception_before_report",
+        "qa_report_path_mismatch",
+    }:
+        evidence.append(f"qa_diagnostic_code={qa_code}")
+        if qa_diag.get("failed_command"):
+            evidence.append(f"failed_command={qa_diag.get('failed_command')}")
+        return {
+            "current_stage": "validation_qa",
+            "last_success_stage": last_success,
+            "failed_stage": "validation_qa",
+            "diagnostic_code": (
+                "qa_gate_stuck" if qa_code == "qa_report_path_mismatch" else qa_code
+            ),
+            "severity": "error",
+            "root_cause": qa_diag.get("suggested_action") or qa_code,
+            "evidence": evidence,
+        }
+    if qa_code == "qa_report_missing_before_run":
+        return {
+            "current_stage": "validation_qa",
+            "last_success_stage": last_success,
+            "failed_stage": "validation_qa",
+            "diagnostic_code": "qa_report_missing_before_run",
+            "severity": "info",
+            "root_cause": "QA 가 미실행 — on-demand 가 트리거됩니다.",
+            "evidence": ["qa_report.md 부재"],
+        }
+
+    # deploy_progress
+    dp = publish_state.get("deploy_progress") or {}
+    failed_recent = sum(
+        1 for a in (dp.get("previous_attempts") or [])
+        if (a or {}).get("status") == "failed"
+    )
+    if dp.get("status") == "failed":
+        failed_recent += 1
+    if failed_recent >= 3:
+        return {
+            "current_stage": "github_actions",
+            "last_success_stage": "validation_qa",
+            "failed_stage": "github_actions",
+            "diagnostic_code": "deploy_failed_repeatedly",
+            "severity": "error",
+            "root_cause": f"최근 deploy 시도 {failed_recent}건 실패",
+            "evidence": [f"deploy_failed_recent={failed_recent}"],
+        }
+
+    # command-level diagnostics surface a recent failure we haven't
+    # classified yet.
+    if cmd_diag.get("status") == "failed" and cmd_diag.get("diagnostic_code"):
+        code = cmd_diag.get("diagnostic_code")
+        return {
+            "current_stage": current_stage,
+            "last_success_stage": last_success,
+            "failed_stage": current_stage,
+            "diagnostic_code": code,
+            "severity": "warning",
+            "root_cause": cmd_diag.get("failed_reason") or code,
+            "evidence": [
+                f"last_command={cmd_diag.get('last_command')}",
+                f"failed_stage={cmd_diag.get('failed_stage')}",
+            ],
+        }
+
+    # Healthy
+    return {
+        "current_stage": current_stage,
+        "last_success_stage": last_success,
+        "failed_stage": None,
+        "diagnostic_code": "healthy",
+        "severity": "info",
+        "root_cause": "pipeline healthy",
+        "evidence": [],
+    }
+
+
+# --- Recovery dispatch ----------------------------------------------------
+
+
+def _watchdog_allow_claude_repair() -> bool:
+    v = os.environ.get("FACTORY_WATCHDOG_ALLOW_CLAUDE_REPAIR", "false").strip().lower()
+    return v in {"true", "1", "yes", "on"}
+
+
+CLAUDE_REPAIR_PROMPT_TEMPLATE = """\
+당신은 Stampport Pipeline Recovery Orchestrator 가 호출한 자동 수리 Claude Code 에이전트입니다.
+
+운영자가 자리를 비운 상태에서 공장이 멈췄고, Watchdog 이 다음 stage 에서 실패를 감지했습니다.
+당신의 임무는 *가장 작은 안전한 변경* 으로 이 stage 를 풀어내는 것입니다.
+
+=== 진단 ===
+diagnostic_code: {code}
+failed_stage: {stage}
+root_cause: {root_cause}
+evidence:
+{evidence}
+=== 진단 끝 ===
+
+기대되는 출력 (expected_output):
+- 코드 변경이 필요하면 변경을 만들고, 검증이 통과하면 commit + push 까지 직접 수행
+- 변경이 필요 없다고 판단되면 변경 없이 종료하고, 사유를 결과 markdown 에 명시
+
+수정 대상 파일 후보:
+- {targets}
+
+수정 가능 디렉터리: app/**, control_tower/**, scripts/local_factory_*.sh, scripts/notify_*.*
+금지: .env*, .key, .pem, .db, .runtime/, node_modules/, dist/, .venv/,
+      package.json, package-lock.json, requirements.txt,
+      deploy/nginx-stampport.conf, .github/workflows/deploy.yml, systemd 관련.
+
+검증 명령:
+- 변경이 app/web 또는 control_tower/web 에 있다면 해당 디렉터리에서 npm run build
+- .py 파일이 변경되면 python3 -m py_compile <파일>
+- 검증 실패 시 commit/push 절대 금지 — working tree 에 변경만 남기고 결과 markdown 에 거부 사유 명시.
+
+commit/push 조건:
+- 검증 통과 + secret/conflict 없음 + 현재 브랜치 main → `git push origin main` 만 허용.
+- 그 외 force push / 다른 브랜치 push 절대 금지.
+
+작업이 끝나면 마지막 응답은 OPERATOR_REQUEST_PROMPT_TEMPLATE 의 형식 (# Operator Request 결과) 으로만 출력하세요.
+"""
+
+
+def _build_claude_repair_prompt(diag: dict) -> str:
+    code = diag.get("diagnostic_code") or "unknown"
+    stage = diag.get("failed_stage") or diag.get("current_stage") or "unknown"
+    root_cause = diag.get("root_cause") or ""
+    evidence_lines = "\n".join(f"- {e}" for e in (diag.get("evidence") or [])) or "- (no evidence)"
+    cycle_state = _read_factory_state() or {}
+    targets = (
+        cycle_state.get("implementation_ticket_target_files")
+        or cycle_state.get("claude_apply_changed_files")
+        or []
+    )
+    targets_line = ", ".join(targets[:10]) or "(자동 결정)"
+    return CLAUDE_REPAIR_PROMPT_TEMPLATE.format(
+        code=code,
+        stage=stage,
+        root_cause=root_cause[:400],
+        evidence=evidence_lines,
+        targets=targets_line,
+    )
+
+
+def _pipeline_decide_recovery(diag: dict) -> dict:
+    """Map the diagnosis to a recovery decision: a stage rollback target,
+    a list of action labels, an operator-readable description, and a
+    next_action sentence the dashboard can render verbatim."""
+    code = diag.get("diagnostic_code") or "unknown"
+    recipe = DIAGNOSTIC_REPAIR_MAP.get(code) or DIAGNOSTIC_REPAIR_MAP["unknown"]
+    contract = PIPELINE_CONTRACT_BY_STAGE.get(diag.get("failed_stage") or "") or {}
+    rollback_to = recipe.get("rollback_to") or contract.get("rollback_to")
+    return {
+        "diagnostic_code": code,
+        "actions": list(recipe.get("actions") or []),
+        "description": recipe.get("description") or "",
+        "rollback_to": rollback_to,
+        "max_retry": int(contract.get("max_retry") or 1),
+    }
+
+
+def _pipeline_apply_recovery(
+    diag: dict,
+    decision: dict,
+    pipeline_state: dict,
+) -> dict:
+    """Execute the safe actions described by the decision. Returns a
+    result dict {applied: [...], skipped: [...], operator_required: bool,
+    next_action: str}."""
+    applied: list[str] = []
+    skipped: list[str] = []
+    operator_required = False
+
+    for action in decision.get("actions") or []:
+        if action == "noop":
+            skipped.append("noop")
+        elif action == "noop_clear_failed":
+            # Clear deploy_progress.failed if there's no actual change
+            # behind the failure.
+            try:
+                ps = _read_publish_state() or {}
+                dp = ps.get("deploy_progress") or {}
+                if dp.get("status") == "failed":
+                    _set_deploy_progress(
+                        "completed",
+                        current_step="변경 없음 — 자동 정리",
+                        log_message="pipeline orchestrator cleared stale failed deploy",
+                    )
+                    applied.append("clear_failed_deploy_progress")
+                else:
+                    skipped.append("clear_failed_deploy_progress (no failed row)")
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"clear_failed_deploy_progress ({e})")
+        elif action == "operator_required":
+            operator_required = True
+            applied.append("escalated_to_operator")
+        elif action == "release_deploy_lock":
+            try:
+                if DEPLOY_LOCK_FILE.is_file():
+                    DEPLOY_LOCK_FILE.unlink()
+                    applied.append("release_deploy_lock")
+                else:
+                    skipped.append("release_deploy_lock (no lock)")
+            except OSError as e:
+                skipped.append(f"release_deploy_lock ({e})")
+        elif action == "reset_deploy_progress":
+            try:
+                _set_deploy_progress(
+                    "failed",
+                    failed_stage="orchestrator_reset",
+                    failed_reason=diag.get("root_cause"),
+                    suggested_action=decision.get("description"),
+                    log_message="orchestrator reset deploy_progress",
+                )
+                applied.append("reset_deploy_progress")
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"reset_deploy_progress ({e})")
+        elif action == "pause_factory":
+            note = _watchdog_action_pause_factory(
+                reason=f"orchestrator·{diag.get('diagnostic_code')}"
+            )
+            applied.append(f"pause_factory · {note}")
+        elif action == "claude_repair":
+            if not _watchdog_allow_claude_repair():
+                skipped.append("claude_repair (FACTORY_WATCHDOG_ALLOW_CLAUDE_REPAIR=false)")
+                operator_required = True
+                continue
+            if diag.get("diagnostic_code") not in CLAUDE_REPAIR_ELIGIBLE_CODES:
+                skipped.append("claude_repair (code not eligible)")
+                operator_required = True
+                continue
+            if _INFLIGHT_COMMAND is not None:
+                skipped.append("claude_repair (runner busy)")
+                continue
+            # Refuse if working tree is in a state we don't trust.
+            dirty = _git_changed_files()
+            if dirty:
+                skipped.append(
+                    f"claude_repair (git dirty — {len(dirty)}건; 운영자 검토 후 재시도)"
+                )
+                operator_required = True
+                continue
+            prompt = _build_claude_repair_prompt(diag)
+            try:
+                ok_repair, msg_repair = _h_operator_request({
+                    "prompt": prompt,
+                    "auto_commit_push": True,
+                })
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"claude_repair (raised: {e})")
+                operator_required = True
+            else:
+                if ok_repair:
+                    applied.append(f"claude_repair · {msg_repair[:160]}")
+                else:
+                    skipped.append(f"claude_repair (failed: {msg_repair[:160]})")
+                    operator_required = True
+        elif action == "cancel_inflight":
+            # We don't actually cancel inflight commands from here —
+            # the runner is single-threaded so the call would race.
+            # Surface the request as escalation instead.
+            skipped.append("cancel_inflight (escalated)")
+            operator_required = True
+        else:
+            skipped.append(f"{action} (unknown)")
+
+    next_action = (
+        decision.get("description")
+        or "조치 필요 없음"
+    )
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "operator_required": operator_required,
+        "next_action": next_action,
+    }
+
+
+def _pipeline_tick() -> dict:
+    """One pass of the orchestrator. Updates pipeline_state.json and
+    appends an entry to recovery_history.json. Returns the decision +
+    result so the watchdog can mirror them into its own log."""
+    pipeline_state = _read_pipeline_state()
+    if not isinstance(pipeline_state, dict):
+        pipeline_state = {}
+
+    diag = _pipeline_diagnose()
+    code = diag["diagnostic_code"]
+
+    cycle_state = _read_factory_state() or {}
+    pipeline_state["cycle_id"] = cycle_state.get("cycle")
+    pipeline_state["current_stage"] = diag.get("current_stage")
+    pipeline_state["last_success_stage"] = diag.get("last_success_stage")
+    pipeline_state["failed_stage"] = diag.get("failed_stage")
+    pipeline_state["diagnostic_code"] = code
+    pipeline_state["severity"] = diag.get("severity")
+    pipeline_state["root_cause"] = diag.get("root_cause")
+    pipeline_state["evidence"] = diag.get("evidence") or []
+
+    history = list(pipeline_state.get("stage_history") or [])
+    history.append({
+        "at": _utc_now_z(),
+        "stage": diag.get("current_stage"),
+        "diagnostic_code": code,
+        "severity": diag.get("severity"),
+    })
+    pipeline_state["stage_history"] = history[-PIPELINE_HISTORY_CAP:]
+
+    if code == "healthy" or code == "no_changes_to_deploy":
+        # Clear retry counters for the *previously failed* stage when we
+        # transition to healthy / noop — the pipeline has caught up.
+        pipeline_state["operator_required"] = False
+        pipeline_state["next_action"] = (
+            "조치 필요 없음" if code == "healthy"
+            else "변경 파일 없음 — 배포할 것이 없습니다."
+        )
+        pipeline_state["last_decision"] = {"diagnostic_code": code, "actions": []}
+        # If the diagnosis is no_changes_to_deploy, still execute the
+        # noop_clear_failed action so any stale failed deploy_progress
+        # gets cleaned up.
+        if code == "no_changes_to_deploy":
+            decision = _pipeline_decide_recovery(diag)
+            result = _pipeline_apply_recovery(diag, decision, pipeline_state)
+            pipeline_state["last_decision"] = decision
+            pipeline_state["last_result"] = result
+            _append_recovery_history({
+                "at": _utc_now_z(),
+                "failed_stage": diag.get("failed_stage"),
+                "diagnostic_code": code,
+                "repair_action": ",".join(decision.get("actions") or []),
+                "result": "success" if result["applied"] else "skipped",
+                "next_stage": decision.get("rollback_to"),
+            })
+        _save_pipeline_state(pipeline_state)
+        return {"diagnosis": diag, "decision": None, "result": None}
+
+    decision = _pipeline_decide_recovery(diag)
+
+    # Retry budget — if exceeded, force operator_required.
+    retries = dict(pipeline_state.get("retry_count_by_stage") or {})
+    stage = diag.get("failed_stage") or diag.get("current_stage") or "unknown"
+    cur_retry = int(retries.get(stage) or 0)
+    max_retry = int(decision.get("max_retry") or 1)
+
+    if cur_retry >= max_retry:
+        result = {
+            "applied": [],
+            "skipped": [f"retry_exceeded ({cur_retry}/{max_retry})"],
+            "operator_required": True,
+            "next_action": (
+                f"같은 실패가 {cur_retry}회 반복되어 운영자 확인이 필요합니다."
+            ),
+        }
+    else:
+        # Bump retry count BEFORE applying so a crash inside doesn't
+        # leave us stuck in an infinite-retry loop.
+        retries[stage] = cur_retry + 1
+        pipeline_state["retry_count_by_stage"] = retries
+        _save_pipeline_state(pipeline_state)
+        result = _pipeline_apply_recovery(diag, decision, pipeline_state)
+
+    pipeline_state["last_decision"] = decision
+    pipeline_state["last_result"] = result
+    pipeline_state["operator_required"] = bool(result.get("operator_required"))
+    pipeline_state["next_action"] = result.get("next_action") or decision.get("description")
+
+    _append_recovery_history({
+        "at": _utc_now_z(),
+        "failed_stage": diag.get("failed_stage"),
+        "diagnostic_code": code,
+        "repair_action": ",".join(decision.get("actions") or []),
+        "result": (
+            "success" if result["applied"]
+            else ("skipped" if result["skipped"] else "noop")
+        ),
+        "next_stage": decision.get("rollback_to"),
+    })
+    _save_pipeline_state(pipeline_state)
+    return {"diagnosis": diag, "decision": decision, "result": result}
+
+
+def _build_pipeline_recovery_meta() -> dict:
+    """Heartbeat metadata block under `local_factory.pipeline_recovery`.
+    Always present so the dashboard can render the orchestrator panel
+    even before the first tick lands."""
+    state = _read_pipeline_state()
+    history = _read_recovery_history()
+    return {
+        "cycle_id": state.get("cycle_id"),
+        "current_stage": state.get("current_stage"),
+        "last_success_stage": state.get("last_success_stage"),
+        "failed_stage": state.get("failed_stage"),
+        "diagnostic_code": state.get("diagnostic_code"),
+        "severity": state.get("severity"),
+        "root_cause": state.get("root_cause"),
+        "evidence": state.get("evidence") or [],
+        "retry_count_by_stage": state.get("retry_count_by_stage") or {},
+        "stage_history": list(state.get("stage_history") or [])[-PIPELINE_HISTORY_CAP:],
+        "operator_required": bool(state.get("operator_required")),
+        "next_action": state.get("next_action"),
+        "last_decision": state.get("last_decision"),
+        "last_result": state.get("last_result"),
+        "stage_order": list(PIPELINE_STAGE_ORDER),
+        "claude_repair_allowed": _watchdog_allow_claude_repair(),
+        "recovery_history": history[-PIPELINE_RECOVERY_CAP:],
     }
 
 
@@ -4991,6 +6205,7 @@ def _build_local_factory_meta() -> dict:
         "qa_gate": _build_qa_meta(state),
         "command_diagnostics": _build_command_diagnostics_meta(),
         "watchdog": _build_watchdog_meta(),
+        "pipeline_recovery": _build_pipeline_recovery_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See
