@@ -15,6 +15,7 @@
 const STATUS_TONE = {
   idle:              { label: "IDLE",              color: "#94a3b8" },
   running:           { label: "RUNNING",           color: "#34d399" },
+  ready_to_publish:  { label: "READY TO PUBLISH",  color: "#d4a843" },
   blocked:           { label: "BLOCKED",           color: "#fb923c" },
   failed:            { label: "FAILED",            color: "#f87171" },
   operator_required: { label: "OPERATOR REQUIRED", color: "#f87171" },

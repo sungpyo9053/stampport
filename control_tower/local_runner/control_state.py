@@ -263,6 +263,11 @@ def _compute_agent_accountability(supervisor_report: dict) -> dict:
     overall = (supervisor_report.get("overall_status") or "skipped").strip()
     if overall == "pass":
         status = "pass"
+    elif overall == "ready_to_publish":
+        # New: code shipped + QA passed but commit/push not run yet.
+        # Distinct from `pass` (fully complete) and from `blocked`
+        # (real failure) — operator just needs to fire deploy_to_server.
+        status = "ready_to_publish"
     elif overall in {"retry_required", "planning_only", "blocked", "failed"}:
         status = "blocked"
     else:
@@ -307,6 +312,19 @@ def _compute_deploy(
             deploy_status = "idle"
         else:
             deploy_status = "no_changes"
+        failed_stage_clean = None
+    elif (
+        dp_status == "failed"
+        and qa_status == "passed"
+        and not (publish_state or {}).get("last_commit_hash")
+    ):
+        # Stale deploy_progress.failed from an earlier cycle that
+        # should NOT poison this cycle's ready-to-publish verdict.
+        # The cycle just finished claude_apply + QA successfully but
+        # hasn't run publish_changes yet — surface as `ready` so the
+        # _resolve_overall layer can flip the top-level status to
+        # `ready_to_publish` instead of `failed`.
+        deploy_status = "ready"
         failed_stage_clean = None
     elif dp_status == "failed":
         deploy_status = "failed"
@@ -386,6 +404,34 @@ def _resolve_overall(
             "operator_request loop in real failure state",
             "operator_request_failed_repeatedly",
             kernel_block.get("last_error"),
+        )
+
+    # Ready-to-publish — the cycle finished its development phase
+    # successfully (changed_files > 0 + qa passed) but commit/push
+    # hasn't run yet. NOT a failure. Supervisor may have flagged
+    # `ready_to_publish` directly OR we infer it from sub-block fields
+    # so a stale supervisor verdict can't downgrade us.
+    deploy_qa_status = deploy_block.get("qa_status")
+    deploy_commit = deploy_block.get("commit_hash")
+    deploy_push = deploy_block.get("push_status")
+    cycle_shipped_code = (
+        changed > 0
+        and deploy_qa_status == "passed"
+        and deploy_push not in {"ok", "succeeded"}
+        and not deploy_commit
+    )
+    if (
+        acc_status == "ready_to_publish"
+        or (cycle_shipped_code and acc_meaningful and acc_ticket)
+    ):
+        return (
+            "ready_to_publish",
+            "code shipped + qa passed — commit/push required",
+            "publish_required",
+            (
+                accountability_block.get("blocking_reason")
+                or "publish_changes / deploy_to_server 명령 대기 중"
+            ),
         )
 
     # Stuck / no_progress / planning_only block the cycle.
@@ -473,6 +519,11 @@ def _suggest_next_action(status: str, diagnostic: str | None,
                          pipe: dict, acc: dict, kernel: dict) -> str:
     if status == "completed":
         return "조치 필요 없음"
+    if status == "ready_to_publish":
+        return (
+            "코드 변경 + QA 통과 — commit/push 만 남음. "
+            "deploy_to_server (또는 publish_changes) 명령으로 배포 진행."
+        )
     if status == "running":
         return "사이클이 진행 중입니다 — 다음 stage 결과 대기"
     if status == "operator_required":

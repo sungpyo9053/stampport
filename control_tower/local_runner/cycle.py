@@ -6260,17 +6260,55 @@ def main() -> int:
         sup_ticket_ok = bool(sup_report.get("implementation_ticket_exists"))
 
         # Refuse to call this cycle "succeeded" when the supervisor
-        # didn't pass — even if claude_apply landed code changes, the
-        # supervisor may flag designer/QA/deploy retry. Downgrade to
-        # planning_only in that case.
-        if state.status == "succeeded" and sup_overall != "pass":
+        # didn't pass — but ONLY when the supervisor's verdict
+        # actually represents a quality problem.
+        #
+        # Critical exclusion: `ready_to_publish` is NOT a failure. It
+        # means "code shipped + QA passed, just waiting for the next
+        # publish_changes / deploy_to_server command". Treating that
+        # like a planning_only downgrade is the exact bug that turned
+        # cycle #2 from succeeded into planning_only despite 3 changed
+        # files + qa passed.
+        sup_apply_ok = (
+            state.claude_apply_status == "applied"
+            and len(state.claude_apply_changed_files or []) > 0
+        )
+        sup_qa_ok = state.qa_status == "passed"
+        is_ready_to_publish = (
+            sup_overall == "ready_to_publish"
+            or (sup_meaningful and sup_ticket_ok and sup_apply_ok and sup_qa_ok
+                and sup_blocking == "deploy")
+        )
+
+        if is_ready_to_publish:
+            # Keep status="succeeded" — the cycle did its job. Just
+            # surface that publish/commit/push hasn't run yet so the
+            # operator (or deploy_to_server) can pick up from here.
+            state.status = "succeeded"
+            state.code_changed = True
+            state.no_code_change_reason = None
+            state.last_message = (
+                "사이클 succeeded — commit/push (publish_changes / "
+                "deploy_to_server) 명령 대기 중"
+            )
+            state.suggested_action = (
+                "deploy_to_server 또는 publish_changes 명령으로 commit/push 진행"
+            )
+            _emit_cycle_log(
+                state, "supervisor_ready_to_publish",
+                "supervisor: code shipped + qa passed — publish/commit/push required",
+                blocking_agent=sup_blocking,
+                changed_files_count=len(state.claude_apply_changed_files or []),
+                qa_status=state.qa_status,
+            )
+        elif state.status == "succeeded" and sup_overall != "pass":
             prior_status = state.status
             if not sup_meaningful or not sup_ticket_ok:
                 state.status = "planning_only"
                 state.code_changed = False
             else:
-                # meaningful + ticket but agent quality lacking — keep
-                # files-changed marker but force planning_only label.
+                # meaningful + ticket but agent quality lacking — force
+                # planning_only label so completed isn't claimed.
                 state.status = "planning_only"
             state.no_code_change_reason = (
                 f"supervisor:{sup_overall} blocking={sup_blocking or '—'}"

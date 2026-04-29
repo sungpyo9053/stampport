@@ -644,6 +644,17 @@ def evaluate_qa(state: dict) -> dict:
 
 
 def evaluate_deploy(state: dict, publish_state: dict) -> dict:
+    """Score the deploy stage. Important distinction:
+
+    publish/commit/push is a *separate command* (deploy_to_server)
+    that runs AFTER the cycle wraps. So during cycle wrap-up, it is
+    perfectly normal for the cycle to have changed_files + qa_passed
+    but no commit_hash yet — that's "ready to publish", not "deploy
+    failed". The supervisor must NOT mark deploy as required_retry in
+    that case, because doing so cascades into the cycle being
+    downgraded to planning_only even though the cycle actually shipped
+    code and passed QA.
+    """
     row = _empty_agent_row("deploy")
     changed = list((state or {}).get("claude_apply_changed_files") or [])
 
@@ -655,6 +666,25 @@ def evaluate_deploy(state: dict, publish_state: dict) -> dict:
     commit_hash = (publish_state or {}).get("last_commit_hash")
     push_status = (publish_state or {}).get("last_push_status") or ""
     deploy_progress = (publish_state or {}).get("deploy_progress") or {}
+    qa_status = (state or {}).get("qa_status") or "skipped"
+
+    # Pending-publish path: the cycle made changes and QA passed, but
+    # publish_changes / deploy_to_server hasn't run yet. This is the
+    # canonical "ready to publish" state — don't mark it as a deploy
+    # failure or trigger retry. Stale deploy_progress.failed rows from
+    # earlier deploy attempts are explicitly ignored when this cycle
+    # produced fresh changes + a QA pass.
+    if qa_status == "passed" and not commit_hash:
+        row["status"] = "skipped"
+        row["score"] = 0
+        row["required_retry"] = False
+        row["evidence"].append(
+            f"changed_files={len(changed)}, qa_status=passed, commit_hash=missing"
+        )
+        row["problems"].append(
+            "publish_changes / deploy_to_server 명령 대기 — 배포 실패 아님"
+        )
+        return row
 
     score = 0
     problems: list[str] = []
@@ -677,7 +707,12 @@ def evaluate_deploy(state: dict, publish_state: dict) -> dict:
         score += 20
         evidence.append(f"deploy_progress.status={dp_status}")
     elif dp_status == "failed":
-        problems.append("deploy_progress.status=failed")
+        # Only count a stale failed deploy_progress when this cycle
+        # didn't produce fresh changes — otherwise the failed row is
+        # from a previous deploy and shouldn't poison this cycle's
+        # verdict.
+        if not changed:
+            problems.append("deploy_progress.status=failed")
 
     score = min(100, max(0, score))
     row["score"] = score
@@ -750,7 +785,13 @@ def evaluate_meaningful_change(state: dict) -> dict:
 
 
 def _decide_overall(agents: dict, mc: dict, state: dict) -> tuple[str, str | None, str | None, bool]:
-    """Returns (overall_status, blocking_agent, blocking_reason, operator_required)."""
+    """Returns (overall_status, blocking_agent, blocking_reason, operator_required).
+
+    Special case: when the cycle actually shipped code (changed_files
+    > 0 + qa_passed) but commit/push hasn't run yet, the cycle is
+    `ready_to_publish` — NOT `retry_required`. publish/commit/push is
+    a separate command (deploy_to_server) that fires after the cycle.
+    """
     # blocking_agent — first agent in pipeline order whose required_retry=true.
     pipeline_order = ("planner", "designer", "pm", "frontend", "backend", "ai", "qa", "deploy")
     blocking = None
@@ -761,8 +802,56 @@ def _decide_overall(agents: dict, mc: dict, state: dict) -> tuple[str, str | Non
             break
 
     operator_required = False
+
+    # Snapshot the "did this cycle actually ship code + pass QA"
+    # question. We use both the agent rows AND raw cycle state so a
+    # single broken evaluator doesn't accidentally hide the fact that
+    # the cycle worked.
+    qa_passed = (state.get("qa_status") or "").strip() == "passed"
+    apply_status = (state.get("claude_apply_status") or "").strip()
+    apply_changed = list(state.get("claude_apply_changed_files") or [])
+    code_shipped = (
+        apply_status == "applied"
+        and len(apply_changed) > 0
+        and qa_passed
+    )
+
+    if blocking == "deploy" and code_shipped and mc["meaningful_change"]:
+        # The deploy evaluator's "skipped — publish pending" path
+        # already returns required_retry=False, so this branch is a
+        # belt-and-suspenders override for legacy callers / older
+        # state files where the deploy row still has required_retry.
+        return (
+            "ready_to_publish",
+            "deploy",
+            "commit/push required — publish_changes / deploy_to_server 명령 대기",
+            operator_required,
+        )
+
     if blocking:
-        return "retry_required", blocking, agents[blocking]["problems"][0] if agents[blocking].get("problems") else None, operator_required
+        return (
+            "retry_required",
+            blocking,
+            (agents[blocking]["problems"][0] if agents[blocking].get("problems") else None),
+            operator_required,
+        )
+
+    # No agent flagged retry. If the cycle shipped code + QA passed
+    # but no commit_hash yet, it's still ready_to_publish (deploy
+    # evaluator returned skipped, not pass — same shape).
+    deploy_row = agents.get("deploy") or {}
+    if (
+        code_shipped
+        and mc["meaningful_change"]
+        and deploy_row.get("status") == "skipped"
+        and not state.get("publish_state_commit_hash")
+    ):
+        return (
+            "ready_to_publish",
+            "deploy",
+            "commit/push required — publish_changes / deploy_to_server 명령 대기",
+            operator_required,
+        )
 
     if not mc["meaningful_change"]:
         # Distinguish planning_only (artifacts produced but no code) vs
@@ -777,6 +866,11 @@ def _decide_overall(agents: dict, mc: dict, state: dict) -> tuple[str, str | Non
 def _next_action(overall: str, blocking: str | None) -> str:
     if overall == "pass":
         return "모든 에이전트 산출물이 기준 통과 + 실제 제품 변경 발생 → 사이클 succeeded"
+    if overall == "ready_to_publish":
+        return (
+            "코드 변경 + QA 통과 — commit/push required. "
+            "deploy_to_server 또는 publish_changes 명령으로 배포 진행."
+        )
     if overall == "retry_required" and blocking:
         return f"`{blocking}` 에이전트에게 retry_prompt 전달 후 재실행"
     if overall == "planning_only":
