@@ -231,6 +231,17 @@ const WATCHDOG_KIND_TO_PHRASE = {
   pipeline_operator_required:       "Operator required",
   pipeline_no_changes:              "No changes to validate",
   pipeline_tick_failed:             "Pipeline tick failed",
+  // Forward Progress Detector — same channel.
+  forward_progress_check_started:        "Forward progress check started",
+  forward_progress_blocked:              "Forward progress blocked",
+  forward_progress_stuck:                "Current stage stuck",
+  forward_progress_required_output_missing: "Required output missing",
+  forward_progress_planning_only:        "Planning only loop detected",
+  forward_progress_no_code_change:       "No code change detected",
+  forward_progress_no_progress:          "No progress despite heartbeat",
+  forward_progress_continuous_stopped:   "Continuous stopped due to no progress",
+  forward_progress_operator_required:    "Operator required",
+  forward_progress_failed:               "Forward progress check failed",
 };
 
 function watchdogEntryId(entry) {

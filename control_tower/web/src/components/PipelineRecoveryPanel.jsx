@@ -48,6 +48,46 @@ function pickPipeline(runners = []) {
   return null;
 }
 
+function pickForwardProgress(runners = []) {
+  for (const r of runners) {
+    const fp = r?.metadata_json?.local_factory?.forward_progress;
+    if (fp) return fp;
+  }
+  return null;
+}
+
+function pickFactoryStatus(runners = []) {
+  for (const r of runners) {
+    const lf = r?.metadata_json?.local_factory;
+    if (lf) return { factoryStatus: lf.status, alive: !!lf.alive };
+  }
+  return { factoryStatus: null, alive: false };
+}
+
+function pickRunnerOnline(runners = []) {
+  for (const r of runners) {
+    if (r?.status) return r.status;
+  }
+  return "offline";
+}
+
+const PROGRESS_TONE = {
+  progressing:        { label: "PROGRESSING",    color: "#34d399" },
+  blocked:            { label: "BLOCKED",        color: "#fb923c" },
+  stuck:              { label: "STUCK",          color: "#f87171" },
+  planning_only:      { label: "PLANNING ONLY",  color: "#a78bfa" },
+  no_progress:        { label: "NO PROGRESS",    color: "#fb923c" },
+  operator_required:  { label: "OPERATOR",       color: "#f87171" },
+};
+
+function fmtElapsed(sec) {
+  if (sec == null) return "—";
+  const s = Number(sec) || 0;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+  return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+}
+
 function StageChip({ stage, kind }) {
   // kind: "ok" | "current" | "failed" | "todo"
   const palette = {
@@ -79,6 +119,13 @@ function StageChip({ stage, kind }) {
 
 export default function PipelineRecoveryPanel({ runners = [] }) {
   const pr = pickPipeline(runners);
+  const fp = pickForwardProgress(runners);
+  const { factoryStatus } = pickFactoryStatus(runners);
+  const runnerOnline = pickRunnerOnline(runners);
+  const liveness = runnerOnline === "online" ? "ONLINE" : "OFFLINE";
+  const factoryLabel = (factoryStatus || "idle").toUpperCase();
+  const progressKey = fp?.status || "progressing";
+  const progressTone = PROGRESS_TONE[progressKey] || PROGRESS_TONE.progressing;
 
   if (!pr) {
     return (
@@ -168,6 +215,143 @@ export default function PipelineRecoveryPanel({ runners = [] }) {
           cycle #{pr.cycle_id ?? "—"}
         </span>
       </div>
+
+      {/* Liveness vs Factory vs Progress — three independent dimensions */}
+      <div className="grid grid-cols-3 gap-2">
+        <div
+          className="rounded p-1.5 text-center"
+          style={{ backgroundColor: "#0a1228", border: "1px solid #1e293b" }}
+        >
+          <div className="text-[8.5px] uppercase tracking-[0.3em] text-slate-500">
+            RUNNER
+          </div>
+          <div
+            className="text-[11.5px] font-bold tracking-widest"
+            style={{ color: liveness === "ONLINE" ? "#34d399" : "#94a3b8" }}
+          >
+            {liveness}
+          </div>
+        </div>
+        <div
+          className="rounded p-1.5 text-center"
+          style={{ backgroundColor: "#0a1228", border: "1px solid #1e293b" }}
+        >
+          <div className="text-[8.5px] uppercase tracking-[0.3em] text-slate-500">
+            FACTORY
+          </div>
+          <div
+            className="text-[11.5px] font-bold tracking-widest"
+            style={{
+              color: factoryLabel === "RUNNING" ? "#38bdf8"
+                : factoryLabel === "PAUSED" ? "#fbbf24"
+                : "#94a3b8",
+            }}
+          >
+            {factoryLabel}
+          </div>
+        </div>
+        <div
+          className="rounded p-1.5 text-center"
+          style={{
+            backgroundColor: "#0a1228",
+            border: `1px solid ${progressTone.color}66`,
+          }}
+        >
+          <div className="text-[8.5px] uppercase tracking-[0.3em] text-slate-500">
+            PROGRESS
+          </div>
+          <div
+            className="text-[11.5px] font-bold tracking-widest"
+            style={{ color: progressTone.color }}
+          >
+            {progressTone.label}
+          </div>
+        </div>
+      </div>
+
+      {/* Forward Progress detail card */}
+      {fp && (
+        <div
+          className="rounded p-2 text-[11px] leading-snug"
+          style={{
+            backgroundColor: "#0a1228",
+            border: `1px solid ${progressTone.color}55`,
+            color: "#cbd5e1",
+          }}
+        >
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px]">
+            <span className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+              stage
+            </span>
+            <span className="text-slate-200">{fp.current_stage || "—"}</span>
+            <span className="text-slate-500">·</span>
+            <span className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+              elapsed
+            </span>
+            <span
+              style={{
+                color:
+                  (fp.current_stage_elapsed_sec || 0) > (fp.stage_timeout_sec || 0)
+                    ? "#f87171" : "#cbd5e1",
+              }}
+            >
+              {fmtElapsed(fp.current_stage_elapsed_sec)} /{" "}
+              {fmtElapsed(fp.stage_timeout_sec)}
+            </span>
+            <span className="text-slate-500">·</span>
+            <span className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+              code
+            </span>
+            <span
+              style={{
+                color: fp.changed_files_count > 0 ? "#34d399" : "#94a3b8",
+                fontWeight: 700,
+              }}
+            >
+              {fp.changed_files_count}건
+            </span>
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px]">
+            <span className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+              required
+            </span>
+            <span style={{ color: fp.required_output_exists ? "#34d399" : "#f87171" }}>
+              {fp.required_output_exists ? "✓" : "✗"} {fp.required_output || "—"}
+            </span>
+          </div>
+          {fp.blocking_reason && (
+            <div className="mt-1 text-[11px]" style={{ color: progressTone.color }}>
+              {fp.blocking_reason}
+            </div>
+          )}
+          {fp.next_action && (
+            <div className="mt-1 text-[11.5px] text-amber-200">
+              ▶ {fp.next_action}
+            </div>
+          )}
+          {/* Motion timestamps row */}
+          <div className="mt-1 grid grid-cols-3 gap-1 text-[9.5px] tracking-widest text-slate-500">
+            <div>
+              code:{" "}
+              <span className="text-slate-300">
+                {fp.last_code_changed_at ? fmtTime(fp.last_code_changed_at) : "—"}
+              </span>
+            </div>
+            <div>
+              commit:{" "}
+              <span className="text-slate-300">
+                {fp.last_commit_at ? fmtTime(fp.last_commit_at) : "—"}
+              </span>
+            </div>
+            <div>
+              push:{" "}
+              <span className="text-slate-300">
+                {fp.last_push_at ? fmtTime(fp.last_push_at) : "—"}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Stage chip strip */}
       <div className="-mx-1 flex flex-wrap gap-1 px-1">

@@ -4547,6 +4547,119 @@ def _watchdog_tick() -> None:
                 diagnostic_code=po_code,
             )
 
+    # Forward Progress Detector — heartbeat ≠ progress. Runs after the
+    # orchestrator and emits its own System Log events. The detector is
+    # cheap (file mtime reads + small JSON), and its judgments feed
+    # directly back into the orchestrator on the *next* tick because
+    # they share DIAGNOSTIC_REPAIR_MAP entries (current_stage_stuck,
+    # planning_only_loop, no_progress_despite_heartbeat, …).
+    try:
+        fp_meta = _forward_progress_diagnose()
+    except Exception as e:  # noqa: BLE001
+        fp_meta = None
+        _watchdog_log_event(
+            state,
+            kind="forward_progress_failed",
+            message=f"Forward progress diagnose raised: {e}",
+            severity="error",
+        )
+    if fp_meta:
+        fp_status = fp_meta.get("status")
+        fp_code = fp_meta.get("diagnostic_code") or "unknown"
+        _watchdog_log_event(
+            state,
+            kind="forward_progress_check_started",
+            message="Forward progress check started",
+            severity="info",
+            diagnostic_code=fp_code,
+        )
+        if fp_status == "blocked":
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_blocked",
+                message=(
+                    f"Forward progress blocked — {fp_code}: "
+                    f"{(fp_meta.get('blocking_reason') or '')[:200]}"
+                ),
+                severity="warning",
+                diagnostic_code=fp_code,
+            )
+            if fp_code == "required_output_missing":
+                _watchdog_log_event(
+                    state,
+                    kind="forward_progress_required_output_missing",
+                    message=(
+                        f"Required output missing — {fp_meta.get('required_output')} "
+                        f"(stage={fp_meta.get('current_stage')})"
+                    ),
+                    severity="warning",
+                    diagnostic_code=fp_code,
+                )
+        elif fp_status == "stuck":
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_stuck",
+                message=(
+                    f"Current stage stuck — {fp_meta.get('current_stage')} "
+                    f"({fp_meta.get('current_stage_elapsed_sec')}s, "
+                    f"timeout={fp_meta.get('stage_timeout_sec')}s)"
+                ),
+                severity="error",
+                diagnostic_code=fp_code,
+            )
+        elif fp_status == "planning_only":
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_planning_only",
+                message=(
+                    f"Planning only loop detected — {fp_code}: "
+                    f"streak={fp_meta.get('planning_only_streak') or fp_meta.get('no_code_change_streak')}"
+                ),
+                severity="warning",
+                diagnostic_code=fp_code,
+            )
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_no_code_change",
+                message="No code change detected — 산출물만 생성, 코드 변경 없음",
+                severity="warning",
+                diagnostic_code=fp_code,
+            )
+            # Continuous OFF directly — pipeline orchestrator's
+            # planning_only_loop entry chains the same action, but
+            # firing it from here makes the cause-effect explicit in
+            # the System Log.
+            note = _watchdog_action_pause_factory(reason=f"forward_progress·{fp_code}")
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_continuous_stopped",
+                message=f"Continuous stopped due to no progress — {note}",
+                severity="warning",
+                diagnostic_code=fp_code,
+            )
+        elif fp_status == "no_progress":
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_no_progress",
+                message=(
+                    f"No progress despite heartbeat — {fp_code}: "
+                    f"{(fp_meta.get('blocking_reason') or '')[:200]}"
+                ),
+                severity="warning" if fp_code == "no_changes_to_validate" else "error",
+                diagnostic_code=fp_code,
+            )
+        elif fp_status == "operator_required":
+            _watchdog_log_event(
+                state,
+                kind="forward_progress_operator_required",
+                message=(
+                    f"Operator required — {fp_code}: "
+                    f"{(fp_meta.get('next_action') or '')[:200]}"
+                ),
+                severity="error",
+                diagnostic_code=fp_code,
+            )
+
     try:
         diag = _watchdog_diagnose()
     except Exception as e:  # noqa: BLE001
@@ -5206,6 +5319,27 @@ DIAGNOSTIC_REPAIR_MAP: dict[str, dict] = {
         "stage": "planner_proposal",
         "actions": ["operator_required"],
         "description": "factory idle 시간 초과 — 운영자가 시작 명령 필요.",
+    },
+    # Forward Progress signals — heartbeat OK 이지만 진행이 멈춘 경우.
+    "current_stage_stuck": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "현재 stage 가 timeout 을 초과한 채 멈춤 — 운영자 확인 필요.",
+    },
+    "required_output_missing": {
+        "stage": "validation_qa",
+        "actions": ["operator_required"],
+        "description": "stage 의 required output 이 없습니다 — 다음 단계로 진행 불가.",
+    },
+    "no_progress_despite_heartbeat": {
+        "stage": "claude_apply",
+        "actions": ["pause_factory"],
+        "description": "heartbeat 정상이지만 stage / output / commit 변화 없음 — factory pause.",
+    },
+    "no_changes_to_validate": {
+        "stage": "validation_qa",
+        "actions": ["noop_clear_failed"],
+        "description": "변경 파일이 0개 — QA 실패가 아니라 검증할 변경사항 없음.",
     },
     "unknown": {
         "stage": "validation_qa",
@@ -5881,6 +6015,502 @@ def _build_pipeline_recovery_meta() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Forward Progress Detector
+#
+# Liveness ≠ progress. heartbeat ok + factory.status=running can sit on
+# the same cycle for an hour without producing a single line of code,
+# and that's the failure mode this module is built for.
+#
+# The detector reads the same on-disk evidence the Pipeline Recovery
+# Orchestrator reads, then asks ONE additional question at every level:
+#
+#   "Has the work actually moved forward since we last looked?"
+#
+# Inputs:
+#   - pipeline_state.current_stage (where we are in the pipeline)
+#   - cycle_state.* (artifact statuses + per-stage timestamps)
+#   - publish_state.last_commit_at / last_push_at (release motion)
+#   - file mtimes for required outputs
+#   - cycle_state.cycle_log[] (count consecutive planning_only / no_code_change)
+#
+# Outputs (heartbeat metadata.local_factory.forward_progress):
+#   status   — progressing | blocked | stuck | planning_only | no_progress | operator_required
+#   plus all the supporting fields the dashboard uses to render the
+#   "RUNNING but no progress" banner.
+# ---------------------------------------------------------------------------
+
+FORWARD_PROGRESS_STATE_FILE = RUNTIME_DIR / "forward_progress_state.json"
+FORWARD_PROGRESS_LOG_CAP = 30
+# How many trailing cycles of "planning only" / "no code change" we need
+# before flipping status to planning_only_loop.
+FORWARD_PROGRESS_PLANNING_LOOP_THRESHOLD = 2
+
+# Per-stage timeouts in seconds. Mirrors the spec exactly.
+FORWARD_PROGRESS_STAGE_TIMEOUTS: dict[str, float] = {
+    "planner_proposal":           300,
+    "designer_review":            300,
+    "pm_decision":                300,
+    "implementation_ticket":      300,
+    "claude_apply":               600,
+    "validation_qa":              600,
+    "git_commit":                 180,
+    "git_push":                   180,
+    "github_actions":             600,
+    "server_verification":        600,
+    "browser_cache_verification": 600,
+}
+
+# Per-stage required output check. Each entry returns
+# (label, exists_bool, last_at_iso_or_none) so the heartbeat shape
+# stays consistent regardless of whether the artifact is a file or a
+# state field.
+def _fp_required_output(
+    stage: str, cycle_state: dict, publish_state: dict
+) -> tuple[str, bool, str | None]:
+    state = cycle_state or {}
+    pub = publish_state or {}
+
+    if stage == "planner_proposal":
+        path = RUNTIME_DIR / "planner_proposal.md"
+        path2 = RUNTIME_DIR / "product_planner_report.md"
+        any_exists = path.is_file() or path2.is_file()
+        last_at = state.get("product_planner_at") or _file_mtime_iso(
+            path if path.is_file() else path2
+        )
+        return ("product_planner_report.md", any_exists, last_at)
+
+    if stage == "designer_review":
+        c = RUNTIME_DIR / "designer_critique.md"
+        f = RUNTIME_DIR / "designer_final_review.md"
+        any_exists = c.is_file() or f.is_file()
+        last_at = (
+            state.get("designer_final_review_at")
+            or state.get("designer_critique_at")
+            or _file_mtime_iso(f if f.is_file() else c)
+        )
+        return ("designer_critique.md or designer_final_review.md", any_exists, last_at)
+
+    if stage == "pm_decision":
+        path = RUNTIME_DIR / "pm_decision.md"
+        return ("pm_decision.md", path.is_file(),
+                state.get("pm_decision_at") or _file_mtime_iso(path))
+
+    if stage == "implementation_ticket":
+        path = RUNTIME_DIR / "implementation_ticket.md"
+        ticket_status = state.get("implementation_ticket_status") or "skipped"
+        exists = path.is_file() and ticket_status == "generated"
+        return (
+            "implementation_ticket.md (status=generated)",
+            exists,
+            state.get("implementation_ticket_at") or _file_mtime_iso(path),
+        )
+
+    if stage == "claude_apply":
+        changed = list(state.get("claude_apply_changed_files") or [])
+        # Required output = at least one product-code file change.
+        product_code_changed = any(
+            f.startswith("app/") or f.startswith("control_tower/web/src/")
+            for f in changed
+        )
+        return (
+            "claude_apply: changed_files_count > 0 (product code path)",
+            len(changed) > 0 and product_code_changed,
+            state.get("claude_apply_at"),
+        )
+
+    if stage == "validation_qa":
+        rep = RUNTIME_DIR / "qa_report.md"
+        diag = RUNTIME_DIR / "qa_diagnostics.json"
+        exists = rep.is_file() or diag.is_file()
+        last_at = _file_mtime_iso(rep if rep.is_file() else diag)
+        return ("qa_report.md or qa_diagnostics.json", exists, last_at)
+
+    if stage == "git_commit":
+        commit_hash = pub.get("last_commit_hash")
+        return (
+            "publish_state.last_commit_hash",
+            bool(commit_hash),
+            pub.get("last_push_at"),
+        )
+
+    if stage == "git_push":
+        return (
+            "publish_state.last_push_status == succeeded",
+            (pub.get("last_push_status") in {"ok", "succeeded"}),
+            pub.get("last_push_at"),
+        )
+
+    if stage == "github_actions":
+        dp = pub.get("deploy_progress") or {}
+        ok = dp.get("status") in {"actions_triggered", "completed"}
+        return ("deploy_progress.status in {actions_triggered, completed}",
+                ok, dp.get("updated_at"))
+
+    if stage in {"server_verification", "browser_cache_verification"}:
+        # No automated signal yet — flag as "operator owns this".
+        return (f"{stage} (operator-verified)", False, None)
+
+    return ("(unknown stage)", False, None)
+
+
+def _file_mtime_iso(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        return (
+            datetime.utcfromtimestamp(path.stat().st_mtime)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        )
+    except OSError:
+        return None
+
+
+def _read_forward_progress_state() -> dict:
+    if not FORWARD_PROGRESS_STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(FORWARD_PROGRESS_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_forward_progress_state(state: dict) -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        state["updated_at"] = _utc_now_z()
+        FORWARD_PROGRESS_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError) as e:
+        sys.stderr.write(f"[runner] failed to write forward_progress_state: {e}\n")
+
+
+def _fp_count_trailing_cycle_log_kinds(
+    cycle_state: dict,
+    kinds: set[str],
+) -> int:
+    """How many of the trailing cycle_log entries match `kinds`. Used
+    to decide planning_only_loop after multiple cycles in a row."""
+    log = cycle_state.get("cycle_log") or []
+    if not isinstance(log, list):
+        return 0
+    n = 0
+    for entry in reversed(log):
+        if not isinstance(entry, dict):
+            break
+        if entry.get("kind") in kinds:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _forward_progress_diagnose() -> dict:
+    """Compute the forward_progress block. Persists running state to
+    forward_progress_state.json so we can compute current_stage_elapsed_sec
+    across watchdog ticks. Returns the metadata dict the heartbeat
+    publishes verbatim."""
+    pipeline_state = _read_pipeline_state() or {}
+    cycle_state = _read_factory_state() or {}
+    publish_state = _read_publish_state() or {}
+    saved = _read_forward_progress_state() or {}
+
+    now = time.time()
+    now_iso = _utc_now_z()
+
+    current_stage = pipeline_state.get("current_stage") or "planner_proposal"
+    last_seen_stage = saved.get("current_stage")
+    last_stage_changed_at = saved.get("last_stage_changed_at") or now_iso
+    last_stage_changed_epoch = float(saved.get("_last_stage_changed_epoch") or now)
+
+    if current_stage != last_seen_stage:
+        last_stage_changed_at = now_iso
+        last_stage_changed_epoch = now
+
+    elapsed_sec = max(0.0, now - last_stage_changed_epoch)
+
+    # Required output for the *current* stage.
+    req_label, req_exists, req_last_at = _fp_required_output(
+        current_stage, cycle_state, publish_state
+    )
+
+    # Convenience signals copied through to the heartbeat.
+    apply_status = cycle_state.get("claude_apply_status") or "skipped"
+    apply_changed = list(cycle_state.get("claude_apply_changed_files") or [])
+    changed_count = len(apply_changed)
+    ticket_path = RUNTIME_DIR / "implementation_ticket.md"
+    ticket_status = cycle_state.get("implementation_ticket_status") or "skipped"
+    ticket_exists = ticket_path.is_file() and ticket_status == "generated"
+    qa_report = RUNTIME_DIR / "qa_report.md"
+    qa_diag_path = RUNTIME_DIR / "qa_diagnostics.json"
+    qa_report_exists = qa_report.is_file() or qa_diag_path.is_file()
+
+    # Latest motion timestamps. We pull from a mix of file mtimes and
+    # state-recorded timestamps so a missing file doesn't blank out a
+    # field we already know.
+    last_artifact_at = max(
+        filter(None, [
+            cycle_state.get("product_planner_at"),
+            cycle_state.get("designer_critique_at"),
+            cycle_state.get("designer_final_review_at"),
+            cycle_state.get("pm_decision_at"),
+            cycle_state.get("implementation_ticket_at"),
+            cycle_state.get("claude_proposal_at"),
+        ]),
+        default=None,
+    )
+    last_required_output_at = req_last_at
+    last_code_changed_at = cycle_state.get("claude_apply_at") if changed_count > 0 else None
+    last_commit_at = publish_state.get("last_push_at") if publish_state.get("last_commit_hash") else None
+    last_push_at = (
+        publish_state.get("last_push_at")
+        if publish_state.get("last_push_status") in {"ok", "succeeded"} else None
+    )
+
+    timeout_sec = float(FORWARD_PROGRESS_STAGE_TIMEOUTS.get(current_stage, 600))
+
+    # planning_only_loop signal — count consecutive cycle_log markers.
+    planning_streak = _fp_count_trailing_cycle_log_kinds(
+        cycle_state,
+        {"cycle_planning_only"},
+    )
+    no_change_streak = _fp_count_trailing_cycle_log_kinds(
+        cycle_state,
+        {"cycle_produced_no_code_change", "cycle_produced_docs_only"},
+    )
+
+    # ----- Status decision ----------------------------------------------
+    status = "progressing"
+    diagnostic_code = "healthy"
+    blocking_reason: str | None = None
+    next_action: str | None = None
+    operator_required = False
+
+    # 1) Pipeline orchestrator already escalated to operator? Inherit.
+    if pipeline_state.get("operator_required"):
+        status = "operator_required"
+        diagnostic_code = pipeline_state.get("diagnostic_code") or "operator_required"
+        blocking_reason = pipeline_state.get("root_cause") or "운영자 확인 필요"
+        next_action = pipeline_state.get("next_action") or "operator_required"
+        operator_required = True
+
+    # 2) deploy_to_server already declared no_changes_to_deploy.
+    elif (
+        (cycle_state.get("status") in {"succeeded", "planning_only", "no_code_change"})
+        and not _git_changed_files()
+    ):
+        status = "no_progress" if changed_count == 0 else "progressing"
+        diagnostic_code = "no_changes_to_validate"
+        blocking_reason = "changed_files=0 — 검증/배포할 변경사항 없음"
+        next_action = (
+            "다음 사이클을 기다리거나, operator_request 로 수동 변경 지시를 내리세요."
+        )
+
+    # 3) planning_only_loop — multiple cycles producing only artifacts.
+    elif (
+        planning_streak >= FORWARD_PROGRESS_PLANNING_LOOP_THRESHOLD
+        and changed_count == 0
+    ):
+        status = "planning_only"
+        diagnostic_code = "planning_only_loop"
+        blocking_reason = (
+            f"최근 {planning_streak}회 사이클이 기획 산출물만 만들고 코드 변경 없음."
+        )
+        next_action = (
+            "Continuous OFF + Product Director/PM 단계로 rollback — 운영자 확인 필요."
+        )
+        operator_required = True
+
+    # 4) no_change_loop — claude_apply applied but no real code change.
+    elif (
+        no_change_streak >= FORWARD_PROGRESS_PLANNING_LOOP_THRESHOLD
+        and changed_count == 0
+    ):
+        status = "planning_only"
+        diagnostic_code = "no_code_change_loop"
+        blocking_reason = (
+            f"최근 {no_change_streak}회 사이클이 코드 변경 없이 종료."
+        )
+        next_action = (
+            "Claude 에게 실제 app/web/src 또는 control_tower/web/src 파일 수정을 재요청."
+        )
+        operator_required = True
+
+    # 5) Stage stuck — required output missing past timeout.
+    elif (not req_exists) and elapsed_sec > timeout_sec:
+        status = "stuck"
+        diagnostic_code = "current_stage_stuck"
+        blocking_reason = (
+            f"`{current_stage}` 가 {int(elapsed_sec)}s째 진행 중이지만 "
+            f"required output ({req_label}) 가 없습니다 (timeout={int(timeout_sec)}s)."
+        )
+        # Stage-specific next_action — concrete and short.
+        next_action = (
+            "Implementation Ticket 재생성 — PM 단계로 rollback."
+            if current_stage == "implementation_ticket"
+            else "Claude Apply 재실행 — Implementation Ticket 기반 코드 변경 요청."
+            if current_stage == "claude_apply"
+            else "QA Gate 재실행 또는 Claude Repair 요청."
+            if current_stage == "validation_qa"
+            else "운영자 확인 — stage 가 timeout 을 초과했습니다."
+        )
+
+    # 6) Required output missing but still within timeout — blocked.
+    elif not req_exists:
+        # Exception: claude_apply with changed_count=0 is the
+        # "no_changes_to_validate / no_code_change" case; we surface it
+        # as no_progress instead of stuck.
+        if current_stage == "claude_apply" and apply_status == "skipped":
+            status = "blocked"
+            diagnostic_code = "claude_apply_skipped"
+            blocking_reason = (
+                cycle_state.get("claude_apply_skipped_reason")
+                or "claude_apply 가 skipped — 개발 단계 미실행"
+            )
+            next_action = (
+                "Implementation Ticket 확인 후 claude_apply 재실행 또는 "
+                "operator_request 로 수동 변경 지시."
+            )
+        elif current_stage == "implementation_ticket" and not ticket_exists:
+            status = "blocked"
+            diagnostic_code = "implementation_ticket_missing"
+            blocking_reason = (
+                "Implementation Ticket 의 수정 대상 파일이 비어 있어 "
+                "다음 단계로 못 넘어가고 있습니다."
+            )
+            next_action = "PM 단계로 rollback — ticket 재생성 필요."
+        elif current_stage == "validation_qa" and not qa_report_exists and changed_count == 0:
+            # The "QA Gate failed but no changes" mis-classification —
+            # surface it explicitly so the dashboard stops showing
+            # "QA failed" red.
+            status = "no_progress"
+            diagnostic_code = "no_changes_to_validate"
+            blocking_reason = (
+                "변경 파일 0개 — 검증할 변경사항이 없어 QA 실행이 필요 없습니다."
+            )
+            next_action = "다음 사이클의 코드 변경을 기다리거나 operator_request 로 변경 지시."
+        else:
+            status = "blocked"
+            diagnostic_code = "required_output_missing"
+            blocking_reason = (
+                f"`{current_stage}` 가 진행 중이지만 required output "
+                f"({req_label}) 가 아직 없습니다."
+            )
+            next_action = (
+                f"`{current_stage}` 산출물이 만들어질 때까지 대기 — "
+                f"timeout={int(timeout_sec)}s."
+            )
+
+    # 7) heartbeat ok + factory running + same stage frozen + no required
+    # output + no recent code change → no_progress.
+    factory_alive_running = bool(
+        cycle_state.get("status") == "running"
+        and current_stage == last_seen_stage
+        and elapsed_sec > min(timeout_sec, 300)
+    )
+    if (
+        status == "progressing"
+        and factory_alive_running
+        and not req_exists
+        and changed_count == 0
+        and not last_commit_at
+    ):
+        status = "no_progress"
+        diagnostic_code = "no_progress_despite_heartbeat"
+        blocking_reason = (
+            f"heartbeat 정상이지만 `{current_stage}` 에서 {int(elapsed_sec)}s 동안 "
+            "산출물 / 코드 변경 / commit 모두 없음."
+        )
+        next_action = (
+            "Pipeline Orchestrator 의 next_action 에 따라 자동 복구 또는 operator_required."
+        )
+
+    # ----- Persist + return ---------------------------------------------
+    new_state = {
+        "current_stage": current_stage,
+        "last_stage_changed_at": last_stage_changed_at,
+        "_last_stage_changed_epoch": last_stage_changed_epoch,
+        "last_artifact_created_at": last_artifact_at,
+        "last_required_output_created_at": last_required_output_at,
+        "last_code_changed_at": last_code_changed_at,
+        "last_commit_at": last_commit_at,
+        "last_push_at": last_push_at,
+        "status": status,
+        "diagnostic_code": diagnostic_code,
+        "blocking_reason": blocking_reason,
+        "next_action": next_action,
+        "operator_required": operator_required,
+        "elapsed_sec": int(elapsed_sec),
+        "timeout_sec": int(timeout_sec),
+        "required_output_label": req_label,
+        "required_output_exists": req_exists,
+        "implementation_ticket_exists": ticket_exists,
+        "claude_apply_status": apply_status,
+        "changed_files_count": changed_count,
+        "qa_report_exists": qa_report_exists,
+        "planning_streak": planning_streak,
+        "no_change_streak": no_change_streak,
+    }
+    _save_forward_progress_state(new_state)
+
+    # Heartbeat-shaped output (drops internal _epoch helpers).
+    return {
+        "status": status,
+        "current_stage": current_stage,
+        "current_stage_elapsed_sec": int(elapsed_sec),
+        "stage_timeout_sec": int(timeout_sec),
+        "last_stage_changed_at": last_stage_changed_at,
+        "last_artifact_created_at": last_artifact_at,
+        "last_required_output_created_at": last_required_output_at,
+        "last_code_changed_at": last_code_changed_at,
+        "last_commit_at": last_commit_at,
+        "last_push_at": last_push_at,
+        "required_output": req_label,
+        "required_output_exists": req_exists,
+        "implementation_ticket_exists": ticket_exists,
+        "claude_apply_status": apply_status,
+        "changed_files_count": changed_count,
+        "qa_report_exists": qa_report_exists,
+        "blocking_reason": blocking_reason,
+        "diagnostic_code": diagnostic_code,
+        "next_action": next_action,
+        "operator_required": operator_required,
+        "planning_only_streak": planning_streak,
+        "no_code_change_streak": no_change_streak,
+        "stage_timeouts": dict(FORWARD_PROGRESS_STAGE_TIMEOUTS),
+    }
+
+
+def _build_forward_progress_meta() -> dict:
+    """Heartbeat metadata block under `local_factory.forward_progress`.
+    Always present so the dashboard can render the panel even before
+    the first watchdog tick. Computes diagnose synchronously — cheap
+    file reads only."""
+    try:
+        return _forward_progress_diagnose()
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[runner] forward_progress build failed: {e}\n")
+        return {
+            "status": "no_progress",
+            "current_stage": None,
+            "current_stage_elapsed_sec": 0,
+            "stage_timeout_sec": 0,
+            "blocking_reason": f"forward_progress build failed: {e}",
+            "diagnostic_code": "unknown",
+            "next_action": "운영자가 runner 로그 확인 필요",
+            "operator_required": True,
+            "required_output": None,
+            "required_output_exists": False,
+            "implementation_ticket_exists": False,
+            "claude_apply_status": "unknown",
+            "changed_files_count": 0,
+            "qa_report_exists": False,
+            "stage_timeouts": dict(FORWARD_PROGRESS_STAGE_TIMEOUTS),
+        }
+
+
 def _read_factory_state() -> dict | None:
     """Read .runtime/factory_state.json — written by cycle.py.
 
@@ -6206,6 +6836,7 @@ def _build_local_factory_meta() -> dict:
         "command_diagnostics": _build_command_diagnostics_meta(),
         "watchdog": _build_watchdog_meta(),
         "pipeline_recovery": _build_pipeline_recovery_meta(),
+        "forward_progress": _build_forward_progress_meta(),
         "operator_fix": _build_operator_fix_meta(),
         "cycle_effectiveness": _build_cycle_effectiveness_meta(state),
         # Planner ↔ Designer ping-pong cycle output. See

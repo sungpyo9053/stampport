@@ -206,6 +206,16 @@ const SYSTEM_TYPE_TABLE = {
 // (handoff / agent_message / artifact_created without a known
 // payload). Order matters — more specific phrases first.
 const KEYWORD_TABLE = [
+  // Forward Progress Detector — heartbeat ≠ progress.
+  [/forward\s+progress\s+check\s+started/i,                 { category: "Doctor", actor: "system", severity: "info",    phase: "info"      }],
+  [/forward\s+progress\s+blocked/i,                         { category: "Error",  actor: "system", severity: "warn",    phase: "failed"    }],
+  [/current\s+stage\s+stuck/i,                              { category: "Error",  actor: "factory", severity: "error",  phase: "failed"    }],
+  [/required\s+output\s+missing/i,                          { category: "Error",  actor: "factory", severity: "warn",   phase: "failed"    }],
+  [/planning\s+only\s+loop\s+detected/i,                    { category: "Doctor", actor: "factory", severity: "warn",   phase: "skipped"   }],
+  [/no\s+code\s+change\s+detected/i,                        { category: "Error",  actor: "factory", severity: "warn",   phase: "skipped"   }],
+  [/no\s+progress\s+despite\s+heartbeat/i,                  { category: "Error",  actor: "system", severity: "error",   phase: "failed"    }],
+  [/continuous\s+stopped\s+due\s+to\s+no\s+progress/i,      { category: "Doctor", actor: "system", severity: "warn",    phase: "info"      }],
+
   // Pipeline Recovery Orchestrator — events synthesized from
   // pipeline_recovery state. The orchestrator's lifecycle drives the
   // "Doctor" category alongside the watchdog.
