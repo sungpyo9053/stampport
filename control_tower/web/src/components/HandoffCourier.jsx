@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import HumanAgentCharacter from "./HumanAgentCharacter.jsx";
 import ArtifactProp from "./ArtifactProp.jsx";
+import { getAgentPokemon } from "../constants/agentPokemon.js";
 
 // Big, visible courier that walks one handoff between desks.
 //
@@ -189,6 +190,31 @@ export default function HandoffCourier({
             </div>
           )}
           <span>{label}</span>
+          {/* From → to Pokemon glyph row — even with sprite assets
+              missing, the emoji fallbacks make the lineage of the
+              handoff visible at a glance. */}
+          {(fromAgent?.id || toAgent?.id) && (
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 2,
+                marginLeft: 4,
+                paddingLeft: 4,
+                borderLeft: `1px solid ${accent}66`,
+                fontSize: isMobile ? 10 : 12,
+              }}
+              aria-label="handoff lineage"
+            >
+              <span title={getAgentPokemon(fromAgent?.id).korean}>
+                {getAgentPokemon(fromAgent?.id).fallback}
+              </span>
+              <span style={{ opacity: 0.6 }}>→</span>
+              <span title={getAgentPokemon(toAgent?.id).korean}>
+                {getAgentPokemon(toAgent?.id).fallback}
+              </span>
+            </span>
+          )}
         </div>
 
         {/* Footstep shadow — squashes while traveling so the courier

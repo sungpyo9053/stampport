@@ -1,5 +1,6 @@
 import { motion } from "framer-motion";
-import AgentAvatar from "./AgentAvatar.jsx";
+import PokemonAvatar from "./PokemonAvatar.jsx";
+import { getAgentPokemon } from "../constants/agentPokemon.js";
 
 // One desk pod inside the PixelOffice. Composed entirely of solid
 // rectangles so the whole thing reads as pixel-art. The wood-toned desk
@@ -84,6 +85,41 @@ function DeskPaperStack({ accent }) {
   );
 }
 
+function RoleProp({ agent, facing, working }) {
+  const poke = getAgentPokemon(agent.id);
+  const props = poke.props || {};
+  const label = props.label;
+  const emoji = props.emoji;
+  if (!label && !emoji) return null;
+  // Pin the chip to the side of the desk opposite the lamp so it
+  // doesn't crowd the monitor.
+  const sideStyle = facing === "left"
+    ? { left: -36, top: 56 }
+    : { right: -36, top: 56 };
+  return (
+    <div
+      className="absolute flex items-center gap-1 px-1.5 py-0.5"
+      style={{
+        ...sideStyle,
+        backgroundColor: "#0a1228",
+        border: `1px solid ${(poke.accent || agent.color) + "66"}`,
+        borderRadius: 3,
+        fontFamily: "ui-monospace, monospace",
+        fontSize: 9,
+        fontWeight: 600,
+        letterSpacing: "0.5px",
+        color: poke.accent || agent.color,
+        boxShadow: working ? `0 0 6px ${(poke.accent || agent.color)}55` : "none",
+        whiteSpace: "nowrap",
+        zIndex: 4,
+      }}
+    >
+      {emoji && <span style={{ fontSize: 11 }}>{emoji}</span>}
+      {label && <span>{label}</span>}
+    </div>
+  );
+}
+
 function CoffeeMug({ accent }) {
   return (
     <svg
@@ -130,18 +166,31 @@ export default function AgentDesk({
         }}
       />
 
-      {/* AVATAR — sitting behind the desk */}
+      {/* AVATAR — Pokemon character behind the desk. Sized so the
+          sprite (or fallback emoji) reads at the same footprint as
+          the legacy human avatar but with more presence. */}
       <div
         className="absolute"
         style={{
           left: "50%",
-          top: 18,
+          top: 6,
           transform: "translateX(-50%)",
           zIndex: 2,
         }}
       >
-        <AgentAvatar look={agent.look} status={status} isActive={isActive} />
+        <PokemonAvatar
+          agentId={agent.id}
+          status={status}
+          isActive={isActive}
+          size={56}
+        />
       </div>
+
+      {/* Role-themed prop chip — small badge floating just outside
+          the desk with the desk-side emoji + label. Reinforces "the
+          designer is at the palette / QA is at the checklist /
+          deploy is at the box" without requiring a full sprite. */}
+      <RoleProp agent={agent} facing={facing} working={working} />
 
       {/* DESK — wood top + side */}
       <div
@@ -235,9 +284,11 @@ export default function AgentDesk({
         )}
       </div>
 
-      {/* NAMEPLATE */}
+      {/* NAMEPLATE — role label + mapped Pokemon (Korean + English).
+          The Korean Pokemon name sits on a second line so the role
+          label (PM / 기획자 / ...) stays the dominant identifier. */}
       <div
-        className="absolute flex items-center gap-1 whitespace-nowrap rounded-sm px-2 py-0.5 text-[10px] font-semibold tracking-widest"
+        className="absolute flex flex-col items-center whitespace-nowrap rounded-sm px-2 py-0.5"
         style={{
           left: "50%",
           bottom: -2,
@@ -250,11 +301,27 @@ export default function AgentDesk({
           zIndex: 5,
         }}
       >
-        <span
-          className="inline-block h-1.5 w-1.5"
-          style={{ backgroundColor: working ? agent.color : "#475569" }}
-        />
-        <span style={{ color: "#f5e9d3" }}>{agent.name}</span>
+        <div className="flex items-center gap-1 text-[10px] font-semibold tracking-widest">
+          <span
+            className="inline-block h-1.5 w-1.5"
+            style={{ backgroundColor: working ? agent.color : "#475569" }}
+          />
+          <span style={{ color: "#f5e9d3" }}>{agent.name}</span>
+        </div>
+        {(() => {
+          const poke = getAgentPokemon(agent.id);
+          if (!poke || poke.korean === "—") return null;
+          return (
+            <div
+              className="text-[8.5px] leading-tight tracking-widest"
+              style={{ color: poke.accent || agent.color }}
+            >
+              {poke.korean}
+              <span className="opacity-60"> · </span>
+              <span className="opacity-70">{poke.pokemon}</span>
+            </div>
+          );
+        })()}
       </div>
 
       {/* working ring around the desk */}

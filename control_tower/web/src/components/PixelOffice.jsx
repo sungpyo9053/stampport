@@ -375,6 +375,9 @@ export default function PixelOffice({
         <span className="text-[10px] font-bold tracking-[0.3em] text-[#d4a843]">
           STAMPPORT · OFFICE
         </span>
+        <span className="text-[9px] tracking-[0.25em] text-emerald-300/70">
+          · 팀 포켓몬
+        </span>
       </div>
 
       {/* live handoff banner — top-center, above the scaled stage so the
