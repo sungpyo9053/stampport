@@ -300,6 +300,260 @@ def _str(value: Any) -> str:
     return str(value)
 
 
+# ---------------------------------------------------------------------------
+# Current-state diagnostic promotion
+#
+# When any of the canonical state files already carries an explicit
+# diagnostic_code that matches one of our known classifications, we
+# promote it to the final verdict directly. This prevents the field-
+# shape fallback path from missing a clearly-set signal and falling
+# through to `unknown` — the bug this section was added to fix.
+#
+# Priority order (highest first):
+#   1. control_state.diagnostic_code        (canonical aggregator)
+#   2. pipeline_state.diagnostic_code        (pipeline-level)
+#   3. forward_progress_state.diagnostic_code (timing-level)
+#   4. factory_command_diagnostics.diagnostic_code (last operator command)
+#   5. qa_diagnostics.diagnostic_code         (qa stage)
+#   6. local_factory.log pattern fallback     (handled outside promotion)
+# ---------------------------------------------------------------------------
+
+
+KNOWN_DIAGNOSTIC_CODES: frozenset[str] = frozenset(
+    c for c in DIAGNOSTIC_CODES if c != "unknown"
+)
+
+
+PROMOTED_DIAGNOSTIC_META: dict[str, dict[str, Any]] = {
+    "stale_runner": {
+        "severity": "blocker", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "pipeline / control_state 가 stale_runner 를 보고 — runner 부팅 이후 "
+            "runner.py 가 수정됐거나 다른 runner 가 같은 .runtime 을 점유."
+        ),
+    },
+    "duplicate_runner": {
+        "severity": "blocker", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "state 파일이 duplicate_runner 를 보고 — 같은 .runtime 을 두 runner 가 "
+            "동시에 점유 중일 가능성. ps aux 로 실 프로세스도 확인 필요."
+        ),
+    },
+    "runner_offline": {
+        "severity": "blocker", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "state 파일이 runner_offline 을 보고 — heartbeat 갱신이 멈춘 채 "
+            "cycle 진행 불가."
+        ),
+    },
+    "implementation_ticket_missing": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "PM/claude_propose 이후 implementation_ticket.md 가 없거나 "
+            "target_files 를 추출하지 못해 다음 단계로 진행할 수 없음."
+        ),
+    },
+    "planner_required_output_missing": {
+        "severity": "warning", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "Product Planner 가 품질 가드에 실패하고 fallback 도 진행되지 않음."
+        ),
+    },
+    "current_stage_stuck": {
+        "severity": "warning", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "forward_progress 가 stuck — 현재 stage 가 timeout 초과로 진행되지 않음."
+        ),
+    },
+    "git_add_ignored_file": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "git add 단계에서 .gitignore 에 의해 무시되는 경로 (__pycache__ / "
+            "*.pyc 등) 를 add 하려다 실패. changed_files 수집 단계가 .gitignore "
+            "를 필터하지 않아 발생."
+        ),
+    },
+    "git_add_failed": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "deploy 명령의 git_add 단계가 실패. stderr 본문을 보고 .gitignore "
+            "충돌 / 권한 / 잠금 / 경로 문제 중 어떤 것인지 분류 필요."
+        ),
+    },
+    "qa_not_run": {
+        "severity": "warning", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "deploy 명령이 QA 단계까지 도달하지 못함 — branch_check / "
+            "publish_blocker / secret_scan 중 하나가 먼저 실패."
+        ),
+    },
+    "qa_gate_failed": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "QA Gate 가 실제 변경 파일에 대해 실패. qa_diagnostics.json 의 "
+            "failed_command / stderr_tail 로 정확한 stage 확인 필요."
+        ),
+    },
+    "claude_apply_failed_no_code_change": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "Implementation Ticket 은 generated 인데 claude_apply 가 0 개 파일 "
+            "변경 — Ticket 의 target_files 가 모호하거나 Claude 가 변경 거부."
+        ),
+    },
+    "actions_pending_timeout": {
+        "severity": "warning", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "git push 는 성공했지만 GitHub Actions 가 오래 pending — 워크플로우가 "
+            "stuck / cancelled 됐을 수 있음."
+        ),
+    },
+    "old_deploy_failed_stale": {
+        "severity": "info", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "deploy_progress.status 가 직전 사이클의 failed 로 남아있음 — "
+            "control_state 는 이미 ready/no_changes 로 재분류했을 가능성."
+        ),
+    },
+    "publish_required": {
+        "severity": "info", "category": "review", "is_failure": False,
+        "root_cause": (
+            "코드 변경 + QA 통과 — commit / push 만 남은 review 상태. 실패 아님."
+        ),
+    },
+}
+
+
+def _promote_known_diagnostic(state: dict) -> tuple[str, str] | None:
+    """Walk state files in priority order. Return (code, source_field) for
+    the first source whose diagnostic_code is a known code, else None."""
+    cs = state.get("control_state") or {}
+    pipe = state.get("pipeline_state") or {}
+    fp = state.get("forward_progress_state") or {}
+    cmd = state.get("factory_command_diagnostics") or {}
+    qad = state.get("qa_diagnostics") or {}
+
+    sources: tuple[tuple[str, Any], ...] = (
+        ("control_state.diagnostic_code", cs.get("diagnostic_code")),
+        ("pipeline_state.diagnostic_code", pipe.get("diagnostic_code")),
+        ("forward_progress_state.diagnostic_code", fp.get("diagnostic_code")),
+        ("factory_command_diagnostics.diagnostic_code",
+         cmd.get("diagnostic_code")),
+        ("qa_diagnostics.diagnostic_code", qad.get("diagnostic_code")),
+    )
+    for source, raw in sources:
+        if not raw:
+            continue
+        val = str(raw).strip()
+        if val in KNOWN_DIAGNOSTIC_CODES:
+            return val, source
+    return None
+
+
+def _build_promoted_classification(
+    code: str,
+    source: str,
+    state: dict,
+) -> dict:
+    """Build the rich classification dict for a promoted code. The
+    promotion tier shares one shape; per-code root_cause / severity
+    come from PROMOTED_DIAGNOSTIC_META, evidence is built per-code with
+    the most useful fields surfaced first."""
+    meta = PROMOTED_DIAGNOSTIC_META[code]
+    cs = state.get("control_state") or {}
+    fs = state.get("factory_state") or {}
+    pipe = state.get("pipeline_state") or {}
+    fp = state.get("forward_progress_state") or {}
+    cmd = state.get("factory_command_diagnostics") or {}
+    qad = state.get("qa_diagnostics") or {}
+
+    base_evidence: list[str] = [
+        f"source={source}",
+        f"control_state.status={cs.get('status') or '—'}",
+        f"control_state.diagnostic_code={cs.get('diagnostic_code') or '—'}",
+        f"pipeline_state.diagnostic_code={pipe.get('diagnostic_code') or '—'}",
+        f"forward_progress.status={fp.get('status') or '—'}",
+        f"agent_accountability.overall_status="
+        f"{(state.get('agent_accountability') or {}).get('overall_status') or '—'}",
+    ]
+
+    # Per-code extra evidence — only the most actionable extra fields.
+    extra: list[str] = []
+    if code == "implementation_ticket_missing":
+        extra = [
+            f"pm_decision_status={fs.get('pm_decision_status') or '—'}",
+            f"implementation_ticket_status="
+            f"{fs.get('implementation_ticket_status') or '—'}",
+            f"product_planner_status={fs.get('product_planner_status') or '—'}",
+        ]
+    elif code == "planner_required_output_missing":
+        gates = list(fs.get("product_planner_gate_failures") or [])
+        extra = [
+            f"product_planner_status={fs.get('product_planner_status') or '—'}",
+            f"gate_failures={len(gates)}",
+        ] + [f"- {g}" for g in gates[:4]]
+    elif code == "current_stage_stuck":
+        extra = [
+            f"current_stage={fp.get('current_stage') or '—'}",
+            f"required_output={fp.get('required_output') or '—'}",
+            f"required_output_exists={fp.get('required_output_exists')}",
+            f"elapsed_sec={fp.get('current_stage_elapsed_sec')}",
+            f"stage_timeout_sec={fp.get('stage_timeout_sec')}",
+        ]
+    elif code in {"git_add_ignored_file", "git_add_failed", "qa_not_run"}:
+        extra = [
+            f"command_diagnostics.failed_stage={cmd.get('failed_stage') or '—'}",
+            f"command_diagnostics.diagnostic_code="
+            f"{cmd.get('diagnostic_code') or '—'}",
+            (_str(cmd.get("failed_reason")) or "")[:300],
+        ]
+    elif code == "qa_gate_failed":
+        extra = [
+            f"qa_status={fs.get('qa_status') or qad.get('qa_status') or '—'}",
+            f"changed_files={len(list(fs.get('claude_apply_changed_files') or []))}",
+        ]
+        if qad.get("failed_command"):
+            extra.append(f"failed_command={qad.get('failed_command')}")
+        if qad.get("stderr_tail"):
+            extra.append(f"stderr_tail={(_str(qad.get('stderr_tail')))[:200]}")
+    elif code == "claude_apply_failed_no_code_change":
+        extra = [
+            f"claude_apply_status={fs.get('claude_apply_status') or '—'}",
+            f"claude_apply_changed_files="
+            f"{len(list(fs.get('claude_apply_changed_files') or []))}",
+            f"implementation_ticket_status="
+            f"{fs.get('implementation_ticket_status') or '—'}",
+        ]
+    elif code == "publish_required":
+        deploy_block = cs.get("deploy") or {}
+        extra = [
+            f"changed_files_count="
+            f"{deploy_block.get('changed_files_count') or len(list(fs.get('claude_apply_changed_files') or []))}",
+            f"qa_status="
+            f"{deploy_block.get('qa_status') or fs.get('qa_status') or '—'}",
+            f"commit_hash={deploy_block.get('commit_hash') or '—'}",
+            f"push_status={deploy_block.get('push_status') or '—'}",
+        ]
+    elif code == "actions_pending_timeout":
+        deploy_block = cs.get("deploy") or {}
+        fpub = state.get("factory_publish") or {}
+        extra = [
+            f"actions_status={deploy_block.get('actions_status') or '—'}",
+            f"actions_run_url={deploy_block.get('actions_run_url') or '—'}",
+            f"last_push_at={fpub.get('last_push_at') or '—'}",
+        ]
+
+    return {
+        "diagnostic_code": code,
+        "severity": meta["severity"],
+        "category": meta["category"],
+        "root_cause": meta["root_cause"],
+        "evidence": base_evidence + extra,
+        "auto_fix_possible": False,
+        "is_failure": meta["is_failure"],
+    }
+
+
 def classify(
     state: dict,
     runner_processes: list[str] | None = None,
@@ -328,21 +582,26 @@ def classify(
                                                        wrapper-only note)
 
     Order of precedence (highest first) — earlier matches win:
-        duplicate_runner  → 2+ Python runner processes
-        stale_runner      → pipeline says runner.py changed mid-cycle
-        runner_offline    → no Python runner OR no heartbeat
+        duplicate_runner    → 2+ Python runner processes (process-level)
+        runner_offline      → no Python runner OR no heartbeat (process+state)
+        PROMOTION PASS      → known diagnostic_code in any of:
+                              control_state / pipeline_state /
+                              forward_progress_state /
+                              factory_command_diagnostics / qa_diagnostics
+                              (in that priority order)
         git_add_ignored_file → __pycache__/.gitignore marker in logs
-        git_add_failed    → command_diagnostics.failed_stage == git_add
-        qa_not_run        → command_diagnostics.diagnostic_code == qa_not_run
-        qa_gate_failed    → qa_status == failed with real changes
+        git_add_failed       → command_diagnostics.failed_stage == git_add
+        qa_not_run           → command_diagnostics.diagnostic_code == qa_not_run
+        qa_gate_failed       → qa_status == failed with real changes
         claude_apply_failed_no_code_change
-        implementation_ticket_missing
+        implementation_ticket_missing  (field-shape combo)
         planner_required_output_missing
-        current_stage_stuck
+        current_stage_stuck   (forward_progress.status == "stuck")
         actions_pending_timeout
         old_deploy_failed_stale
-        publish_required  → review state, NOT failure
-        unknown           → fallback
+        publish_required      → review state, NOT failure
+        stale_runner          → log_tail-only fallback
+        healthy / unknown
     """
     cs = state.get("control_state") or {}
     fs = state.get("factory_state") or {}
@@ -382,34 +641,12 @@ def classify(
             "is_failure": True,
         }
 
-    # 2. stale_runner — pipeline_state / control_state 가 stale_runner 진단을 들고 있음.
+    # Read these once for use in both promotion-fallback and field-shape paths.
     pipe_code = _str(pipe.get("diagnostic_code"))
     cs_code = _str(cs.get("diagnostic_code"))
     cs_diag = _str((cs.get("pipeline") or {}).get("diagnostic_code"))
-    if (
-        pipe_code == "stale_runner"
-        or cs_code == "stale_runner"
-        or cs_diag == "stale_runner"
-        or any("stale_runner" in line for line in log_tail.splitlines()[-80:])
-    ):
-        return {
-            "diagnostic_code": "stale_runner",
-            "severity": "blocker",
-            "category": "failure",
-            "root_cause": (
-                "pipeline / control_state 가 stale_runner 를 보고 — runner 부팅 이후 "
-                "runner.py 가 수정됐거나 다른 runner 가 같은 .runtime 을 점유."
-            ),
-            "evidence": [
-                f"pipeline_state.diagnostic_code={pipe_code or '—'}",
-                f"control_state.diagnostic_code={cs_code or '—'}",
-                f"control_state.pipeline.diagnostic_code={cs_diag or '—'}",
-            ],
-            "auto_fix_possible": False,
-            "is_failure": True,
-        }
 
-    # 3. runner_offline — Python runner 프로세스 0개 OR heartbeat 없음.
+    # 2. runner_offline — Python runner 프로세스 0개 OR heartbeat 없음.
     liveness = cs.get("liveness") or {}
     no_python_runner = len(runner_procs) == 0
     heartbeat_dead = bool(cs and liveness and not liveness.get("runner_online"))
@@ -448,6 +685,19 @@ def classify(
             "auto_fix_possible": False,
             "is_failure": True,
         }
+
+    # 3. CURRENT-STATE PROMOTION — if any canonical state file already
+    # carries a known diagnostic_code, promote it to the final verdict.
+    # This MUST run before the field-shape fallbacks below; otherwise a
+    # clearly-set signal like control_state.diagnostic_code=
+    # implementation_ticket_missing can fall through to `unknown` when
+    # the field-shape combo (pm_decision_status=generated +
+    # implementation_ticket_status in {missing,...}) doesn't happen to
+    # match. See user-reported bug 2026-04-30.
+    promotion = _promote_known_diagnostic(state)
+    if promotion is not None:
+        promoted_code, promoted_source = promotion
+        return _build_promoted_classification(promoted_code, promoted_source, state)
 
     # 4. git_add_ignored_file — log 또는 deploy_progress 에 ignored 마커.
     dep_text = json.dumps(dep, ensure_ascii=False) if dep else ""
@@ -709,7 +959,31 @@ def classify(
             "is_failure": False,
         }
 
-    # 15. unknown — 이 외의 모든 비-healthy 상태. evidence 에 raw status 첨부.
+    # 15. stale_runner — log_tail 에서만 stale_runner 가 반복 보고되는 경우.
+    # 상태 파일에 diagnostic_code 가 들어있는 케이스는 이미 promotion 이
+    # 잡았으므로 여기는 순수 log-pattern 폴백.
+    if any("stale_runner" in line for line in log_tail.splitlines()[-80:]):
+        return {
+            "diagnostic_code": "stale_runner",
+            "severity": "blocker",
+            "category": "failure",
+            "root_cause": (
+                "local_factory.log 마지막 80 줄에 stale_runner 가 반복 — runner "
+                "부팅 이후 runner.py 가 수정됐거나 다른 runner 가 같은 .runtime "
+                "을 점유. (state 파일에는 아직 diagnostic_code 가 미반영.)"
+            ),
+            "evidence": [
+                "source=local_factory.log",
+                f"control_state.diagnostic_code={cs_code or '—'}",
+                f"pipeline_state.diagnostic_code={pipe_code or '—'}",
+            ],
+            "auto_fix_possible": False,
+            "is_failure": True,
+        }
+
+    # 16. healthy / unknown — 마지막 폴백. unknown 은 어떤 known
+    # diagnostic_code 도 없고, 어떤 log pattern 도 매칭 안 됐고, runner
+    # 상태도 판단 가능했을 때만 도달함.
     if cs_status in {"completed", "running", "idle"}:
         return {
             "diagnostic_code": "healthy",
@@ -727,10 +1001,12 @@ def classify(
         "severity": "warning",
         "category": "failure",
         "root_cause": (
-            f"분류된 진단 없음 — control_state.status={cs_status or '—'} / "
-            f"diagnostic_code={cs_code or '—'}. 운영자 직접 확인 필요."
+            "어떤 canonical state 파일에도 known diagnostic_code 가 없고 "
+            "log pattern / 프로세스 시그널로도 분류 불가. 운영자 직접 확인 필요."
         ),
         "evidence": [
+            "no_known_diagnostic_in: control_state / pipeline_state / "
+            "forward_progress_state / factory_command_diagnostics / qa_diagnostics",
             f"control_state.status={cs_status or '—'}",
             f"control_state.diagnostic_code={cs_code or '—'}",
             f"factory_state.status={fs.get('status') or '—'}",
@@ -945,13 +1221,24 @@ REPAIR_REQUIREMENTS_BY_CODE: dict[str, str] = {
         "4. 같은 패턴이 3회 반복되면 continuous OFF + 운영자 직접 검토."
     ),
     "implementation_ticket_missing": (
-        "1. PM 결정문(.runtime/pm_decision.md) 의 수정 대상 파일 명시 여부 확인.\n"
-        "2. cycle.py 의 stage_implementation_ticket 에 fallback ticket 생성 경로 추가 — "
-        "PM 결정문이 있으면 최소한 (target_files=수집된 파일, 성공 기준=PM 본문 요약) "
-        "으로 빈 ticket 이 아닌 fallback 을 생성해야 함.\n"
-        "3. fallback 이 만들어내는 ticket 도 IMPLEMENTATION_TICKET_REQUIRED_HEADINGS 의 "
-        "5 개 섹션을 모두 포함해야 함.\n"
-        "4. 수정 후 cycle 재실행해 implementation_ticket_status=generated 확인."
+        "1. .runtime/product_planner_report.md, .runtime/planner_revision.md, "
+        ".runtime/pm_decision.md 세 파일을 스캔해 수정 대상 파일 (target_files) 을 "
+        "추출 — 코드 경로 패턴 (.py / .jsx / .tsx / .ts / .js / .css / .md 중 "
+        "app/ 또는 control_tower/ 하위) 을 모두 수집.\n"
+        "2. target_files 가 ≥1 이면 cycle.py 의 stage_implementation_ticket 에 "
+        "fallback 경로를 추가해 다음을 만족하는 implementation_ticket.md 를 "
+        "직접 작성:\n"
+        "   - IMPLEMENTATION_TICKET_REQUIRED_HEADINGS 의 5 개 섹션 (작업 / 수정 "
+        "대상 파일 / 성공 기준 / 검증 방법 / 위험) 모두 포함\n"
+        "   - target_files 섹션에 위에서 추출한 경로를 줄바꿈으로 명시\n"
+        "3. ticket 생성 직후 factory_state.implementation_ticket_status = "
+        "\"generated\" 로 마킹해 다음 stage (claude_apply) 가 정상 진행되도록 함.\n"
+        "4. target_files 가 0 이면 fallback ticket 을 만드는 대신 PM decision "
+        "프롬프트를 강화 — 'must include explicit list of files to modify under "
+        "app/* or control_tower/*' 같은 강한 요구를 추가하고 PM 단계로 "
+        "rollback 후 재실행.\n"
+        "5. 변경 후 cycle 한 번 돌려 implementation_ticket_status=\"generated\" "
+        "AND claude_apply_changed_files 길이 > 0 확인."
     ),
     "planner_required_output_missing": (
         "1. cycle.py 의 stage_product_planning 결과 / fallback 경로 점검.\n"
@@ -1022,8 +1309,12 @@ ACCEPTANCE_TEMPLATE_BY_CODE: dict[str, str] = {
         "- agent_accountability.meaningful_change == true"
     ),
     "implementation_ticket_missing": (
-        "- implementation_ticket_status == 'generated'\n"
-        "- IMPLEMENTATION_TICKET_REQUIRED_HEADINGS 5 개 섹션 모두 존재"
+        "- .runtime/implementation_ticket.md 가 5 개 required headings 모두 포함\n"
+        "- target_files 섹션에 app/ 또는 control_tower/ 하위 경로 ≥1 명시\n"
+        "- factory_state.implementation_ticket_status == 'generated'\n"
+        "- 다음 cycle 에서 claude_apply_changed_files 길이 > 0\n"
+        "- pipeline_state.diagnostic_code != 'implementation_ticket_missing'\n"
+        "- control_state.diagnostic_code != 'implementation_ticket_missing'"
     ),
     "planner_required_output_missing": (
         "- product_planner_status in {generated, fallback_generated}\n"
@@ -1729,6 +2020,145 @@ def self_test() -> tuple[int, int, list[str]]:
         failures.append(
             f"L: shell wrapper / editor lines should be dropped — "
             f"py={py_procs} caff={caff_procs}"
+        )
+
+    # ----- Promotion tests M–Q (regression for the unknown-misclassify bug) -----
+
+    # M. control_state.diagnostic_code = implementation_ticket_missing
+    # → observer must promote, NOT fall through to unknown.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {
+        "status": "operator_required",
+        "diagnostic_code": "implementation_ticket_missing",
+        "liveness": {"runner_online": True},
+    }
+    s["forward_progress_state"] = {"status": "operator_required"}
+    s["agent_accountability"] = {"overall_status": "retry_required"}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    is_promoted = (
+        c["diagnostic_code"] == "implementation_ticket_missing"
+        and any("source=control_state.diagnostic_code" in e
+                for e in c["evidence"])
+    )
+    if is_promoted:
+        passed += 1
+    else:
+        failures.append(
+            f"M: control_state.diagnostic_code=implementation_ticket_missing "
+            f"should promote, got {c['diagnostic_code']} (evidence={c['evidence'][:3]})"
+        )
+
+    # N. pipeline_state.diagnostic_code only — promotion still wins.
+    total += 1
+    s = _empty_state()
+    s["pipeline_state"] = {"diagnostic_code": "implementation_ticket_missing"}
+    s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    is_pipeline_promoted = (
+        c["diagnostic_code"] == "implementation_ticket_missing"
+        and any("source=pipeline_state.diagnostic_code" in e
+                for e in c["evidence"])
+    )
+    if is_pipeline_promoted:
+        passed += 1
+    else:
+        failures.append(
+            f"N: pipeline_state.diagnostic_code=implementation_ticket_missing "
+            f"should promote (with source=pipeline_state.diagnostic_code), "
+            f"got {c['diagnostic_code']}"
+        )
+
+    # O. control_state.diagnostic_code = current_stage_stuck → promote.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {
+        "status": "blocked",
+        "diagnostic_code": "current_stage_stuck",
+        "liveness": {"runner_online": True},
+    }
+    s["forward_progress_state"] = {
+        "status": "stuck",
+        "current_stage": "implementation_ticket",
+        "required_output": ".runtime/implementation_ticket.md",
+        "required_output_exists": False,
+    }
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] == "current_stage_stuck":
+        passed += 1
+    else:
+        failures.append(
+            f"O: control_state.diagnostic_code=current_stage_stuck should "
+            f"promote, got {c['diagnostic_code']}"
+        )
+
+    # P. Known diagnostic anywhere in the priority chain blocks `unknown`.
+    # Use a code that no field-shape rule would otherwise match.
+    total += 1
+    s = _empty_state()
+    s["qa_diagnostics"] = {"diagnostic_code": "actions_pending_timeout"}
+    s["control_state"] = {
+        "status": "blocked",
+        "liveness": {"runner_online": True},
+    }
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] != "unknown":
+        passed += 1
+    else:
+        failures.append(
+            "P: known diagnostic in qa_diagnostics should block unknown"
+        )
+
+    # Q. NO diagnostic anywhere AND no log pattern AND blocked status →
+    # unknown is allowed (and only here).
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {
+        "status": "blocked",
+        "diagnostic_code": "weird_unmapped_xyz",
+        "liveness": {"runner_online": True},
+    }
+    s["factory_state"] = {"status": "weird_state"}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    is_unknown_with_marker = (
+        c["diagnostic_code"] == "unknown"
+        and any("no_known_diagnostic_in" in e for e in c["evidence"])
+    )
+    if is_unknown_with_marker:
+        passed += 1
+    else:
+        failures.append(
+            f"Q: blocked + unknown diagnostic_code should fall to unknown "
+            f"with no_known_diagnostic_in marker, got {c['diagnostic_code']}"
+        )
+
+    # R. publish_required promoted from state preserves category=review,
+    # is_failure=False.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {
+        "status": "ready_to_publish",
+        "diagnostic_code": "publish_required",
+        "deploy": {
+            "changed_files_count": 2,
+            "qa_status": "passed",
+            "commit_hash": None,
+            "push_status": None,
+        },
+        "liveness": {"runner_online": True},
+    }
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if (
+        c["diagnostic_code"] == "publish_required"
+        and c["category"] == "review"
+        and c["is_failure"] is False
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"R: promoted publish_required should be review/non-failure, got "
+            f"code={c['diagnostic_code']} cat={c['category']} "
+            f"is_failure={c['is_failure']}"
         )
 
     return passed, total, failures
