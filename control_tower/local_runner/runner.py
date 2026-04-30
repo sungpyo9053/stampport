@@ -543,6 +543,117 @@ def _is_allowed_publish_path(path: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Auto-publish ignore filter.
+#
+# `git add` rejects gitignored files when called with explicit paths.
+# claude_apply / publish_changes used to pass the raw changed_files
+# list straight to git, so a stray __pycache__/ entry from a Python
+# import side-effect would crash the whole publish at git_add stage —
+# AND the failure was misclassified as `qa_not_run` because the
+# diagnostic_code mapper defaulted to it for any non-qa stage.
+#
+# `_filter_addable_files` strips the obvious noise paths AND consults
+# `git check-ignore` so any path matching the project's .gitignore is
+# silently dropped. Returns (addable, ignored_skipped) so the caller
+# can log the skipped list as evidence rather than as failure.
+# ---------------------------------------------------------------------------
+
+# Hard-block patterns even before consulting git check-ignore — these
+# never legitimately appear in a publish payload regardless of what
+# .gitignore says.
+PUBLISH_HARD_IGNORE_SUBSTRINGS: tuple[str, ...] = (
+    "__pycache__/",
+    "/__pycache__",
+    "node_modules/",
+    "/dist/",
+    "/build/",
+    ".runtime/",
+)
+PUBLISH_HARD_IGNORE_SUFFIXES: tuple[str, ...] = (
+    ".pyc",
+    ".pyo",
+    ".pem",
+    ".key",
+    ".db",
+    ".sqlite",
+)
+PUBLISH_HARD_IGNORE_BASENAMES: tuple[str, ...] = (
+    ".env",
+    ".DS_Store",
+)
+
+
+def _file_obviously_ignored(path: str) -> bool:
+    """Cheap pattern match before shelling out to git check-ignore."""
+    if not path:
+        return True
+    if any(s in path for s in PUBLISH_HARD_IGNORE_SUBSTRINGS):
+        return True
+    base = path.rsplit("/", 1)[-1]
+    if base in PUBLISH_HARD_IGNORE_BASENAMES:
+        return True
+    if base.startswith(".env"):
+        return True
+    if any(path.endswith(s) for s in PUBLISH_HARD_IGNORE_SUFFIXES):
+        return True
+    return False
+
+
+def _git_check_ignored_paths(paths: list[str]) -> set[str]:
+    """Return the subset of `paths` that git considers ignored.
+    Uses `git check-ignore --stdin -z` so we make exactly one
+    subprocess call regardless of how many paths we're checking.
+    Empty or all-already-ignored input → empty set without calling git.
+    """
+    if not paths:
+        return set()
+    try:
+        # `--stdin` reads NUL-separated paths from stdin and writes the
+        # ones that are ignored, also NUL-separated, to stdout. exit
+        # code 0 means at least one was ignored; 1 means none; 128 is
+        # an error.
+        r = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-ignore", "--stdin", "-z"],
+            input="\0".join(paths) + "\0",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if r.returncode not in {0, 1}:
+        return set()
+    if not r.stdout:
+        return set()
+    return {p for p in r.stdout.split("\0") if p}
+
+
+def _filter_addable_files(candidates: list[str]) -> tuple[list[str], list[str]]:
+    """Returns (addable, ignored_skipped). Combines hard-coded
+    substring/suffix patterns with `git check-ignore` so the publish
+    pipeline never tries to git-add a file that .gitignore rejects."""
+    if not candidates:
+        return [], []
+    deduped = list(dict.fromkeys(candidates))  # preserve order, drop dupes
+    addable: list[str] = []
+    ignored: list[str] = []
+    soft_candidates: list[str] = []
+    for p in deduped:
+        if _file_obviously_ignored(p):
+            ignored.append(p)
+        else:
+            soft_candidates.append(p)
+    # One git check-ignore call for the rest.
+    soft_ignored = _git_check_ignored_paths(soft_candidates)
+    for p in soft_candidates:
+        if p in soft_ignored:
+            ignored.append(p)
+        else:
+            addable.append(p)
+    return addable, ignored
+
+
 def _classify_publish_files(
     files: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
@@ -960,6 +1071,18 @@ _QA_SUGGESTION = {
         "이전 deploy 명령이 처리 중 / 캐시됨 — 30초 후 다시 시도하거나 runner 재시작",
     "stale_metadata":
         "factory_state.json 의 qa 상태와 실제 파일 상태가 불일치 — on-demand QA 가 자동으로 재실행합니다",
+    "git_add_failed":
+        "git add 단계 실패 — stderr tail 의 경로/권한 오류 확인 후 publish 재시도",
+    "git_add_ignored_file":
+        "ignored/generated 파일을 add 대상에서 제외하고 publish 재시도",
+    "git_commit_failed":
+        "git commit 단계 실패 — pre-commit hook / repo 상태 확인 후 publish 재시도",
+    "git_push_failed":
+        "git push 단계 실패 — branch / non-fast-forward / 인증 오류 확인 후 재시도",
+    "github_actions_not_triggered":
+        "push 는 됐지만 GitHub Actions 트리거가 실패 — 워크플로우 활성 상태 점검",
+    "no_addable_changes":
+        "추가 가능한 변경 파일이 없음 — 모든 후보가 ignored/generated 였음. 새 사이클 대기.",
     "unknown":
         "원인 분류 실패 — qa_diagnostics.json 의 raw_detail 확인",
 }
@@ -2015,20 +2138,45 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
                 log_message=f"publish blocked at {stage}: {message[:200]}",
             )
         # Mirror the failure into command_diagnostics so the dashboard
-        # always has a structured reason — including `qa_not_run` for
-        # the cases where publish gave up before the QA gate (e.g.
-        # branch_check, secret_scan, publish_blocker). The QA-stage
-        # path overwrites this with its own richer diagnostic_code.
+        # always has a structured reason. Pre-QA stages (branch_check
+        # / secret_scan / publish_blocker) historically mapped to
+        # `qa_not_run`. Post-QA stages (git_add / git_commit / git_push)
+        # need their own codes — calling the result `qa_not_run` is a
+        # lie when QA already passed. The QA-stage path overwrites
+        # this with its own richer diagnostic_code.
         if stage != "qa_gate":
+            stage_code_map = {
+                "git_add": "git_add_failed",
+                "git_commit": "git_commit_failed",
+                "git_push": "git_push_failed",
+                "actions_dispatch": "github_actions_not_triggered",
+            }
+            # Stage-specific code if known; otherwise fall back to the
+            # legacy `qa_not_run` for branch_check / secret_scan /
+            # publish_blocker / etc.
+            diag_code = stage_code_map.get(stage, "qa_not_run")
+            # Bonus signal: if the stderr clearly mentions ignored
+            # files, surface the more specific code so the dashboard
+            # explains the right fix.
+            if (
+                stage == "git_add"
+                and message
+                and (
+                    ".gitignore" in message
+                    or "ignored by" in message.lower()
+                    or "무시합니다" in message
+                )
+            ):
+                diag_code = "git_add_ignored_file"
             _save_command_diagnostics({
                 "last_command": "deploy_to_server",
                 "status": "failed",
                 "failed_stage": stage,
-                "diagnostic_code": "qa_not_run",
+                "diagnostic_code": diag_code,
                 "failed_reason": message[:600],
                 "suggested_action": (
                     suggested_action
-                    or _qa_diagnostic_suggested("qa_not_run")
+                    or _qa_diagnostic_suggested(diag_code)
                 ),
                 "occurred_at": _utc_now_z(),
             })
@@ -2503,20 +2651,112 @@ def _h_publish_changes(_payload: dict) -> tuple[bool, str]:
         return True, msg
 
     # 7. Real publish path. git add ONLY the allowed files (never `.`).
-    _progress("committing", step="git commit 생성 중")
-    ok, out = _git("add", "--", *allowed, timeout=60)
-    if not ok:
-        _record_failure("git_add", out[-300:])
-        return False, f"publish failed at git_add: {out[-300:]}"
+    #
+    # First filter ignored / generated paths up front so a stray
+    # `__pycache__` entry doesn't crash git add. The filter also
+    # consults `git check-ignore` so any path matched by the project
+    # .gitignore is dropped silently. Skipped files are surfaced as
+    # publish_ignored_file_skipped events (not failures).
+    addable, ignored_skipped = _filter_addable_files(allowed)
+    if ignored_skipped:
+        for f in ignored_skipped:
+            _log_event(f"publish_ignored_file_skipped: {f}")
+        if track_progress:
+            _set_deploy_progress(
+                "committing",
+                current_step=(
+                    f"ignored/generated 파일 {len(ignored_skipped)}개 제외 — "
+                    "addable 파일만 git add"
+                ),
+                log_message=(
+                    "publish_ignored_file_skipped: "
+                    + ", ".join(ignored_skipped[:5])
+                ),
+            )
 
-    # 8. Commit.
+    if not addable:
+        # Every candidate was ignored — there's literally nothing safe
+        # to add. Surface as a structured no_addable_changes verdict
+        # rather than as a publish failure: no commit, no push, no
+        # stale `failed` row.
+        _save_publish_state({
+            "last_push_status": "noop",
+            "last_push_at": _utc_now_z(),
+            "last_publish_message": (
+                "no_addable_changes — 후보 파일이 전부 ignored/generated"
+            ),
+            "last_failed_stage": None,
+            "last_attempt_started_at": started_at,
+            "last_skipped_ignored_files": ignored_skipped[:30],
+        })
+        _save_command_diagnostics({
+            "last_command": "deploy_to_server",
+            "status": "noop",
+            "failed_stage": None,
+            "diagnostic_code": "no_addable_changes",
+            "failed_reason": (
+                "추가 가능한 변경 파일이 없음 — 모든 후보가 .gitignore 대상."
+            ),
+            "suggested_action": _qa_diagnostic_suggested("no_addable_changes"),
+            "occurred_at": _utc_now_z(),
+            "skipped_ignored_files": ignored_skipped[:30],
+        })
+        if track_progress:
+            _set_deploy_progress(
+                "completed",
+                current_step="추가 가능한 변경 없음 — publish 완료(no-op)",
+                log_message="no_addable_changes",
+            )
+        return True, (
+            "publish skipped: 추가 가능한 변경 없음 ("
+            f"ignored {len(ignored_skipped)}개)"
+        )
+
+    _progress("committing", step="git commit 생성 중")
+    ok, out = _git("add", "--", *addable, timeout=60)
+    if not ok:
+        # One-shot retry: parse stderr for additional ignored-file
+        # mentions, drop them from `addable`, retry once. This catches
+        # repos where check-ignore disagreed with the actual git-add
+        # rejection (e.g. nested .gitignore files Python's stdlib
+        # subprocess doesn't see).
+        retry_message = out
+        retry_addable, _ = _filter_addable_files(addable)
+        # Always re-run check-ignore against the ORIGINAL set in case
+        # the .gitignore changed mid-operation; also drop anything
+        # explicitly named in stderr.
+        stderr_lower = (out or "").lower()
+        retry_addable = [
+            p for p in retry_addable
+            if p.lower() not in stderr_lower
+            and not _file_obviously_ignored(p)
+        ]
+        if retry_addable and retry_addable != addable:
+            _log_event(
+                f"publish git_add retry — original={len(addable)} "
+                f"after ignored-strip={len(retry_addable)}"
+            )
+            ok2, out2 = _git("add", "--", *retry_addable, timeout=60)
+            if ok2:
+                addable = retry_addable
+                ok, out = True, out2
+            else:
+                retry_message = out2
+        if not ok:
+            _record_failure("git_add", retry_message[-300:])
+            return False, f"publish failed at git_add: {retry_message[-300:]}"
+
+    # 8. Commit. Use the post-filter `addable` list so the commit
+    # message + reset rollback both reference the actually-staged
+    # files (not the pre-filter `allowed` list which may include
+    # ignored entries the dashboard would mis-attribute to the diff).
     commit_message = _build_publish_commit_message(
-        allowed, state_at_start, push_message="Push: origin/main"
+        addable, state_at_start, push_message="Push: origin/main"
     )
     ok, out = _git("commit", "-m", commit_message, timeout=60)
     if not ok:
         # Rollback the staged adds so nothing lingers.
-        _git("reset", "HEAD", "--", *allowed, timeout=30)
+        _git("reset", "HEAD", "--", *addable, timeout=30)
         _record_failure("git_commit", out[-300:])
         return False, f"publish failed at git_commit: {out[-300:]}"
 
