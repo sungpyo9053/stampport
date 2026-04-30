@@ -52,3 +52,4 @@ scripts/*.log
 *.sqlite3
 .runtime/
 control_tower/.runtime/
+*.pyc
