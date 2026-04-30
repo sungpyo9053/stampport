@@ -150,15 +150,80 @@ def collect_state(runtime: Path | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-RUNNER_MODULE_TOKEN = "control_tower.local_runner.runner"
+RUNNER_MODULE_TOKEN = "-m control_tower.local_runner.runner"
+
+# Wrappers / utilities that may legitimately co-exist alongside the real
+# Python runner — they reference the runner in their command line but
+# are NOT themselves the runner. caffeinate -dimsu wraps the python -m
+# call to keep the laptop awake; sh/bash/zsh wrap an exec; timeout/awk
+# may appear in pipelines. None of these counts toward duplicate_runner.
+_WRAPPER_BASENAMES: frozenset[str] = frozenset({
+    "caffeinate",
+    "sh", "bash", "zsh", "fish",
+    "timeout",
+    "awk", "tee", "xargs",
+    "grep", "egrep", "fgrep", "rg",
+    "watch",
+})
+
+_PYTHON_BASENAME_TOKENS: tuple[str, ...] = (
+    "python3", "python2", "python",
+    "Python",  # the macOS framework path: .../Python.app/Contents/MacOS/Python
+    "pypy3", "pypy",
+)
 
 
-def detect_runner_processes(ps_output: str | None = None) -> list[str]:
-    """Return the matching process lines for the local runner module.
+def _ps_command_field(line: str) -> str:
+    """Return the COMMAND column from a `ps aux` line.
 
-    `ps_output` is injectable for tests; production calls `ps aux` once
-    and matches lines containing RUNNER_MODULE_TOKEN, excluding the
-    grep/observer process itself.
+    `ps aux` columns: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+    The COMMAND column is the 11th field onward (joined). We split with
+    `maxsplit=10` so any spaces inside COMMAND are preserved.
+    """
+    parts = line.split(None, 10)
+    if len(parts) < 11:
+        return line.strip()
+    return parts[10]
+
+
+def _looks_like_python(executable: str) -> bool:
+    """True if the first token of the COMMAND looks like a Python interpreter.
+
+    Matches both `python3`, `/usr/local/.../python3.11`, and the macOS
+    framework path `.../Python.app/Contents/MacOS/Python` (basename `Python`).
+    """
+    if not executable:
+        return False
+    base = os.path.basename(executable)
+    if base in _PYTHON_BASENAME_TOKENS:
+        return True
+    # Versioned binaries like python3.11
+    for tok in ("python3", "python2", "python"):
+        if base.startswith(tok):
+            return True
+    return False
+
+
+def _wrapper_basename(executable: str) -> str | None:
+    """If COMMAND starts with a known wrapper, return its basename, else None."""
+    if not executable:
+        return None
+    base = os.path.basename(executable)
+    return base if base in _WRAPPER_BASENAMES else None
+
+
+def detect_runner_processes(
+    ps_output: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (python_runner_lines, caffeinate_wrapper_lines).
+
+    Both lists exclude the observer's own process and the grep helper.
+    Only the first list counts toward duplicate_runner — caffeinate (and
+    other shell wrappers) are tracked separately so a normal
+    `caffeinate -dimsu python -m control_tower.local_runner.runner`
+    invocation reads as Python=1, caffeinate=1 (NOT duplicate).
+
+    `ps_output` is injectable for tests; production calls `ps aux` once.
     """
     if ps_output is None:
         try:
@@ -168,18 +233,42 @@ def detect_runner_processes(ps_output: str | None = None) -> list[str]:
             )
             ps_output = res.stdout or ""
         except (subprocess.SubprocessError, FileNotFoundError, OSError):
-            return []
-    matches: list[str] = []
+            return [], []
+
+    python_runners: list[str] = []
+    wrappers: list[str] = []
     for line in ps_output.splitlines():
         if RUNNER_MODULE_TOKEN not in line:
             continue
-        # Filter out the observer / grep / ps line itself.
+        # Always exclude self / grep helpers regardless of executable.
         if "factory_observer" in line:
             continue
-        if " grep " in line or line.endswith(" grep"):
+        if " grep " in line or line.rstrip().endswith(" grep"):
             continue
-        matches.append(line.strip())
-    return matches
+
+        cmd = _ps_command_field(line)
+        first_token = cmd.split(None, 1)[0] if cmd else ""
+
+        # Wrapper bucket — caffeinate / shells / timeout / etc.
+        wrapper = _wrapper_basename(first_token)
+        if wrapper == "caffeinate":
+            wrappers.append(line.strip())
+            continue
+        if wrapper is not None:
+            # Other wrappers (sh/bash/zsh/timeout/awk) are excluded
+            # entirely — they're neither real runners nor the
+            # caffeinate-style "keep alive" companion we want to surface.
+            continue
+
+        # Real runner — first token must look like a Python interpreter.
+        if _looks_like_python(first_token):
+            python_runners.append(line.strip())
+            continue
+
+        # Anything else that mentions the module but isn't python and
+        # isn't a known wrapper (e.g. an editor showing the file) is
+        # ignored.
+    return python_runners, wrappers
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +300,11 @@ def _str(value: Any) -> str:
     return str(value)
 
 
-def classify(state: dict, runner_processes: list[str] | None = None) -> dict:
+def classify(
+    state: dict,
+    runner_processes: list[str] | None = None,
+    caffeinate_processes: list[str] | None = None,
+) -> dict:
     """Return diagnostic classification dict.
 
     Shape:
@@ -225,10 +318,19 @@ def classify(state: dict, runner_processes: list[str] | None = None) -> dict:
             "is_failure": bool,
         }
 
+    Process counting rules (only python_runners count):
+        Python runner ≥ 2                           → duplicate_runner
+        Python runner = 1 (any caffeinate count)    → ok at process level
+        Python runner = 0, caffeinate = 0           → runner_offline
+        Python runner = 0, caffeinate ≥ 1           → broken_wrapper
+                                                       (surfaced as
+                                                       runner_offline with
+                                                       wrapper-only note)
+
     Order of precedence (highest first) — earlier matches win:
-        duplicate_runner  → process-level
+        duplicate_runner  → 2+ Python runner processes
         stale_runner      → pipeline says runner.py changed mid-cycle
-        runner_offline    → no heartbeat
+        runner_offline    → no Python runner OR no heartbeat
         git_add_ignored_file → __pycache__/.gitignore marker in logs
         git_add_failed    → command_diagnostics.failed_stage == git_add
         qa_not_run        → command_diagnostics.diagnostic_code == qa_not_run
@@ -253,24 +355,29 @@ def classify(state: dict, runner_processes: list[str] | None = None) -> dict:
     accountability = state.get("agent_accountability") or {}
     log_tail = state.get("log_tail") or ""
 
-    runner_procs = (
-        runner_processes
-        if runner_processes is not None
-        else detect_runner_processes()
-    )
+    if runner_processes is None and caffeinate_processes is None:
+        runner_procs, caffeinate_procs = detect_runner_processes()
+    else:
+        runner_procs = runner_processes or []
+        caffeinate_procs = caffeinate_processes or []
 
-    # 1. duplicate_runner — ps aux says 2+ runner processes.
+    # 1. duplicate_runner — only count Python runner processes. caffeinate
+    # wrappers are tracked separately and do NOT count.
     if len(runner_procs) >= 2:
         return {
             "diagnostic_code": "duplicate_runner",
             "severity": "blocker",
             "category": "failure",
             "root_cause": (
-                f"control_tower.local_runner.runner 프로세스가 {len(runner_procs)} 개 "
-                "감지됨 — 두 runner 가 같은 .runtime 파일을 동시에 쓰면 stale_runner "
-                "/ inconsistent state 가 반복 발생."
+                f"Python runner 프로세스가 {len(runner_procs)} 개 감지됨 — "
+                "두 runner 가 같은 .runtime 파일을 동시에 쓰면 stale_runner / "
+                "inconsistent state 가 반복 발생. (caffeinate wrapper 는 별도 "
+                f"{len(caffeinate_procs)} 개로 정상.)"
             ),
-            "evidence": runner_procs[:6],
+            "evidence": (
+                [f"python_runner: {p}" for p in runner_procs[:4]]
+                + [f"caffeinate: {p}" for p in caffeinate_procs[:2]]
+            ),
             "auto_fix_possible": False,
             "is_failure": True,
         }
@@ -302,22 +409,42 @@ def classify(state: dict, runner_processes: list[str] | None = None) -> dict:
             "is_failure": True,
         }
 
-    # 3. runner_offline — heartbeat 없음.
+    # 3. runner_offline — Python runner 프로세스 0개 OR heartbeat 없음.
     liveness = cs.get("liveness") or {}
-    if cs and liveness and not liveness.get("runner_online"):
+    no_python_runner = len(runner_procs) == 0
+    heartbeat_dead = bool(cs and liveness and not liveness.get("runner_online"))
+    if no_python_runner or heartbeat_dead:
+        wrapper_only = no_python_runner and len(caffeinate_procs) >= 1
+        if wrapper_only:
+            root = (
+                "Python runner 0 개인데 caffeinate wrapper 만 살아있음 — "
+                "wrapper 가 시작했어야 할 python -m control_tower.local_runner.runner "
+                "가 부팅 직후 죽었거나 exec 실패. (broken_wrapper)"
+            )
+        elif no_python_runner:
+            root = (
+                "Python runner 프로세스가 0 개 — runner 가 죽었거나 시작되지 않음. "
+                f"(caffeinate wrapper {len(caffeinate_procs)} 개)"
+            )
+        else:
+            root = (
+                "control_state.liveness.runner_online=false — runner heartbeat 갱신이 "
+                "멈춤. 프로세스는 살아있을 수 있으나 cycle 진행 불가."
+            )
         return {
             "diagnostic_code": "runner_offline",
             "severity": "blocker",
             "category": "failure",
-            "root_cause": (
-                "control_state.liveness.runner_online=false — runner 가 죽었거나 "
-                "heartbeat 갱신이 멈춤."
-            ),
+            "root_cause": root,
             "evidence": [
+                f"python_runner_count={len(runner_procs)}",
+                f"caffeinate_count={len(caffeinate_procs)}",
                 f"liveness.runner_online={liveness.get('runner_online')}",
                 f"liveness.heartbeat_at={liveness.get('heartbeat_at')}",
                 f"liveness.runner_stale={liveness.get('runner_stale')}",
-            ],
+            ] + (
+                [f"caffeinate: {caffeinate_procs[0]}"] if caffeinate_procs else []
+            ),
             "auto_fix_possible": False,
             "is_failure": True,
         }
@@ -967,6 +1094,8 @@ def build_failure_report(state: dict, classification: dict) -> str:
 
     auto_fix = "예 (자동 수정 후보)" if classification.get("auto_fix_possible") else "아니오 (운영자 검토 필요)"
 
+    procs_block = _format_process_block(classification)
+
     return (
         f"# Factory Failure Report\n\n"
         f"생성 시각: {_utc_now_iso()}\n"
@@ -988,6 +1117,7 @@ def build_failure_report(state: dict, classification: dict) -> str:
         f"{classification.get('root_cause') or '—'}\n\n"
         f"## 근거 로그\n"
         f"{_format_evidence_lines(classification.get('evidence') or [])}\n\n"
+        f"{procs_block}"
         f"## 관련 runtime 파일\n"
         f"{_format_runtime_files()}\n\n"
         f"## 수동 확인 명령\n"
@@ -997,6 +1127,32 @@ def build_failure_report(state: dict, classification: dict) -> str:
         f"- 자동 수정 가능 여부: {auto_fix}\n"
         f"- 같은 진단이 3회 이상 반복되면 continuous OFF + 운영자 직접 조치\n"
     )
+
+
+def _format_process_block(classification: dict) -> str:
+    """Render the runner/caffeinate process section. classification carries
+    process-shaped evidence on duplicate_runner / runner_offline; for
+    other diagnostics the section is omitted."""
+    code = classification.get("diagnostic_code")
+    if code not in {"duplicate_runner", "runner_offline"}:
+        return ""
+    evidence = classification.get("evidence") or []
+    runner_lines = [e for e in evidence if isinstance(e, str)
+                    and e.startswith("python_runner: ")]
+    wrapper_lines = [e for e in evidence if isinstance(e, str)
+                     and e.startswith("caffeinate: ")]
+    body = "## 프로세스 현황\n"
+    body += f"- Python runner: {len(runner_lines)} 개\n"
+    body += f"- caffeinate wrapper: {len(wrapper_lines)} 개\n"
+    if runner_lines:
+        body += "### Python runner\n"
+        for line in runner_lines:
+            body += f"  - `{line[len('python_runner: '):]}`\n"
+    if wrapper_lines:
+        body += "### caffeinate wrapper\n"
+        for line in wrapper_lines:
+            body += f"  - `{line[len('caffeinate: '):]}`\n"
+    return body + "\n"
 
 
 def build_repair_prompt(state: dict, classification: dict) -> str:
@@ -1220,8 +1376,12 @@ def tick(runtime: Path | None = None) -> dict:
     """
     rt = runtime or _runtime_dir()
     state = collect_state(rt)
-    runner_processes = detect_runner_processes()
-    classification = classify(state, runner_processes=runner_processes)
+    runner_processes, caffeinate_processes = detect_runner_processes()
+    classification = classify(
+        state,
+        runner_processes=runner_processes,
+        caffeinate_processes=caffeinate_processes,
+    )
 
     code = classification["diagnostic_code"]
     failure_report = build_failure_report(state, classification)
@@ -1262,6 +1422,8 @@ def tick(runtime: Path | None = None) -> dict:
         "evidence": classification.get("evidence") or [],
         "runner_process_count": len(runner_processes),
         "runner_processes": runner_processes,
+        "caffeinate_process_count": len(caffeinate_processes),
+        "caffeinate_processes": caffeinate_processes,
         "outputs": {
             "failure_report": str(_failure_report_path()),
             "repair_prompt": str(_repair_prompt_path()),
@@ -1275,7 +1437,9 @@ def tick(runtime: Path | None = None) -> dict:
     _save_state(persisted)
     _append_log(
         f"observer_tick · code={code} · severity={classification.get('severity')} "
-        f"· category={classification.get('category')} · runner_procs={len(runner_processes)}",
+        f"· category={classification.get('category')} "
+        f"· python_runner={len(runner_processes)} "
+        f"· caffeinate={len(caffeinate_processes)}",
     )
     return persisted
 
@@ -1307,6 +1471,14 @@ def self_test() -> tuple[int, int, list[str]]:
     total = 0
     passed = 0
 
+    # All classify() invocations below pass runner_processes=["fake-py"]
+    # so the runner_offline branch (Python runner = 0) doesn't fire when
+    # we're testing other diagnostics. Tests for runner_offline /
+    # duplicate_runner / wrapper-only override this explicitly.
+    fake_python_runner = [
+        "/usr/local/bin/python3 -m control_tower.local_runner.runner",
+    ]
+
     # A. stale_runner
     total += 1
     s = _empty_state()
@@ -1315,7 +1487,7 @@ def self_test() -> tuple[int, int, list[str]]:
     s["control_state"] = {"status": "operator_required",
                             "diagnostic_code": "stale_runner",
                             "liveness": {"runner_online": True}}
-    c = classify(s, runner_processes=[])
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
     if c["diagnostic_code"] == "stale_runner":
         passed += 1
     else:
@@ -1330,7 +1502,7 @@ def self_test() -> tuple[int, int, list[str]]:
         "app/api/app/__pycache__\n"
     )
     s["control_state"] = {"status": "failed", "liveness": {"runner_online": True}}
-    c = classify(s, runner_processes=[])
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
     if c["diagnostic_code"] == "git_add_ignored_file":
         passed += 1
     else:
@@ -1344,7 +1516,7 @@ def self_test() -> tuple[int, int, list[str]]:
         "implementation_ticket_status": "missing",
     }
     s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
-    c = classify(s, runner_processes=[])
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
     prompt = build_repair_prompt(s, c)
     has_fallback_requirement = (
         c["diagnostic_code"] == "implementation_ticket_missing"
@@ -1379,7 +1551,7 @@ def self_test() -> tuple[int, int, list[str]]:
         },
         "liveness": {"runner_online": True},
     }
-    c = classify(s, runner_processes=[])
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
     if c["diagnostic_code"] == "publish_required" and not c["is_failure"]:
         passed += 1
     else:
@@ -1388,7 +1560,7 @@ def self_test() -> tuple[int, int, list[str]]:
             f"(is_failure={c['is_failure']})"
         )
 
-    # E. duplicate_runner (2 process lines)
+    # E. duplicate_runner (2 Python runner process lines)
     total += 1
     s = _empty_state()
     s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
@@ -1398,6 +1570,7 @@ def self_test() -> tuple[int, int, list[str]]:
             "user 12345 0.1 0.5 python3 -m control_tower.local_runner.runner",
             "user 12346 0.1 0.5 python3 -m control_tower.local_runner.runner",
         ],
+        caffeinate_processes=[],
     )
     if c["diagnostic_code"] == "duplicate_runner":
         passed += 1
@@ -1413,7 +1586,7 @@ def self_test() -> tuple[int, int, list[str]]:
         "liveness": {"runner_online": True},
     }
     s["factory_state"] = {"status": "weird_state"}
-    c = classify(s, runner_processes=[])
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
     has_raw_evidence = (
         c["diagnostic_code"] == "unknown"
         and any("control_state.status=blocked" in e for e in c["evidence"])
@@ -1427,19 +1600,135 @@ def self_test() -> tuple[int, int, list[str]]:
             f"with evidence={c['evidence']}"
         )
 
-    # Bonus: detect_runner_processes filters self / grep.
+    # G. detect_runner_processes splits Python runners from caffeinate
+    # wrappers and filters self / grep.
     total += 1
     sample = (
-        "user 1 0.1 0.5 python3 -m control_tower.local_runner.runner\n"
-        "user 2 0.1 0.5 grep control_tower.local_runner.runner\n"
-        "user 3 0.1 0.5 python3 -m control_tower.local_runner.factory_observer --once\n"
+        "sungpyo  100   0.1 0.5  100  100  s001 S    01:00 0:01 "
+        "/usr/local/Cellar/python@3.11/3.11.7/Frameworks/Python.framework"
+        "/Versions/3.11/Resources/Python.app/Contents/MacOS/Python "
+        "-m control_tower.local_runner.runner\n"
+        "sungpyo  101   0.0 0.1  100  100  s001 S    01:00 0:00 "
+        "caffeinate -dimsu app/api/.venv/bin/python "
+        "-m control_tower.local_runner.runner\n"
+        "sungpyo  102   0.0 0.1  100  100  s001 S    01:00 0:00 "
+        "grep control_tower.local_runner.runner\n"
+        "sungpyo  103   0.0 0.1  100  100  s001 S    01:00 0:00 "
+        "/usr/bin/python3 -m control_tower.local_runner.factory_observer --once\n"
     )
-    procs = detect_runner_processes(ps_output=sample)
-    if len(procs) == 1 and "factory_observer" not in procs[0] and " grep " not in procs[0]:
+    py_procs, caff_procs = detect_runner_processes(ps_output=sample)
+    if (
+        len(py_procs) == 1
+        and len(caff_procs) == 1
+        and "Python.app/Contents/MacOS/Python" in py_procs[0]
+        and "caffeinate -dimsu" in caff_procs[0]
+        and not any("factory_observer" in p for p in py_procs + caff_procs)
+        and not any(" grep " in p for p in py_procs + caff_procs)
+    ):
         passed += 1
     else:
         failures.append(
-            f"G: detect_runner_processes filter failed — got {procs}"
+            f"G: detect_runner_processes split failed — "
+            f"py={py_procs} caffeinate={caff_procs}"
+        )
+
+    # H. Python runner 1 + caffeinate 1 → NOT duplicate_runner.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
+    c = classify(
+        s,
+        runner_processes=[
+            "user 1 0 0 python3 -m control_tower.local_runner.runner",
+        ],
+        caffeinate_processes=[
+            "user 2 0 0 caffeinate -dimsu python -m control_tower.local_runner.runner",
+        ],
+    )
+    if c["diagnostic_code"] != "duplicate_runner":
+        passed += 1
+    else:
+        failures.append(
+            f"H: Python=1 + caffeinate=1 should NOT be duplicate_runner, got "
+            f"{c['diagnostic_code']}"
+        )
+
+    # I. Python runner 2 + caffeinate 1 → duplicate_runner.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
+    c = classify(
+        s,
+        runner_processes=[
+            "user 1 0 0 python3 -m control_tower.local_runner.runner",
+            "user 2 0 0 python3 -m control_tower.local_runner.runner",
+        ],
+        caffeinate_processes=[
+            "user 3 0 0 caffeinate -dimsu python -m control_tower.local_runner.runner",
+        ],
+    )
+    if c["diagnostic_code"] == "duplicate_runner":
+        passed += 1
+    else:
+        failures.append(
+            f"I: Python=2 + caffeinate=1 should be duplicate_runner, got "
+            f"{c['diagnostic_code']}"
+        )
+
+    # J. Python runner 0 + caffeinate 0 → runner_offline.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=[], caffeinate_processes=[])
+    if c["diagnostic_code"] == "runner_offline":
+        passed += 1
+    else:
+        failures.append(
+            f"J: Python=0 + caffeinate=0 should be runner_offline, got "
+            f"{c['diagnostic_code']}"
+        )
+
+    # K. Python runner 0 + caffeinate 1 → runner_offline (broken_wrapper note).
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"status": "blocked", "liveness": {"runner_online": True}}
+    c = classify(
+        s,
+        runner_processes=[],
+        caffeinate_processes=[
+            "user 1 0 0 caffeinate -dimsu python -m control_tower.local_runner.runner",
+        ],
+    )
+    has_broken_wrapper_note = (
+        c["diagnostic_code"] == "runner_offline"
+        and "broken_wrapper" in (c.get("root_cause") or "")
+    )
+    if has_broken_wrapper_note:
+        passed += 1
+    else:
+        failures.append(
+            f"K: Python=0 + caffeinate=1 should be runner_offline + "
+            f"broken_wrapper note, got {c['diagnostic_code']} / "
+            f"root={(c.get('root_cause') or '')[:80]}"
+        )
+
+    # L. ps line that mentions module but is launched by sh wrapper or
+    # an editor is dropped from both lists (covers vim/sed/etc).
+    total += 1
+    sample = (
+        "user 1 0 0 sh -c 'python -m control_tower.local_runner.runner'\n"
+        "user 2 0 0 vim control_tower/local_runner/runner.py\n"
+    )
+    py_procs, caff_procs = detect_runner_processes(ps_output=sample)
+    # vim line doesn't include "-m control_tower.local_runner.runner" so
+    # it never enters the loop; sh wrapper IS matched by module token but
+    # excluded as a non-caffeinate wrapper.
+    if py_procs == [] and caff_procs == []:
+        passed += 1
+    else:
+        failures.append(
+            f"L: shell wrapper / editor lines should be dropped — "
+            f"py={py_procs} caff={caff_procs}"
         )
 
     return passed, total, failures
