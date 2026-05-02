@@ -215,7 +215,11 @@ class SmokeRun:
     pm_hold_spec_keywords: list[str] = field(default_factory=list)
     design_spec_status: str | None = None
     design_spec_acceptance_passed: bool | None = None
+    design_spec_acceptance_errors: list[str] = field(default_factory=list)
+    design_spec_title_label_count: int | None = None
     design_spec_target_files_count: int = 0
+    design_spec_svg_path_valid: bool | None = None
+    stale_artifacts_moved: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -255,6 +259,19 @@ PREFLIGHT_RUNTIME_FILES: tuple[str, ...] = (
     "auto_publish_request.json",
     "operator_request.md",
     "operator_request.json",
+)
+
+# Per-cycle code-output artifacts. Moved aside on every local-cycle /
+# bridge preflight so a SHIP cycle's leftover ticket / proposal / diff /
+# QA report can never be mistaken for the current cycle's output. These
+# are renamed to `*.prev` so forensic inspection is still possible.
+# Kept separate from PREFLIGHT_RUNTIME_FILES so the report can list
+# stale code-output files distinctly from stale smoke/observer state.
+PREFLIGHT_STALE_OUTPUT_FILES: tuple[str, ...] = (
+    "implementation_ticket.md",
+    "claude_proposal.md",
+    "claude_apply.diff",
+    "qa_report.md",
 )
 
 
@@ -298,6 +315,7 @@ def preflight(mode: str, *, dry_run: bool = False) -> dict:
         "runner_processes": [],
         "caffeinate_processes": [],
         "backed_up": [],
+        "stale_artifacts_moved": [],
         "git_dirty": False,
         "git_status_text": "",
         "warnings": [],
@@ -332,6 +350,15 @@ def preflight(mode: str, *, dry_run: bool = False) -> dict:
             target = runtime / name
             if _backup_one(target):
                 out["backed_up"].append(str(target))
+        # Per-cycle code-output artifacts — surface separately so the
+        # report can show "we deliberately moved aside last cycle's
+        # ticket". This is the gate that prevents the cat
+        # .runtime/implementation_ticket.md → "last week's Local Visa
+        # ticket" surprise the operator hit on cycle 1.
+        for name in PREFLIGHT_STALE_OUTPUT_FILES:
+            target = runtime / name
+            if _backup_one(target):
+                out["stale_artifacts_moved"].append(str(target))
 
     # 4. Default-safe env. Smoke runs with auto-publish DISABLED unless
     # the operator explicitly enables it. We only set defaults — never
@@ -634,6 +661,7 @@ def run_local_cycle(timeout_sec: int) -> SmokeRun:
     _smoke_log(f"local-cycle smoke started — timeout={timeout_sec}s")
 
     pre = preflight("local-cycle")
+    run.stale_artifacts_moved = list(pre.get("stale_artifacts_moved") or [])
     if not pre["ok"]:
         run.verdict = "FAIL"
         run.failure_code = "preflight_failed"
@@ -692,6 +720,7 @@ def run_bridge(timeout_sec: int) -> SmokeRun:
     run = SmokeRun(mode="bridge", timeout_sec=timeout_sec)
     run.started_at = _utc_now_iso()
     pre = preflight("bridge")
+    run.stale_artifacts_moved = list(pre.get("stale_artifacts_moved") or [])
 
     runtime = _runtime_dir()
     pause_marker = runtime / "factory.paused"
@@ -788,6 +817,30 @@ def _finalize_run(
     target_files = factory_state.get("design_spec_target_files") or []
     if isinstance(target_files, list):
         run.design_spec_target_files_count = len(target_files)
+    errors = (
+        factory_state.get("design_spec_acceptance_errors")
+        or factory_state.get("design_spec_acceptance_failures")
+        or []
+    )
+    if isinstance(errors, list):
+        run.design_spec_acceptance_errors = [str(e) for e in errors]
+    title_count = (
+        factory_state.get("design_spec_title_label_count")
+        if factory_state.get("design_spec_title_label_count") is not None
+        else factory_state.get("design_spec_titlelabel_count")
+    )
+    if title_count is not None:
+        try:
+            run.design_spec_title_label_count = int(title_count)
+        except (TypeError, ValueError):
+            run.design_spec_title_label_count = None
+    svg_valid = factory_state.get("design_spec_svg_path_valid")
+    if svg_valid is None:
+        svg_paths = factory_state.get("design_spec_svg_paths") or []
+        if isinstance(svg_paths, list):
+            svg_valid = len(svg_paths) >= 3
+    if svg_valid is not None:
+        run.design_spec_svg_path_valid = bool(svg_valid)
 
     # last successful stage / failed stage
     for obs in run.stages:
@@ -860,7 +913,11 @@ def _serialize_run(run: SmokeRun) -> dict:
         "pm_hold_spec_keywords": list(run.pm_hold_spec_keywords),
         "design_spec_status": run.design_spec_status,
         "design_spec_acceptance_passed": run.design_spec_acceptance_passed,
+        "design_spec_acceptance_errors": list(run.design_spec_acceptance_errors),
+        "design_spec_title_label_count": run.design_spec_title_label_count,
         "design_spec_target_files_count": run.design_spec_target_files_count,
+        "design_spec_svg_path_valid": run.design_spec_svg_path_valid,
+        "stale_artifacts_moved": list(run.stale_artifacts_moved),
         "stages": [_serialize_stage(s) for s in run.stages],
         "notes": list(run.notes),
     }
@@ -910,6 +967,12 @@ def _build_report(
         f"- cycle subprocess exit: `{run.cycle_subprocess_exit}`",
         f"- 자동 배포: `LOCAL_RUNNER_ALLOW_PUBLISH={os.environ.get('LOCAL_RUNNER_ALLOW_PUBLISH', '(unset)')}` "
         f"— commit/push 실행 여부: `{run.publish_executed}`",
+    ]
+
+    lines.extend(_build_design_spec_section(run))
+    lines.extend(_build_stale_artifact_section(run))
+
+    lines += [
         "",
         "## Stage table",
     ]
@@ -970,6 +1033,156 @@ def _build_report(
         lines += ["", "## Notes"]
         lines.extend(f"- {n}" for n in run.notes)
     return "\n".join(lines) + "\n"
+
+
+def _build_design_spec_section(run: SmokeRun) -> list[str]:
+    """Render a Design Spec block in the smoke report so the operator
+    can tell at a glance whether the validator parsed the spec or whether
+    the cycle is HOLDing on real spec gaps. Skipped when the cycle never
+    ran the design_spec stage (status absent or skipped)."""
+    status = run.design_spec_status
+    if not status:
+        return []
+    if status == "skipped":
+        # design_spec is conditional — don't pollute the report when it
+        # was never required.
+        return []
+    out = ["", "## Design spec acceptance"]
+    out.append(f"- design_spec_status: `{status}`")
+    out.append(
+        f"- design_spec_acceptance_passed: "
+        f"`{run.design_spec_acceptance_passed}`"
+    )
+    out.append(
+        f"- design_spec_title_label_count: "
+        f"`{run.design_spec_title_label_count if run.design_spec_title_label_count is not None else '—'}`"
+    )
+    out.append(
+        f"- design_spec_target_files_count: "
+        f"`{run.design_spec_target_files_count}`"
+    )
+    out.append(
+        f"- design_spec_svg_path_valid: "
+        f"`{run.design_spec_svg_path_valid}`"
+    )
+    if run.design_spec_acceptance_errors:
+        out.append("")
+        out.append("### design_spec_acceptance_errors")
+        for e in run.design_spec_acceptance_errors[:8]:
+            out.append(f"- {e}")
+    # HOLD progress diagnosis — whenever the cycle ended HOLD on a
+    # design_spec, surface whether it's a parser bug vs a real spec gap.
+    if run.verdict == "HOLD" and status == "insufficient":
+        diagnosis = _diagnose_design_spec_hold(run)
+        out.append("")
+        out.append("### HOLD progress 진단")
+        out.extend(f"- {d}" for d in diagnosis)
+    return out
+
+
+def _diagnose_design_spec_hold(run: SmokeRun) -> list[str]:
+    """Decide whether a design_spec HOLD is a parser/contract bug or a
+    real spec deficiency, and explain the call to the operator."""
+    out: list[str] = ["design_spec 생성됨 (`.runtime/design_spec.md`)"]
+    errors = run.design_spec_acceptance_errors or []
+    title_count = run.design_spec_title_label_count
+    target_count = run.design_spec_target_files_count
+    svg_ok = run.design_spec_svg_path_valid
+    # Mismatch heuristic: error mentions titleLabel < 13 but the actual
+    # counter we read from factory_state shows ≥ 13 → parser bug.
+    parser_bug_signals: list[str] = []
+    for e in errors:
+        if "titleLabel" in e and title_count is not None and title_count >= 13:
+            parser_bug_signals.append(
+                "validator 가 titleLabel 부족이라고 보고했지만 "
+                f"design_spec_title_label_count={title_count} 이라 정합성 깨짐"
+            )
+        if "수정 대상 파일" in e and target_count >= 3:
+            parser_bug_signals.append(
+                "validator 가 수정 대상 파일 부족이라고 보고했지만 "
+                f"design_spec_target_files_count={target_count}"
+            )
+        if "SVG" in e and svg_ok:
+            parser_bug_signals.append(
+                "validator 가 SVG path 미달이라고 보고했지만 "
+                "design_spec_svg_path_valid=true"
+            )
+    if parser_bug_signals:
+        out.append(
+            "분류: **parser/contract bug** — 실제 spec 에는 항목이 충분하나 "
+            "validator 가 인식하지 못함."
+        )
+        out.extend(parser_bug_signals)
+        out.append(
+            "조치: cycle._validate_design_spec / "
+            "_extract_design_spec_titlelabel_count 등 parser 를 먼저 수정하고 "
+            "smoke 를 다시 돌리세요."
+        )
+    elif errors:
+        out.append(
+            "분류: **실제 spec 부족** — design_spec 본문에 보강이 필요한 "
+            "항목이 있습니다."
+        )
+        for e in errors[:5]:
+            out.append(f"실패 항목: {e}")
+        out.append(
+            "조치: 다음 사이클의 designer 에게 `.runtime/claude_rework_prompt.md` "
+            "를 통해 누락 항목을 명시하세요."
+        )
+    else:
+        out.append(
+            "분류: **미상** — acceptance error 메시지가 비어 있어 분류할 "
+            "수 없습니다."
+        )
+    return out
+
+
+def _build_stale_artifact_section(run: SmokeRun) -> list[str]:
+    """Render which per-cycle code-output artifacts the smoke runner
+    moved aside on preflight, plus any leftover implementation_ticket.md
+    that still belongs to a prior cycle."""
+    moved = list(run.stale_artifacts_moved or [])
+    leftover = _detect_leftover_implementation_ticket(run.cycle_id)
+    if not moved and not leftover:
+        return []
+    out = ["", "## Stale artifacts"]
+    if moved:
+        out.append("### preflight 이동 (`*.prev` 백업)")
+        out.extend(f"- {p}" for p in moved)
+    if leftover:
+        out.append("")
+        out.append("### 현재 cycle 산출물이 아닌 잔존 파일")
+        out.extend(f"- {leftover}")
+    return out
+
+
+def _detect_leftover_implementation_ticket(
+    current_cycle: int | None,
+) -> str | None:
+    """Return a human-readable warning string when
+    .runtime/implementation_ticket.md exists but its cycle_id header
+    does not match the smoke run's current_cycle. None otherwise."""
+    path = _runtime_dir() / "implementation_ticket.md"
+    if not path.is_file():
+        return None
+    try:
+        head = path.read_text(encoding="utf-8")[:600]
+    except OSError:
+        return None
+    import re as _re
+    m = _re.search(r"cycle_id:\s*(\d+)", head)
+    if not m:
+        return f"`{path}` (cycle_id 헤더 없음 — stale 의심)"
+    file_cycle = int(m.group(1))
+    if current_cycle is None:
+        return None
+    if file_cycle < int(current_cycle):
+        return (
+            f"`{path}` cycle_id={file_cycle} (현재 cycle={current_cycle}) — "
+            "이전 사이클 티켓이 그대로 남아 있습니다. 운영자가 이를 현재 "
+            "산출물로 오해하지 않도록 stale 처리하세요."
+        )
+    return None
 
 
 def _recommend_next(run: SmokeRun) -> list[str]:
@@ -2675,6 +2888,290 @@ def self_test() -> tuple[int, int, list[str]]:
     else:
         failures.append("20G: skipped — cycle import failed earlier")
 
+    # 21. titleLabel parser — markdown table form with 13 rows must
+    #     count 13 (the actual prod-cycle-1 design_spec format).
+    total += 1
+    if _cycle is not None:
+        body_table = _DESIGN_SPEC_FIXTURE_TABLE_13
+        count_table = _cycle._extract_design_spec_titlelabel_count(body_table)
+        fails_table = _cycle._validate_design_spec(body_table)
+        if (
+            count_table == 13
+            and not any("titleLabel" in f and "필요" in f for f in fails_table)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"21: markdown-table titleLabel — count={count_table} "
+                f"fails={fails_table[:3]}"
+            )
+    else:
+        failures.append("21: skipped — cycle import failed earlier")
+
+    # 22. titleLabel parser — markdown table with backtick-wrapped IDs.
+    #     The prod-cycle-1 spec uses `cafe_starter` cells; parser must
+    #     accept that form too.
+    total += 1
+    if _cycle is not None:
+        count_bt = _cycle._extract_design_spec_titlelabel_count(
+            _DESIGN_SPEC_FIXTURE_TABLE_BACKTICK
+        )
+        if count_bt == 13:
+            passed += 1
+        else:
+            failures.append(
+                f"22: backtick-wrapped table titleLabel — count={count_bt}"
+            )
+    else:
+        failures.append("22: skipped — cycle import failed earlier")
+
+    # 23. titleLabel parser — markdown table with only 12 rows must be
+    #     rejected by _validate_design_spec.
+    total += 1
+    if _cycle is not None:
+        body_12 = _DESIGN_SPEC_FIXTURE_TABLE_13.replace(
+            "| traveler_starter | 동네 탐험가 | 1 | 0 |\n", "", 1
+        )
+        count_12 = _cycle._extract_design_spec_titlelabel_count(body_12)
+        fails_12 = _cycle._validate_design_spec(body_12)
+        if (
+            count_12 == 12
+            and any("titleLabel 13" in f for f in fails_12)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"23: table-12 should fail — count={count_12} fails={fails_12[:3]}"
+            )
+    else:
+        failures.append("23: skipped — cycle import failed earlier")
+
+    # 24. titleLabel parser — header-only table (no data rows) → count 0.
+    total += 1
+    if _cycle is not None:
+        body_empty = _DESIGN_SPEC_FIXTURE_TABLE_HEADER_ONLY
+        count_empty = _cycle._extract_design_spec_titlelabel_count(body_empty)
+        fails_empty = _cycle._validate_design_spec(body_empty)
+        if (
+            count_empty == 0
+            and any("titleLabel 13" in f for f in fails_empty)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"24: empty-table — count={count_empty} fails={fails_empty[:3]}"
+            )
+    else:
+        failures.append("24: skipped — cycle import failed earlier")
+
+    # 25. SVG path parser — the actual prod-cycle-1 Tier2 / Tier3 paths
+    #     (with concave shield + crown spikes) must parse as 3 numeric
+    #     tiers; a body whose Tier 2 block has only `M ... Z` and no
+    #     other coordinates must drop to 2 tiers.
+    total += 1
+    if _cycle is not None:
+        tiers_prod = _cycle._extract_design_spec_svg_paths(
+            _DESIGN_SPEC_FIXTURE_TABLE_13
+        )
+        placeholder_body = (
+            "# Stampport Design Implementation Spec\n\n"
+            "## SVG Path 명세\n\n"
+            "### Tier 1 원형\n"
+            "- <circle cx=\"40\" cy=\"40\" r=\"28\" />\n\n"
+            "### Tier 2 방패\n"
+            "- path: M ... Z\n\n"
+            "### Tier 3 왕관\n"
+            "- path: M8,64 L72,64 L72,46 L60,46 L60,20 L50,38 L40,10 "
+            "L30,38 L20,20 L20,46 L8,46 Z\n"
+        )
+        tiers_bad = _cycle._extract_design_spec_svg_paths(placeholder_body)
+        if (
+            len(tiers_prod) == 3
+            and len(tiers_bad) == 2
+            and not any("Tier 2" in t for t in tiers_bad)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"25: prod SVG paths — good={tiers_prod} bad={tiers_bad}"
+            )
+    else:
+        failures.append("25: skipped — cycle import failed earlier")
+
+    # 26. Stale implementation_ticket cleanup — when HOLD/skipped_hold,
+    #     a previous SHIP cycle's ticket must be moved to *.prev (not
+    #     left as the "current" output).
+    total += 1
+    if _cycle is not None:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                stale_ticket = runtime / "implementation_ticket.md"
+                stale_ticket.write_text(
+                    "<!-- cycle_id: 7 -->\n# Stampport 구현 티켓 (Local Visa)\n",
+                    encoding="utf-8",
+                )
+                # cycle.py reads/writes IMPLEMENTATION_TICKET_FILE from a
+                # path captured at import time — patch it for the test.
+                saved = _cycle.IMPLEMENTATION_TICKET_FILE
+                _cycle.IMPLEMENTATION_TICKET_FILE = stale_ticket
+                try:
+                    moved = _cycle._move_stale_artifact_aside(stale_ticket)
+                finally:
+                    _cycle.IMPLEMENTATION_TICKET_FILE = saved
+                prev_path = stale_ticket.with_suffix(
+                    stale_ticket.suffix + ".prev"
+                )
+                if (
+                    moved
+                    and not stale_ticket.exists()
+                    and prev_path.is_file()
+                    and "Local Visa" in prev_path.read_text(encoding="utf-8")
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"26: stale ticket cleanup — moved={moved} "
+                        f"stale_exists={stale_ticket.exists()} "
+                        f"prev_exists={prev_path.is_file()}"
+                    )
+            finally:
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+    else:
+        failures.append("26: skipped — cycle import failed earlier")
+
+    # 27. Stale ticket from older cycle — current report's
+    #     _detect_leftover_implementation_ticket flags it as stale.
+    total += 1
+    repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            (runtime / "implementation_ticket.md").write_text(
+                "<!--\nstampport_artifact\ncycle_id: 3\n-->\n# old\n",
+                encoding="utf-8",
+            )
+            warning = _detect_leftover_implementation_ticket(current_cycle=7)
+            if warning and "cycle_id=3" in warning and "현재 cycle=7" in warning:
+                passed += 1
+            else:
+                failures.append(
+                    f"27: leftover detection — got {warning!r}"
+                )
+        finally:
+            if repo_prev is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 28. PM spec_bypass — design_spec_acceptance_passed=true with low
+    #     desire score still ships when the PM body says ship; the same
+    #     setup with acceptance_passed=false must NOT ship.
+    total += 1
+    if _cycle is not None:
+        ship_g, bypass_g = _cycle._decide_pm_ship(
+            decision_section="ship",
+            score_gate_ok=False,
+            design_spec_status="generated",
+            design_spec_acceptance_passed=True,
+        )
+        ship_h, bypass_h = _cycle._decide_pm_ship(
+            decision_section="ship",
+            score_gate_ok=False,
+            design_spec_status="insufficient",
+            design_spec_acceptance_passed=False,
+        )
+        if (
+            ship_g is True and bypass_g is True
+            and ship_h is False and bypass_h is False
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"28: PM spec_bypass — ship_g={ship_g}/{bypass_g} "
+                f"ship_h={ship_h}/{bypass_h}"
+            )
+    else:
+        failures.append("28: skipped — cycle import failed earlier")
+
+    # 29. Smoke report renders Design spec / Stale artifact / HOLD
+    #     progress sections when factory_state has spec-mode signals,
+    #     and includes the new field names in the report body.
+    total += 1
+    repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            run = SmokeRun(mode="local-cycle", timeout_sec=1800)
+            run.started_at = _utc_now_iso()
+            run.finished_at = _utc_now_iso()
+            run.verdict = "HOLD"
+            run.factory_status = "hold_for_rework"
+            run.cycle_id = 1
+            run.ticket_status = "skipped_hold"
+            run.design_spec_status = "insufficient"
+            run.design_spec_acceptance_passed = False
+            run.design_spec_acceptance_errors = [
+                "titleLabel 13개 이상 필요 — 현재 0개",
+            ]
+            run.design_spec_title_label_count = 13
+            run.design_spec_target_files_count = 5
+            run.design_spec_svg_path_valid = True
+            run.stale_artifacts_moved = [
+                str(runtime / "implementation_ticket.md.prev")
+            ]
+            fs = {
+                "status": "hold_for_rework", "cycle": 1,
+                "pm_decision_status": "generated",
+                "pm_decision_ship_ready": False,
+                "implementation_ticket_status": "skipped_hold",
+                "design_spec_status": "insufficient",
+                "design_spec_acceptance_passed": False,
+                "design_spec_title_label_count": 13,
+                "design_spec_target_files": ["a", "b", "c", "d"],
+                "design_spec_svg_path_valid": True,
+                "design_spec_acceptance_errors": [
+                    "titleLabel 13개 이상 필요 — 현재 0개",
+                ],
+            }
+            write_outputs(run, factory_state=fs, observer_classification=None)
+            report = (runtime / "factory_smoke_report.md").read_text(
+                encoding="utf-8"
+            )
+            ok = (
+                "Design spec acceptance" in report
+                and "design_spec_status" in report
+                and "design_spec_acceptance_passed" in report
+                and "design_spec_title_label_count" in report
+                and "design_spec_target_files_count" in report
+                and "design_spec_svg_path_valid" in report
+                and "design_spec_acceptance_errors" in report
+                and "Stale artifacts" in report
+                and "parser/contract bug" in report
+            )
+            if ok:
+                passed += 1
+            else:
+                failures.append(
+                    "29: smoke report missing Design spec / Stale artifacts / "
+                    "HOLD progress 진단 sections"
+                )
+        finally:
+            if repo_prev is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
     return passed, total, failures
 
 
@@ -3001,6 +3498,142 @@ _DESIGN_SPEC_FIXTURE_GOOD = """\
 - share-note 100자 이상에서 share-canvas 가 560px 를 넘지 않는다
 - relatedBadge null 시 보조 텍스트 미렌더
 - Lv1 사용자가 tier-2 badge 선택 시 잠금 슬롯 스타일이 렌더된다
+"""
+
+
+# Markdown-table form of the titleLabel section. Mirrors the actual
+# spec the cycle-1 designer produced — that body parsed as 0 titleLabels
+# under the bullet-only validator. Tier 2 / Tier 3 paths are the exact
+# coordinates we need the SVG validator to accept too.
+_DESIGN_SPEC_FIXTURE_TABLE_13 = """\
+# Stampport Design Implementation Spec
+
+## 구현 대상 기능
+- 기능명: TitleSeal + tier-2 방패 / tier-3 왕관 SVG 확정
+- 관련 PM HOLD 사유: tier-2 방패 / tier-3 왕관 좌표 미확정 + titleLabel 13개 합의 미완료.
+
+## SVG Path 명세
+
+### Tier 1 원형
+- viewBox: 0 0 80 80
+- 정의:
+  ```svg
+  <circle cx="40" cy="40" r="28" stroke="#1f3d2b" fill="none" stroke-width="3" />
+  ```
+
+### Tier 2 방패 (내향 측면 곡선 — 핵심 확정값)
+- viewBox: 0 0 80 80
+- path:
+  ```
+  M14,8 L66,8 Q74,8 74,16 Q70,34 72,52 C66,64 54,72 40,76 C26,72 14,64 8,52 Q10,34 6,16 Q6,8 14,8 Z
+  ```
+
+### Tier 3 왕관
+- viewBox: 0 0 80 80
+- path:
+  ```
+  M8,64 L72,64 L72,46 L60,46 L60,20 L50,38 L40,10 L30,38 L20,20 L20,46 L8,46 Z
+  ```
+
+## titleLabel 최종 목록
+
+| badge id | titleLabel | level | lockedUntilLevel |
+|---|---|---|---|
+| cafe_starter | 카페 입문자 | 1 | 0 |
+| bakery_pilgrim | 빵지 순례자 | 1 | 0 |
+| restaurant_explorer | 맛집 탐험가 | 2 | 1 |
+| dessert_explorer | 디저트 탐험가 | 2 | 1 |
+| seongsu_cafe_visa | 성수 카페 영사 | 2 | 1 |
+| mangwon_dessert_visa | 망원 디저트 영사 | 2 | 1 |
+| yeonnam_visa | 연남 단골 영사 | 2 | 1 |
+| gwanak_explorer | 관악 로컬 영사 | 2 | 1 |
+| salt_bread_collector | 소금빵 수집가 | 2 | 1 |
+| solo_starter | 혼밥 미식 대사 | 3 | 2 |
+| weekend_explorer | 주말 탐험 대사 | 3 | 2 |
+| verified_collector | 여권 비자 대사 | 3 | 2 |
+| traveler_starter | 동네 탐험가 | 1 | 0 |
+
+## badges.js 스키마 변경
+- level / lockedUntilLevel 두 필드 추가
+- titleLabel 위 표 그대로 매핑
+
+## ShareCard 레이아웃 명세
+- share-title-seal 블록 — share-note 아래 독립 블록
+- relatedBadge null 이면 보조 텍스트 미렌더
+- share-canvas max-height 560
+
+## 수정 대상 파일
+- `app/web/src/data/badges.js`
+- `app/web/src/screens/Badges.jsx`
+- `app/web/src/screens/Share.jsx`
+- `app/web/src/components/TitleSeal.jsx`
+
+## QA 기준
+- iOS Safari 390px / 560px 가시성
+- relatedBadge null 시 보조 텍스트 미렌더
+- tier-2 / tier-3 SVG 가 카드 위계로 보인다
+"""
+
+
+# Same as the table fixture but with backtick-wrapped IDs in the first
+# column (the form the production design_spec actually used).
+_DESIGN_SPEC_FIXTURE_TABLE_BACKTICK = (
+    _DESIGN_SPEC_FIXTURE_TABLE_13
+    .replace("| cafe_starter |", "| `cafe_starter` |")
+    .replace("| bakery_pilgrim |", "| `bakery_pilgrim` |")
+    .replace("| restaurant_explorer |", "| `restaurant_explorer` |")
+    .replace("| dessert_explorer |", "| `dessert_explorer` |")
+    .replace("| seongsu_cafe_visa |", "| `seongsu_cafe_visa` |")
+    .replace("| mangwon_dessert_visa |", "| `mangwon_dessert_visa` |")
+    .replace("| yeonnam_visa |", "| `yeonnam_visa` |")
+    .replace("| gwanak_explorer |", "| `gwanak_explorer` |")
+    .replace("| salt_bread_collector |", "| `salt_bread_collector` |")
+    .replace("| solo_starter |", "| `solo_starter` |")
+    .replace("| weekend_explorer |", "| `weekend_explorer` |")
+    .replace("| verified_collector |", "| `verified_collector` |")
+    .replace("| traveler_starter |", "| `traveler_starter` |")
+)
+
+
+# A spec where the titleLabel section has only the table header — no
+# data rows. Validator must reject this with the count-13 message.
+_DESIGN_SPEC_FIXTURE_TABLE_HEADER_ONLY = """\
+# Stampport Design Implementation Spec
+
+## 구현 대상 기능
+- 기능명: TitleSeal
+- 관련 PM HOLD 사유: titleLabel 합의 미완료.
+
+## SVG Path 명세
+
+### Tier 1 원형
+- <circle cx="40" cy="40" r="28" />
+
+### Tier 2 방패
+- path: M10,8 L70,8 L70,48 C70,62 56,72 40,76 C24,72 10,62 10,48 Z
+
+### Tier 3 왕관
+- path: M12,58 L18,24 L32,42 L40,16 L48,42 L62,24 L68,58 Z
+
+## titleLabel 최종 목록
+
+| badge id | titleLabel | level | lockedUntilLevel |
+|---|---|---|---|
+
+## badges.js 스키마 변경
+- level / lockedUntilLevel 추가
+
+## ShareCard 레이아웃 명세
+- share-title-seal — relatedBadge null 시 미렌더 — share-canvas 560px
+
+## 수정 대상 파일
+- `app/web/src/data/badges.js`
+- `app/web/src/screens/Badges.jsx`
+- `app/web/src/screens/Share.jsx`
+
+## QA 기준
+- 390px 가시성 확인
+- relatedBadge null 케이스 미렌더 확인
 """
 
 

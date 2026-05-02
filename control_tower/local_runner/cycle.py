@@ -672,10 +672,14 @@ class CycleState:
             "design_spec_message": self.design_spec_message,
             "design_spec_skipped_reason": self.design_spec_skipped_reason,
             "design_spec_target_files": list(self.design_spec_target_files),
+            "design_spec_target_files_count": len(self.design_spec_target_files),
             "design_spec_titlelabel_count": self.design_spec_titlelabel_count,
+            "design_spec_title_label_count": self.design_spec_titlelabel_count,
             "design_spec_svg_paths": list(self.design_spec_svg_paths),
+            "design_spec_svg_path_valid": len(self.design_spec_svg_paths) >= 3,
             "design_spec_acceptance_passed": self.design_spec_acceptance_passed,
             "design_spec_acceptance_failures": list(self.design_spec_acceptance_failures),
+            "design_spec_acceptance_errors": list(self.design_spec_acceptance_failures),
             "desire_scorecard": dict(self.desire_scorecard),
             "desire_scorecard_total": self.desire_scorecard_total,
             "desire_scorecard_path": self.desire_scorecard_path,
@@ -857,6 +861,26 @@ def safe_write_artifact(
     )
     payload = header + (body if body.endswith("\n") else body + "\n")
     return safe_write_text(path, payload)
+
+
+def _move_stale_artifact_aside(path: Path) -> str | None:
+    """Rename `path` → `path.prev` so the operator can still inspect the
+    previous version, but the live filename no longer reads as the
+    current cycle's output.
+
+    Returns the new path string when something moved, or None when the
+    file was absent / move failed.
+    """
+    if not path.exists():
+        return None
+    backup = path.with_suffix(path.suffix + ".prev")
+    try:
+        if backup.exists():
+            backup.unlink()
+        path.rename(backup)
+        return str(backup)
+    except OSError:
+        return None
 
 
 def _write_state(state: CycleState) -> None:
@@ -3756,6 +3780,13 @@ _TARGET_FILE_LINE = re.compile(
     r"`?\s*((?:app|control_tower|scripts)/[\w./-]+\.[\w]+)\s*`?"
 )
 _TITLELABEL_LINE = re.compile(r"^\s*-\s+([A-Za-z][\w]+)\s*[:：]\s+\S")
+# Table separator row, e.g. "|---|---|---|" or "| --- | :---: | ---: |".
+# Cells contain only dashes / colons / spaces.
+_TITLELABEL_TABLE_SEPARATOR = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+# A bare badge id token, optionally backtick-wrapped: cafe_starter / `cafe_starter`.
+_TITLELABEL_TABLE_ID_CELL = re.compile(r"^`?([A-Za-z][\w]+)`?$")
 
 
 def _extract_design_spec_target_files(body: str) -> list[str]:
@@ -3773,22 +3804,110 @@ def _extract_design_spec_target_files(body: str) -> list[str]:
     return found
 
 
+def _split_md_table_row(line: str) -> list[str]:
+    """Split a single Markdown table row into cell strings.
+
+    Tolerates leading/trailing pipes and trims surrounding whitespace.
+    Empty edge cells (from leading/trailing `|`) are dropped.
+    """
+    s = line.strip()
+    if not s.startswith("|") and "|" not in s:
+        return []
+    cells = [c.strip() for c in s.split("|")]
+    if cells and cells[0] == "":
+        cells = cells[1:]
+    if cells and cells[-1] == "":
+        cells = cells[:-1]
+    return cells
+
+
+def _detect_titlelabel_table(lines: list[str]) -> tuple[int, int, int] | None:
+    """Find (separator_idx, id_col_idx, label_col_idx) for a titleLabel
+    table inside a list of section lines, or None.
+
+    A table is recognized when there is a header row containing a cell
+    matching `badge id` / `id` AND a cell matching `titleLabel` / `title
+    label`, immediately followed by a separator row.
+    """
+    n = len(lines)
+    for i, raw in enumerate(lines):
+        cells = _split_md_table_row(raw)
+        if len(cells) < 2:
+            continue
+        # Locate the column indexes by header text.
+        id_col = -1
+        label_col = -1
+        for idx, cell in enumerate(cells):
+            norm = cell.strip().lower().replace("_", " ").strip("`")
+            if norm in ("badge id", "id", "badge"):
+                id_col = idx
+            elif norm in ("titlelabel", "title label"):
+                label_col = idx
+            elif "titlelabel" in norm.replace(" ", ""):
+                # e.g. "titleLabel (확정)" — accept any header that starts
+                # with titleLabel as the label column.
+                if label_col < 0:
+                    label_col = idx
+        if id_col < 0 or label_col < 0:
+            continue
+        # Next non-empty line must be a separator row.
+        j = i + 1
+        while j < n and not lines[j].strip():
+            j += 1
+        if j >= n or not _TITLELABEL_TABLE_SEPARATOR.match(lines[j]):
+            continue
+        return (j, id_col, label_col)
+    return None
+
+
 def _extract_design_spec_titlelabel_count(body: str) -> int:
+    """Count the unique badge ids that appear with a non-empty
+    titleLabel under '## titleLabel 최종 목록'.
+
+    Accepts both bullet form (`- cafe_starter: 카페 입문자`) and a
+    Markdown table whose header has `badge id` (or `id`) + `titleLabel`
+    columns. Backtick-wrapped ids are accepted in table cells.
+    """
     section = _extract_md_section(body, "titleLabel 최종 목록")
     if not section:
         return 0
-    count = 0
     seen: set[str] = set()
+
+    # Bullet form (existing behavior).
     for line in section.splitlines():
         m = _TITLELABEL_LINE.match(line)
         if not m:
             continue
-        key = m.group(1)
-        if key in seen:
-            continue
-        seen.add(key)
-        count += 1
-    return count
+        seen.add(m.group(1))
+
+    # Markdown-table form. We walk only lines after the separator row.
+    lines = section.splitlines()
+    detected = _detect_titlelabel_table(lines)
+    if detected is not None:
+        sep_idx, id_col, label_col = detected
+        for raw in lines[sep_idx + 1:]:
+            row = raw.strip()
+            if not row:
+                # Blank line ends the table.
+                break
+            cells = _split_md_table_row(row)
+            if not cells:
+                break
+            # A line that looks like a section break — abort.
+            if row.startswith("#") or row.startswith(">"):
+                continue
+            if len(cells) <= max(id_col, label_col):
+                continue
+            id_cell = cells[id_col].strip()
+            label_cell = cells[label_col].strip()
+            if not id_cell or not label_cell:
+                continue
+            m = _TITLELABEL_TABLE_ID_CELL.match(id_cell)
+            if not m:
+                continue
+            seen.add(m.group(1))
+
+    return len(seen)
 
 
 def _extract_design_spec_svg_paths(body: str) -> list[str]:
@@ -4092,6 +4211,34 @@ def _build_pm_decision_prompt(
     )
 
 
+def _decide_pm_ship(
+    *,
+    decision_section: str,
+    score_gate_ok: bool,
+    design_spec_status: str | None,
+    design_spec_acceptance_passed: bool,
+) -> tuple[bool, bool]:
+    """Decide whether the PM verdict should ship, and whether design_spec
+    acceptance is the reason it's allowed to.
+
+    Returns (pm_ship, spec_bypass).
+
+    spec_bypass is True only when the cycle wrote a design_spec.md whose
+    acceptance gate passed — that's the bypass path that lets PM ship
+    even when desire scores didn't recover yet (avoids the abstract
+    rework-loop trap documented in docs/factory-smoke.md).
+    """
+    decision = (decision_section or "").lower()
+    ship_word = "ship" in decision
+    hold_word = "hold" in decision
+    spec_bypass = (
+        design_spec_status == "generated"
+        and bool(design_spec_acceptance_passed)
+    )
+    pm_ship = ship_word and not hold_word and (score_gate_ok or spec_bypass)
+    return pm_ship, spec_bypass
+
+
 def stage_pm_decision(state: CycleState) -> StageResult:
     label = next(lab for n, lab, _ in STAGES if n == "pm_decision")
     sr = StageResult(name="pm_decision", label=label, status="running")
@@ -4144,21 +4291,13 @@ def stage_pm_decision(state: CycleState) -> StageResult:
         PM_DECISION_FILE, body,
         cycle_id=state.cycle, stage="pm_decision", source_agent="pm",
     )
-    decision_section = _extract_md_section(body, "출하 결정").lower()
-    ship_word = "ship" in decision_section
-    hold_word = "hold" in decision_section
+    decision_section = _extract_md_section(body, "출하 결정")
     score_gate_ok = state.desire_scorecard_ship_ready
-    # design_spec bypass: when acceptance passes, PM is allowed to ship
-    # even if scores didn't recover yet — directly avoids the abstract
-    # rework-loop trap we documented in docs/factory-smoke.md.
-    spec_bypass = (
-        state.design_spec_status == "generated"
-        and state.design_spec_acceptance_passed
-    )
-    pm_ship = (
-        ship_word
-        and not hold_word
-        and (score_gate_ok or spec_bypass)
+    pm_ship, spec_bypass = _decide_pm_ship(
+        decision_section=decision_section,
+        score_gate_ok=score_gate_ok,
+        design_spec_status=state.design_spec_status,
+        design_spec_acceptance_passed=state.design_spec_acceptance_passed,
     )
 
     state.pm_decision_status = "generated"
@@ -4690,6 +4829,18 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         state.implementation_ticket_target_files = []
         state.implementation_ticket_target_screens = []
         state.implementation_ticket_message = sr.message
+        # Stale-artifact cleanup — a previous SHIP cycle's
+        # implementation_ticket.md must NOT remain readable as the current
+        # cycle's output when this cycle ends in HOLD. Move it to .prev so
+        # the operator can still inspect history but `cat` doesn't show
+        # last week's Local Visa ticket while we're rework'ing something
+        # else.
+        moved = _move_stale_artifact_aside(IMPLEMENTATION_TICKET_FILE)
+        if moved:
+            _emit_cycle_log(
+                state, "implementation_ticket_stale_moved",
+                f"prior implementation_ticket.md moved aside → {moved}",
+            )
         _emit_cycle_log(
             state, "implementation_ticket_skipped_hold",
             "implementation_ticket skipped — PM HOLD (재작업 사이클)",
