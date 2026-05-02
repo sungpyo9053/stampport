@@ -52,9 +52,18 @@ jobs:
           # Pick up Python source changes (schemas.py, routers/*.py, etc.)
           # — frontend dist refresh alone leaves uvicorn running the old
           # ALLOWED_COMMANDS allowlist, which silently rejects new commands
-          # like start_autopilot until the service is bounced.
-          sudo systemctl restart stampport-api
-          sudo systemctl restart stampport-control-api
+          # like start_autopilot until the service is bounced. We don't
+          # fail the deploy when a unit isn't registered yet: stampport-api
+          # is optional on hosts that only run the control surface.
+          for svc in stampport-api stampport-control-api; do
+            if systemctl list-unit-files --no-legend "$svc.service" \
+                | grep -q "$svc.service"; then
+              echo "  · sudo systemctl restart $svc"
+              sudo systemctl restart "$svc"
+            else
+              echo "  · skipping $svc — not installed"
+            fi
+          done
 
           echo "▶ Health checks"
           # Wait for uvicorn to come back up before failing the workflow.
