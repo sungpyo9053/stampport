@@ -8082,13 +8082,40 @@ def _build_pingpong_meta(state: dict) -> dict:
     }
 
 
+def _safe_meta(name: str, fn: Callable[..., dict], *args, **kwargs) -> dict:
+    """Run a metadata sub-builder and convert any unexpected exception
+    into ``{"error": "..."}`` so a single broken builder cannot kill the
+    heartbeat (which would also kill the runner's command queue and
+    block Auto Pilot starts).
+
+    This intentionally swallows all exceptions — the only contract is
+    "return a dict" — and surfaces the failure in the heartbeat
+    payload itself so the dashboard can show the error instead of the
+    panel just going blank.
+    """
+    try:
+        out = fn(*args, **kwargs)
+        return out if isinstance(out, dict) else {"value": out}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error": f"{name} meta builder raised: {type(exc).__name__}: {exc}",
+            "error_type": type(exc).__name__,
+        }
+
+
 def _build_local_factory_meta() -> dict:
     """Compose the `metadata.local_factory` payload for heartbeats.
 
     Pulls from factory_state.json + pid file + log tail. Everything is
     best-effort — missing files turn into nulls, never raised errors."""
-    state = _read_factory_state() or {}
-    alive, pid = _factory_pid_alive()
+    try:
+        state = _read_factory_state() or {}
+    except Exception:  # noqa: BLE001
+        state = {}
+    try:
+        alive, pid = _factory_pid_alive()
+    except Exception:  # noqa: BLE001
+        alive, pid = False, None
 
     # The state file's claude_proposal_path/at reflect the CURRENT cycle.
     # On a skip cycle these go null even when a proposal from an earlier
@@ -8207,7 +8234,9 @@ def _build_local_factory_meta() -> dict:
             "gate_failures": state.get("product_planner_gate_failures") or [],
         },
         "publish": _build_publish_meta(state),
-        "publish_blocker": _build_publish_blocker_meta(state),
+        "publish_blocker": _safe_meta(
+            "publish_blocker", _build_publish_blocker_meta, state
+        ),
         "qa_gate": _build_qa_meta(state),
         "command_diagnostics": _build_command_diagnostics_meta(),
         "watchdog": _build_watchdog_meta(),
@@ -8257,9 +8286,14 @@ def _build_publish_blocker_meta(state: dict) -> dict:
         auto_restored = list(legacy)
     recurring = state.get("publish_blocker_recurring") or {}
     if not recurring:
-        # Read the standalone counter file as a fallback.
+        # Read the standalone counter file as a fallback. Use the
+        # module-level pathlib.Path — re-importing it inside this
+        # function makes the compiler treat `Path` as a function-local
+        # name everywhere, so a later `Path(report_path)` call below
+        # would crash with UnboundLocalError whenever the branch
+        # carrying the import was skipped (which is the common case
+        # when state already supplied `publish_blocker_recurring`).
         try:
-            from pathlib import Path
             f = RUNTIME_DIR / "blocker_recurring.json"
             if f.is_file():
                 recurring = {
@@ -8274,7 +8308,15 @@ def _build_publish_blocker_meta(state: dict) -> dict:
         candidate = RUNTIME_DIR / "blocker_resolve_report.md"
         if candidate.is_file():
             report_path = str(candidate)
-    report_exists = bool(report_path) and Path(report_path).is_file()
+    # Defensive: report_path may be None / "" / a path that no longer
+    # exists. Coerce to str before constructing Path so a stray int /
+    # bool sneaking in via factory_state.json never raises here.
+    report_exists = False
+    if report_path:
+        try:
+            report_exists = Path(str(report_path)).is_file()
+        except (OSError, TypeError, ValueError):
+            report_exists = False
 
     # Hard-risky basenames only — never the full path.
     def _bn(p: str) -> str:
