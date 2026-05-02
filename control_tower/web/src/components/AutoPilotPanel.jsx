@@ -179,28 +179,82 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState("");
 
+  // Build the start payload from the operator's draft. Single source
+  // of truth — both the live "what will be sent" preview pill AND the
+  // actual handleStart() POST read from this. That way the bug where
+  // the select said auto_publish but the POST sent safe_run can never
+  // come back: if the preview shows safe_run, you know the click will
+  // send safe_run, period.
+  const startPayload = useMemo(() => ({
+    autopilot_enabled: true,
+    // Send under both keys for defence-in-depth: the runner accepts
+    // either `autopilot_mode` (canonical) or `mode` (back-compat).
+    autopilot_mode: draft.mode,
+    mode: draft.mode,
+    max_cycles: Number(draft.maxCycles) || 5,
+    max_hours: Number(draft.maxHours) || 6,
+    stop_on_hold: !!draft.stopOnHold,
+    require_scope_consistency: true,
+    require_render_check: !!draft.requireRender,
+    require_api_health: !!draft.requireHealth,
+  }), [draft]);
+
+  // The runner has an active cycle process iff cycle_count > 0 AND
+  // status==running. If status==running but cycle_count is still 0
+  // (start command claimed but no smoke spawned yet), the "현재 cycle
+  // 종료 후 정지" label is misleading — there's nothing in flight to
+  // wait for. The "stopped acknowledged" check, plus a quick fallback
+  // that auto-clears stopRequested after ~10s if the runner refuses to
+  // confirm, prevents the UI from sticking on RUNNING/STOP REQUESTED
+  // forever.
+  const cycleInFlight = isRunning && (state?.cycle_count || 0) > 0;
+  useEffect(() => {
+    if (!stopRequested) return undefined;
+    // If the runner has already moved off `running`, the other effect
+    // above will clear the flag; this one only handles the silent-
+    // refusal case where the heartbeat keeps lying about running.
+    const id = setTimeout(() => {
+      // Only auto-clear if we're STILL in the requested state — the
+      // user shouldn't see the flag bounce if a real status update
+      // arrived in the meantime.
+      setStopRequested(false);
+    }, 12000);
+    return () => clearTimeout(id);
+  }, [stopRequested]);
+
   const canStart = !!runnerId && !busy && !isLocked && !stopRequested;
   const canStop = !!runnerId && !busy && (isRunning || isStopping) && !stopRequested;
+  // Restart is always offered when a runner is registered — it stops
+  // first if running, then starts. If the runner is already stopped
+  // it's effectively a Start with the current draft.
+  const canRestart = !!runnerId && !busy && !stopRequested;
 
   async function handleStart() {
     if (!runnerId) {
       setFeedback("러너가 등록되어 있지 않아요 — 먼저 runner heartbeat 확인");
       return;
     }
+    if (!startPayload.autopilot_mode) {
+      setFeedback("모드가 선택되지 않았습니다 — Safe Run / Auto Commit / Auto Publish 중 하나를 선택해 주세요.");
+      return;
+    }
     setBusy(true);
     setFeedback("");
     try {
-      await startAutopilot(runnerId, {
-        autopilot_enabled: true,
-        autopilot_mode: draft.mode,
-        max_cycles: Number(draft.maxCycles) || 5,
-        max_hours: Number(draft.maxHours) || 6,
-        stop_on_hold: !!draft.stopOnHold,
-        require_scope_consistency: true,
-        require_render_check: !!draft.requireRender,
-        require_api_health: !!draft.requireHealth,
-      });
-      setFeedback("Auto Pilot 시작 요청 완료 — 다음 heartbeat 에서 상태가 갱신됩니다.");
+      // Persist the payload to console + a runtime debug surface so an
+      // operator can verify "what did the dashboard actually send?"
+      // without sniffing the network tab.
+      // eslint-disable-next-line no-console
+      console.info("[autopilot] start payload →", startPayload);
+      if (typeof window !== "undefined") {
+        window.__last_autopilot_start_payload = startPayload;
+      }
+      await startAutopilot(runnerId, startPayload);
+      setFeedback(
+        `Auto Pilot 시작 요청 완료 (mode=${startPayload.autopilot_mode}, ` +
+        `cycles=${startPayload.max_cycles}, hours=${startPayload.max_hours}, ` +
+        `stop_on_hold=${startPayload.stop_on_hold}). 다음 heartbeat 에서 갱신됩니다.`,
+      );
       onSent && onSent();
     } catch (e) {
       setFeedback(`시작 실패: ${e.message || e}`);
@@ -218,7 +272,11 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     setFeedback("");
     try {
       await stopAutopilot(runnerId, "operator stop from dashboard");
-      setFeedback("Auto Pilot 정지 요청 완료 — 현재 cycle 종료를 기다립니다.");
+      setFeedback(
+        cycleInFlight
+          ? "Auto Pilot 정지 요청 완료 — 현재 cycle 종료를 기다립니다."
+          : "Auto Pilot 정지 요청 완료.",
+      );
       onSent && onSent();
     } catch (e) {
       setStopRequested(false);
@@ -228,18 +286,50 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     }
   }
 
+  async function handleRestart() {
+    if (!runnerId) return;
+    setBusy(true);
+    setFeedback("Auto Pilot 재시작 요청 — 정지 후 새 설정으로 다시 시작합니다.");
+    try {
+      if (isRunning || isStopping) {
+        await stopAutopilot(runnerId, "operator restart");
+        // Wait briefly for the runner to acknowledge the stop. The
+        // autopilot module checks if the loop is alive before it
+        // accepts a new start, so we give it a beat.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+      // eslint-disable-next-line no-console
+      console.info("[autopilot] restart payload →", startPayload);
+      if (typeof window !== "undefined") {
+        window.__last_autopilot_start_payload = startPayload;
+      }
+      await startAutopilot(runnerId, startPayload);
+      setFeedback(
+        `Auto Pilot 재시작 완료 (mode=${startPayload.autopilot_mode}).`,
+      );
+      onSent && onSent();
+    } catch (e) {
+      setFeedback(`재시작 실패: ${e.message || e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // Compose stop button label so the operator always sees the right
-  // phase. The runner currently writes status=running until the cycle
-  // finishes then flips to stopped — there's no real "stopping" tick
-  // in between. So the UI synthesizes it from `stopRequested`: the
-  // moment the operator clicks Stop the button immediately reads
-  // "정지 요청 중", and once the heartbeat confirms the loop has
-  // actually torn down (status=stopped) the local flag clears.
+  // phase. Three states the runner can actually be in (running with
+  // active cycle / running with no cycle yet / stopped) → three
+  // distinct labels. Don't say "현재 cycle 종료 후 정지" when there's
+  // no cycle in flight to wait for.
   let stopLabel = "정지";
-  if (stopRequested && isRunning) stopLabel = "정지 요청 중 — 현재 cycle 종료 후 정지";
-  else if (stopRequested) stopLabel = "정지 요청 중...";
-  else if (isStopping) stopLabel = "현재 cycle 종료 후 정지";
-  else if (status === "stopped") stopLabel = "정지됨";
+  if (stopRequested && cycleInFlight) {
+    stopLabel = "정지 요청 중 — 현재 cycle 종료 후 정지";
+  } else if (stopRequested) {
+    stopLabel = "정지 요청 중...";
+  } else if (isStopping) {
+    stopLabel = "현재 cycle 종료 후 정지";
+  } else if (status === "stopped") {
+    stopLabel = "정지됨";
+  }
 
   const startLabel = (() => {
     if (busy) return "처리 중...";
@@ -247,6 +337,16 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     if (isStopping) return "정지 중";
     return "Auto Pilot 시작";
   })();
+
+  // Pretty-print the payload for the operator-facing preview pill.
+  const payloadPreviewLines = [
+    `mode=${startPayload.autopilot_mode}`,
+    `max_cycles=${startPayload.max_cycles}`,
+    `max_hours=${startPayload.max_hours}`,
+    `stop_on_hold=${startPayload.stop_on_hold}`,
+    `render=${startPayload.require_render_check}`,
+    `health=${startPayload.require_api_health}`,
+  ].join(" · ");
 
   return (
     <section
@@ -392,7 +492,24 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
         </div>
       </div>
 
-      <div className="mt-1 flex gap-2">
+      {/* Live "what will be sent" preview — eliminates the silent
+          safe_run regression by making the payload visible BEFORE the
+          operator clicks Start. */}
+      <div
+        className="rounded px-2 py-1.5 text-[10px] tracking-widest"
+        data-testid="autopilot-payload-preview"
+        style={{
+          backgroundColor: "#0a1228",
+          border: "1px dashed #d4a84355",
+          color: "#fde68a",
+          fontFamily: "ui-monospace, monospace",
+        }}
+      >
+        <span className="mr-2 font-bold text-amber-300">START PAYLOAD</span>
+        <span style={{ wordBreak: "break-word" }}>{payloadPreviewLines}</span>
+      </div>
+
+      <div className="mt-1 flex flex-wrap gap-2">
         <button
           type="button"
           onClick={handleStart}
@@ -420,6 +537,20 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
           data-testid="autopilot-stop"
         >
           {stopLabel}
+        </button>
+        <button
+          type="button"
+          onClick={handleRestart}
+          disabled={!canRestart}
+          className={
+            "flex-1 rounded-lg px-3 py-1.5 text-[12px] font-semibold " +
+            (canRestart
+              ? "bg-sky-500 text-slate-950 hover:bg-sky-400"
+              : "cursor-not-allowed bg-slate-800/60 text-slate-500")
+          }
+          data-testid="autopilot-restart"
+        >
+          재시작
         </button>
       </div>
 

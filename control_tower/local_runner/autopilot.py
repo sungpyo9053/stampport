@@ -136,10 +136,32 @@ class AutopilotConfig:
 
     @classmethod
     def from_payload(cls, payload: dict | None) -> "AutopilotConfig":
+        # Accept mode under either `autopilot_mode` (canonical) or `mode`
+        # (defensive — both the dashboard and the autopilot --mode CLI
+        # used to disagree on the field name; supporting both means a
+        # rename in one place can never silently fall through to
+        # safe_run again).
         payload = payload or {}
-        mode = str(payload.get("autopilot_mode") or "safe_run").strip()
+        raw_mode = (
+            payload.get("autopilot_mode")
+            if payload.get("autopilot_mode") is not None
+            else payload.get("mode")
+        )
+        if raw_mode is None:
+            # Distinct from "client said safe_run" — surface a real
+            # error so the operator sees `start_autopilot` rejected
+            # instead of a silent downgrade. Caller (_h_start_autopilot)
+            # turns this into a False/message tuple.
+            raise ValueError(
+                "autopilot_mode missing from payload — refusing to default "
+                "to safe_run silently. Send autopilot_mode = "
+                f"{'/'.join(VALID_MODES)}."
+            )
+        mode = str(raw_mode).strip()
         if mode not in VALID_MODES:
-            mode = "safe_run"
+            raise ValueError(
+                f"autopilot_mode={mode!r} not in {VALID_MODES}"
+            )
         try:
             max_cycles = int(payload.get("max_cycles") or 5)
         except (TypeError, ValueError):
@@ -152,17 +174,30 @@ class AutopilotConfig:
             smoke_timeout = int(payload.get("smoke_timeout_sec") or 3600)
         except (TypeError, ValueError):
             smoke_timeout = 3600
+
+        # Booleans need to round-trip JSON honestly. `bool(payload.get(k,
+        # True))` is wrong when the client sends literal False — Python's
+        # bool() of False is False, which IS what we want, but the prior
+        # `payload.get(k, True)` form would also coerce a missing key to
+        # True. Keep that "missing → True" behaviour for backward compat
+        # but make the explicit-False path unambiguous.
+        def _bool_with_default(key: str, default: bool) -> bool:
+            v = payload.get(key, default)
+            if isinstance(v, str):
+                return v.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(v)
+
         return cls(
-            autopilot_enabled=bool(payload.get("autopilot_enabled", True)),
+            autopilot_enabled=_bool_with_default("autopilot_enabled", True),
             autopilot_mode=mode,
             max_cycles=max(1, min(max_cycles, 50)),
             max_hours=max(0.1, min(max_hours, 48.0)),
-            stop_on_hold=bool(payload.get("stop_on_hold", True)),
-            require_scope_consistency=bool(
-                payload.get("require_scope_consistency", True)
+            stop_on_hold=_bool_with_default("stop_on_hold", True),
+            require_scope_consistency=_bool_with_default(
+                "require_scope_consistency", True
             ),
-            require_render_check=bool(payload.get("require_render_check", True)),
-            require_api_health=bool(payload.get("require_api_health", True)),
+            require_render_check=_bool_with_default("require_render_check", True),
+            require_api_health=_bool_with_default("require_api_health", True),
             smoke_timeout_sec=max(60, min(smoke_timeout, 7200)),
         )
 

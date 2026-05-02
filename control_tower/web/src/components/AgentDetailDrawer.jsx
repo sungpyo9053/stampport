@@ -296,7 +296,7 @@ export default function AgentDetailDrawer({
 
   return (
     <div
-      className="agent-detail-overlay fixed inset-0 z-[80] flex justify-end"
+      className="agent-detail-drawer agent-detail-overlay fixed inset-0 z-[80] flex justify-end"
       data-testid="agent-detail-drawer"
       onClick={onClose}
       role="dialog"
@@ -305,7 +305,7 @@ export default function AgentDetailDrawer({
       style={{ backgroundColor: "rgba(5, 9, 18, 0.7)" }}
     >
       <aside
-        className="agent-detail-panel relative flex h-full w-full max-w-md flex-col gap-3 overflow-y-auto p-4 sm:p-5"
+        className="agent-detail-drawer-panel agent-detail-panel relative flex h-full w-full max-w-md flex-col gap-3 overflow-y-auto p-4 sm:p-5"
         onClick={(e) => e.stopPropagation()}
         style={{
           background:

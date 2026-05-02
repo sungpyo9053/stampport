@@ -456,11 +456,25 @@ def _h_start_autopilot(payload: dict) -> tuple[bool, str]:
         from . import autopilot as _autopilot
     except Exception as exc:  # noqa: BLE001
         return False, f"autopilot import failed: {exc}"
-    cfg = _autopilot.AutopilotConfig.from_payload(payload or {})
+    # Strict-mode validation — from_payload now raises ValueError when
+    # autopilot_mode is missing or invalid so the dashboard never
+    # silently gets safe_run when the operator picked auto_publish.
+    try:
+        cfg = _autopilot.AutopilotConfig.from_payload(payload or {})
+    except ValueError as exc:
+        return False, f"start_autopilot rejected: {exc}"
     if not cfg.autopilot_enabled:
         return False, "autopilot_enabled=false in payload"
     ok, msg = _autopilot.start(cfg)
-    return ok, msg
+    # Bake the resolved config into the response so the operator can
+    # eyeball "what did the runner actually accept?" right away — this
+    # is the closest thing to a payload echo we can offer through the
+    # command queue without inventing a new round-trip.
+    suffix = (
+        f" (mode={cfg.autopilot_mode}, max_cycles={cfg.max_cycles}, "
+        f"max_hours={cfg.max_hours}, stop_on_hold={cfg.stop_on_hold})"
+    )
+    return ok, (msg + suffix) if ok else msg
 
 
 def _h_stop_autopilot(payload: dict) -> tuple[bool, str]:
