@@ -48,7 +48,22 @@ jobs:
           sudo rm -rf /var/www/stampport-control/*
           sudo cp -r dist/* /var/www/stampport-control/
 
+          echo "▶ Restart API services"
+          # Pick up Python source changes (schemas.py, routers/*.py, etc.)
+          # — frontend dist refresh alone leaves uvicorn running the old
+          # ALLOWED_COMMANDS allowlist, which silently rejects new commands
+          # like start_autopilot until the service is bounced.
+          sudo systemctl restart stampport-api
+          sudo systemctl restart stampport-control-api
+
           echo "▶ Health checks"
+          # Wait for uvicorn to come back up before failing the workflow.
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 5 https://reviewdr.kr/stampport-control-api/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
           curl -f https://reviewdr.kr/stampport-control-api/health
           curl -I https://reviewdr.kr/stampport/
           curl -I https://reviewdr.kr/stampport-control/
