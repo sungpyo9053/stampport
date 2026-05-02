@@ -513,6 +513,16 @@ class CycleState:
     design_spec_svg_paths: list[str] = field(default_factory=list)
     design_spec_acceptance_passed: bool = False
     design_spec_acceptance_failures: list[str] = field(default_factory=list)
+    # Stale design_spec isolation — set when the on-disk
+    # .runtime/design_spec.md belongs to a previous cycle whose feature
+    # disagrees with the current cycle's selected feature. The PM stage
+    # excludes the spec body from its prompt and refuses spec_bypass
+    # whenever this flag is True. See _classify_design_spec_freshness.
+    stale_design_spec_detected: bool = False
+    stale_design_spec_feature: str | None = None
+    stale_design_spec_cycle_id: int | None = None
+    stale_design_spec_reason: str | None = None
+    current_cycle_feature: str | None = None
     # Desire scorecard (1~5 each, total /30). ship_ready is True only
     # when the threshold gate (≥24 total, visual_desire ≥4, share ≥4,
     # revisit ≥4) passes. rework_required lists the axis ids that
@@ -698,6 +708,11 @@ class CycleState:
             "design_spec_acceptance_passed": self.design_spec_acceptance_passed,
             "design_spec_acceptance_failures": list(self.design_spec_acceptance_failures),
             "design_spec_acceptance_errors": list(self.design_spec_acceptance_failures),
+            "stale_design_spec_detected": self.stale_design_spec_detected,
+            "stale_design_spec_feature": self.stale_design_spec_feature,
+            "stale_design_spec_cycle_id": self.stale_design_spec_cycle_id,
+            "stale_design_spec_reason": self.stale_design_spec_reason,
+            "current_cycle_feature": self.current_cycle_feature,
             "desire_scorecard": dict(self.desire_scorecard),
             "desire_scorecard_total": self.desire_scorecard_total,
             "desire_scorecard_path": self.desire_scorecard_path,
@@ -3984,6 +3999,116 @@ def _extract_design_spec_feature(body: str) -> str | None:
     return None
 
 
+# Pull cycle_id out of the artifact's HTML metadata comment written by
+# safe_write_artifact. None when the comment is absent or malformed.
+_ARTIFACT_CYCLE_ID_RE = re.compile(r"cycle_id:\s*([0-9]+)")
+
+
+def _parse_artifact_cycle_id(body: str) -> int | None:
+    if not body:
+        return None
+    head = body[:512]
+    m = _ARTIFACT_CYCLE_ID_RE.search(head)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_feature_name(name: str | None) -> str:
+    if not name:
+        return ""
+    s = re.sub(r"\s+", " ", name.strip().lower())
+    return s
+
+
+def _features_match(a: str | None, b: str | None) -> bool:
+    """Loose feature-name comparison.
+
+    Returns True when:
+      * either side is empty (callers cannot prove a mismatch yet), or
+      * normalized strings are equal, or
+      * ≥2 unique 2+character tokens overlap (Korean and ASCII).
+    """
+    sa = _normalize_feature_name(a)
+    sb = _normalize_feature_name(b)
+    if not sa or not sb:
+        return True
+    if sa == sb:
+        return True
+    toks_a = set(re.findall(r"[A-Za-z가-힣0-9]{2,}", sa))
+    toks_b = set(re.findall(r"[A-Za-z가-힣0-9]{2,}", sb))
+    if not toks_a or not toks_b:
+        return False
+    return len(toks_a & toks_b) >= 2
+
+
+def _classify_design_spec_freshness(
+    *,
+    current_cycle_id: int,
+    current_feature: str | None,
+    design_spec_md: str,
+) -> tuple[bool, dict]:
+    """Decide whether the on-disk design_spec belongs to *this* cycle.
+
+    Returns (is_stale, evidence) where evidence carries the parsed
+    fingerprint so the caller can mirror it into factory_state.json /
+    factory_smoke_state.json without re-parsing.
+
+    A spec is considered stale only when BOTH:
+      * its embedded `cycle_id` is older than the current cycle, AND
+      * its `기능명` does not match the current selected feature.
+
+    A missing fingerprint OR a missing current-feature falls back to
+    "fresh" so we never block a legitimate spec_bypass on a transient
+    parse failure.
+    """
+    evidence = {
+        "spec_cycle_id": None,
+        "spec_feature": None,
+        "current_cycle_id": current_cycle_id,
+        "current_feature": (current_feature or "").strip() or None,
+        "reason": None,
+    }
+    if not design_spec_md:
+        return False, evidence
+
+    spec_cycle_id = _parse_artifact_cycle_id(design_spec_md)
+    spec_feature = _extract_design_spec_feature(design_spec_md)
+    evidence["spec_cycle_id"] = spec_cycle_id
+    evidence["spec_feature"] = spec_feature
+
+    feature_match = _features_match(current_feature, spec_feature)
+    cycle_match = (
+        spec_cycle_id is None
+        or current_cycle_id is None
+        or spec_cycle_id == current_cycle_id
+    )
+
+    if cycle_match and feature_match:
+        return False, evidence
+
+    # An older cycle_id alone isn't enough — rework cycles legitimately
+    # carry the spec forward as long as the feature still matches.
+    if cycle_match and not feature_match:
+        evidence["reason"] = (
+            f"design_spec feature='{spec_feature}' "
+            f"!= current_feature='{current_feature or '(none)'}'"
+        )
+        return True, evidence
+    if not cycle_match and not feature_match:
+        evidence["reason"] = (
+            f"design_spec cycle_id={spec_cycle_id} "
+            f"(current={current_cycle_id}) AND feature mismatch "
+            f"('{spec_feature}' vs '{current_feature or '(none)'}')"
+        )
+        return True, evidence
+    # Different cycle but feature matches — treat as fresh-enough.
+    return False, evidence
+
+
 # Tokens we always recognize as schema fields when they appear in the
 # design_spec's badges.js section. Used as the curated whitelist for
 # scope-consistency keyword extraction so generic English words like
@@ -4412,6 +4537,7 @@ def _decide_pm_ship(
     score_gate_ok: bool,
     design_spec_status: str | None,
     design_spec_acceptance_passed: bool,
+    spec_bypass_eligible: bool = True,
 ) -> tuple[bool, bool]:
     """Decide whether the PM verdict should ship, and whether design_spec
     acceptance is the reason it's allowed to.
@@ -4419,15 +4545,19 @@ def _decide_pm_ship(
     Returns (pm_ship, spec_bypass).
 
     spec_bypass is True only when the cycle wrote a design_spec.md whose
-    acceptance gate passed — that's the bypass path that lets PM ship
-    even when desire scores didn't recover yet (avoids the abstract
-    rework-loop trap documented in docs/factory-smoke.md).
+    acceptance gate passed AND the spec is fresh for the current cycle
+    (caller passes ``spec_bypass_eligible=False`` when the spec is stale).
+    That's the bypass path that lets PM ship even when desire scores
+    didn't recover yet (avoids the abstract rework-loop trap documented
+    in docs/factory-smoke.md), but it must never be unlocked by a
+    leftover spec from a previous cycle's different feature.
     """
     decision = (decision_section or "").lower()
     ship_word = "ship" in decision
     hold_word = "hold" in decision
     spec_bypass = (
-        design_spec_status == "generated"
+        bool(spec_bypass_eligible)
+        and design_spec_status == "generated"
         and bool(design_spec_acceptance_passed)
     )
     pm_ship = ship_word and not hold_word and (score_gate_ok or spec_bypass)
@@ -4465,13 +4595,64 @@ def stage_pm_decision(state: CycleState) -> StageResult:
         "rework": list(state.desire_scorecard_rework),
         "verdict": state.designer_final_review_verdict,
     }
+
+    # ------------------------------------------------------------------
+    # Stale design_spec gate.
+    #
+    # If .runtime/design_spec.md belongs to an older cycle whose feature
+    # disagrees with this cycle's selected feature, exclude the spec
+    # body from the PM prompt and forbid spec_bypass. Otherwise an old
+    # "TitleSeal" spec drags a brand-new "PNG Share" cycle into the same
+    # HOLD loop that produced the stale spec in the first place.
+    # ------------------------------------------------------------------
+    current_feature = (
+        state.planner_revision_selected_feature
+        or state.product_planner_selected_feature
+        or state.selected_feature
+        or ""
+    )
+    state.current_cycle_feature = current_feature or None
+    spec_stale, spec_evidence = _classify_design_spec_freshness(
+        current_cycle_id=state.cycle,
+        current_feature=current_feature,
+        design_spec_md=design_spec_md,
+    )
+    state.stale_design_spec_detected = bool(spec_stale)
+    state.stale_design_spec_feature = spec_evidence.get("spec_feature")
+    state.stale_design_spec_cycle_id = spec_evidence.get("spec_cycle_id")
+    state.stale_design_spec_reason = spec_evidence.get("reason")
+
+    if spec_stale:
+        # Surface the diagnostic so smoke_report / dashboard can show
+        # "stale design_spec" without the PM HOLD reason getting
+        # contaminated with TitleSeal-shaped content from a different
+        # cycle.
+        _emit_cycle_log(
+            state, "stale_design_spec_isolated",
+            (
+                f"이전 사이클 design_spec ('{spec_evidence.get('spec_feature') or '—'}', "
+                f"cycle_id={spec_evidence.get('spec_cycle_id')}) 이 현재 평가 대상 "
+                f"'{current_feature or '(미정)'}' 과 달라 PM 프롬프트에서 제외했습니다."
+            ),
+            spec_feature=spec_evidence.get("spec_feature"),
+            spec_cycle_id=spec_evidence.get("spec_cycle_id"),
+            current_feature=current_feature,
+        )
+        prompt_design_spec_md = ""
+        prompt_design_spec_passed = False
+        prompt_design_spec_failures: list[str] = []
+    else:
+        prompt_design_spec_md = design_spec_md
+        prompt_design_spec_passed = state.design_spec_acceptance_passed
+        prompt_design_spec_failures = list(state.design_spec_acceptance_failures)
+
     prompt = _build_pm_decision_prompt(
         revision_md,
         final_review_md,
         scorecard,
-        design_spec_md=design_spec_md,
-        design_spec_acceptance_passed=state.design_spec_acceptance_passed,
-        design_spec_failures=list(state.design_spec_acceptance_failures),
+        design_spec_md=prompt_design_spec_md,
+        design_spec_acceptance_passed=prompt_design_spec_passed,
+        design_spec_failures=prompt_design_spec_failures,
     )
     ok, body = _run_pingpong_claude(prompt, "# Stampport PM Decision")
     sr.duration_sec = round(time.time() - t0, 3)
@@ -4493,6 +4674,7 @@ def stage_pm_decision(state: CycleState) -> StageResult:
         score_gate_ok=score_gate_ok,
         design_spec_status=state.design_spec_status,
         design_spec_acceptance_passed=state.design_spec_acceptance_passed,
+        spec_bypass_eligible=not state.stale_design_spec_detected,
     )
 
     state.pm_decision_status = "generated"
@@ -5216,6 +5398,7 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         design_spec_md
         and state.design_spec_status == "generated"
         and state.design_spec_acceptance_passed
+        and not state.stale_design_spec_detected
     )
 
     # Source priority: design_spec.md takes precedence whenever its

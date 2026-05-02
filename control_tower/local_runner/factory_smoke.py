@@ -178,6 +178,12 @@ STAGE_TIMEOUTS_SEC: dict[str, int] = {
 VERDICTS = ("PASS", "READY_TO_REVIEW", "READY_TO_PUBLISH", "HOLD", "FAIL")
 
 
+# Threshold (sec) past which we report `product_planning_near_timeout`
+# in the smoke report. Sits 10s under the stage's hard 600s budget so
+# the signal fires before a real timeout flips the verdict to FAIL.
+PRODUCT_PLANNING_NEAR_TIMEOUT_SEC = 590
+
+
 @dataclass
 class StageObservation:
     name: str
@@ -233,6 +239,21 @@ class SmokeRun:
     scope_mismatch_reason: str | None = None
     scope_consistency_keywords_matched: list[str] = field(default_factory=list)
     scope_consistency_keywords_total: int = 0
+    # Stale design_spec gate — set when cycle.py decided the on-disk
+    # design_spec belongs to a different cycle/feature than the current
+    # one. Surfaced in the smoke report so the operator can tell at a
+    # glance that this HOLD wasn't caused by genuine spec gaps.
+    stale_design_spec_detected: bool = False
+    stale_design_spec_feature: str | None = None
+    stale_design_spec_cycle_id: int | None = None
+    stale_design_spec_reason: str | None = None
+    current_cycle_feature: str | None = None
+    # Product-planning near-timeout signal — true when the stage's
+    # observed duration crossed PRODUCT_PLANNING_NEAR_TIMEOUT_SEC. Only
+    # advisory; the cycle still finishes whatever stage was running.
+    product_planning_near_timeout: bool = False
+    product_planning_duration_sec: float = 0.0
+    product_planning_timeout_sec: int = 0
     changed_files: list[str] = field(default_factory=list)
     stale_artifacts_moved: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -866,6 +887,43 @@ def _finalize_run(
     sc_tot = factory_state.get("scope_consistency_keywords_total")
     if isinstance(sc_tot, int):
         run.scope_consistency_keywords_total = sc_tot
+    # Stale design_spec mirror — written by cycle.stage_pm_decision so
+    # the smoke report can show why HOLD reasons aren't being driven by
+    # an old TitleSeal-style spec body.
+    run.stale_design_spec_detected = bool(
+        factory_state.get("stale_design_spec_detected")
+    )
+    run.stale_design_spec_feature = factory_state.get("stale_design_spec_feature")
+    spec_cid = factory_state.get("stale_design_spec_cycle_id")
+    if isinstance(spec_cid, int):
+        run.stale_design_spec_cycle_id = spec_cid
+    elif isinstance(spec_cid, str) and spec_cid.isdigit():
+        run.stale_design_spec_cycle_id = int(spec_cid)
+    run.stale_design_spec_reason = factory_state.get("stale_design_spec_reason")
+    run.current_cycle_feature = (
+        factory_state.get("current_cycle_feature")
+        or run.selected_feature
+    )
+
+    # Product-planning timeout signal — derived from the StageObservation
+    # rows we already record. Reports the longest observed duration for
+    # `product_planning` so the operator can compare against the 600s
+    # budget at a glance.
+    pp_dur = 0.0
+    pp_budget = STAGE_TIMEOUTS_SEC.get("product_planning", 0)
+    for obs in run.stages or []:
+        if obs.name == "product_planning":
+            try:
+                d = float(obs.duration_sec or 0.0)
+            except (TypeError, ValueError):
+                d = 0.0
+            if d > pp_dur:
+                pp_dur = d
+    run.product_planning_duration_sec = round(pp_dur, 3)
+    run.product_planning_timeout_sec = pp_budget
+    run.product_planning_near_timeout = bool(
+        pp_dur >= PRODUCT_PLANNING_NEAR_TIMEOUT_SEC
+    )
     cf = factory_state.get("claude_apply_changed_files") or []
     if isinstance(cf, list):
         run.changed_files = [str(p) for p in cf]
@@ -981,6 +1039,14 @@ def _serialize_run(run: SmokeRun) -> dict:
             run.scope_consistency_keywords_matched
         ),
         "scope_consistency_keywords_total": run.scope_consistency_keywords_total,
+        "stale_design_spec_detected": run.stale_design_spec_detected,
+        "stale_design_spec_feature": run.stale_design_spec_feature,
+        "stale_design_spec_cycle_id": run.stale_design_spec_cycle_id,
+        "stale_design_spec_reason": run.stale_design_spec_reason,
+        "current_cycle_feature": run.current_cycle_feature,
+        "product_planning_near_timeout": run.product_planning_near_timeout,
+        "product_planning_duration_sec": run.product_planning_duration_sec,
+        "product_planning_timeout_sec": run.product_planning_timeout_sec,
         "changed_files": list(run.changed_files),
         "stale_artifacts_moved": list(run.stale_artifacts_moved),
         "stages": [_serialize_stage(s) for s in run.stages],
@@ -1035,7 +1101,9 @@ def _build_report(
     ]
 
     lines.extend(_build_design_spec_section(run))
+    lines.extend(_build_stale_design_spec_section(run))
     lines.extend(_build_scope_consistency_section(run))
+    lines.extend(_build_planning_timeout_section(run))
     lines.extend(_build_stale_artifact_section(run))
 
     lines += [
@@ -1256,6 +1324,58 @@ def _build_scope_consistency_section(run: SmokeRun) -> list[str]:
         out.append("### scope_mismatch_reason")
         out.append(f"> {run.scope_mismatch_reason}")
     return out
+
+
+def _build_stale_design_spec_section(run: SmokeRun) -> list[str]:
+    """Render the Stale design_spec block when cycle.py decided the
+    on-disk spec belongs to a previous cycle/feature.
+
+    The block is intentionally separate from `## Design spec acceptance`
+    so the operator can tell at a glance that this HOLD wasn't caused by
+    real spec gaps — the stale spec was simply isolated from the PM
+    prompt and spec_bypass.
+    """
+    if not run.stale_design_spec_detected:
+        return []
+    out = ["", "## Stale design_spec mismatch"]
+    out.append(
+        f"- current_cycle_feature: `{run.current_cycle_feature or '—'}`"
+    )
+    out.append(
+        f"- stale_design_spec_feature: `{run.stale_design_spec_feature or '—'}`"
+    )
+    out.append(
+        f"- stale_design_spec_cycle_id: "
+        f"`{run.stale_design_spec_cycle_id if run.stale_design_spec_cycle_id is not None else '—'}` "
+        f"(현재 cycle: `{run.cycle_id}`)"
+    )
+    if run.stale_design_spec_reason:
+        out.append(f"- 사유: {run.stale_design_spec_reason}")
+    out.append("")
+    out.append(
+        "> 이전 사이클의 design_spec 이 현재 평가 대상과 다른 기능을 다루고 있어서 "
+        "PM 프롬프트와 spec_bypass 게이트에서 제외되었습니다. 이번 HOLD 사유는 "
+        "stale spec 본문이 아니라 현재 cycle 자체의 평가 결과입니다."
+    )
+    return out
+
+
+def _build_planning_timeout_section(run: SmokeRun) -> list[str]:
+    """Surface a near-timeout warning when product_planning duration
+    crosses the advisory threshold (590s default). Stays silent for
+    healthy runs so the report doesn't get noisy."""
+    if not run.product_planning_near_timeout:
+        return []
+    budget = run.product_planning_timeout_sec or 600
+    return [
+        "",
+        "## product_planning near_timeout",
+        f"- duration: `{run.product_planning_duration_sec:.1f}s` / "
+        f"budget `{budget}s`",
+        "- 다음 사이클이 통과되기 전에 planner 프롬프트를 더 짧고 결정형으로 "
+        "압축하세요 — 600s 한도를 넘기면 verdict 가 FAIL/smoke_timeout 으로 "
+        "내려갑니다.",
+    ]
 
 
 def _build_stale_artifact_section(run: SmokeRun) -> list[str]:
@@ -1918,6 +2038,7 @@ def compute_maturity_signal(history: list[dict]) -> dict:
             "avg_human_action_required": 0.0,
             "signals": [],
             "recommendation": "keep_sequential_loop",
+            "secondary_recommendations": [],
             "operator_message": (
                 "아직 history 가 없습니다. smoke 를 몇 회 더 돌린 뒤 다시 보세요."
             ),
@@ -2049,6 +2170,21 @@ def compute_maturity_signal(history: list[dict]) -> dict:
             f"{avg_duration:.0f}s). 순차 루프를 유지하세요."
         )
 
+    # Secondary recommendations — additive hints that don't replace the
+    # primary recommendation but get surfaced alongside it. The product
+    # planner is the prime candidate: when it's the longest stage AND
+    # crossing the near-timeout threshold (590s), the operator needs a
+    # specific next step regardless of which primary recommendation fired.
+    secondary_recommendations: list[str] = []
+    if (
+        longest_stage == "product_planning"
+        and longest_stage_avg >= PRODUCT_PLANNING_NEAR_TIMEOUT_SEC
+    ):
+        secondary_recommendations.append("improve_planner_prompt_efficiency")
+        signals.append(
+            "product_planning near_timeout — planner 프롬프트 압축 검토"
+        )
+
     return {
         "recent_count": n,
         "verdict_distribution": verdict_dist,
@@ -2064,6 +2200,7 @@ def compute_maturity_signal(history: list[dict]) -> dict:
         "avg_human_action_required": round(avg_human, 3),
         "signals": signals,
         "recommendation": recommendation,
+        "secondary_recommendations": secondary_recommendations,
         "operator_message": operator_message,
     }
 
@@ -2079,6 +2216,12 @@ def _build_maturity_section(signal: dict) -> list[str]:
             "",
             f"### 추천: `{signal['recommendation']}`",
         ]
+        secondary = signal.get("secondary_recommendations") or []
+        if secondary:
+            lines.append("")
+            lines.append("### 추가 추천")
+            for s in secondary:
+                lines.append(f"- `{s}`")
         return lines
 
     avg_min = signal["avg_duration_sec"] / 60.0
@@ -2115,6 +2258,12 @@ def _build_maturity_section(signal: dict) -> list[str]:
         "",
         f"### 추천: `{signal['recommendation']}`",
     ]
+    secondary = signal.get("secondary_recommendations") or []
+    if secondary:
+        lines.append("")
+        lines.append("### 추가 추천")
+        for s in secondary:
+            lines.append(f"- `{s}`")
     return lines
 
 
@@ -3596,6 +3745,197 @@ def self_test() -> tuple[int, int, list[str]]:
             f"30H: legacy planner ticket path should still produce "
             f"READY_TO_REVIEW — got {v_h}/{c_h}"
         )
+
+    # ----------------------------------------------------------------
+    # Stale design_spec isolation — fixtures A–F per spec.
+    # ----------------------------------------------------------------
+    try:
+        from . import cycle as _cycle
+    except Exception as exc:  # noqa: BLE001
+        _cycle = None
+        failures.append(f"stale_spec/A-F: cycle import failed: {exc}")
+
+    if _cycle is not None:
+        # Build a synthetic design_spec body for the TitleSeal feature
+        # with cycle_id=11 in its artifact header.
+        old_spec_body_no_header = (
+            "# Stampport Design Implementation Spec\n\n"
+            "## 구현 대상 기능\n"
+            "- 기능명: 칭호 Tier 시각화 · TitleSeal 컴포넌트 · ShareCard 통합\n"
+            "- 관련 PM HOLD 사유: 추상 논의가 반복됨\n\n"
+            "## 수정 대상 파일\n"
+            "- app/web/src/components/TitleSeal.jsx\n"
+            "- app/web/src/screens/Badges.jsx\n"
+            "- app/web/src/screens/Share.jsx\n"
+        )
+        old_spec_md = (
+            "<!--\nstampport_artifact\ncycle_id: 11\nstage: design_spec\n"
+            "source_agent: designer\n"
+            "created_at: 2026-04-01T00:00:00.000000Z\n-->\n\n"
+            + old_spec_body_no_header
+        )
+        # And a current-cycle spec with cycle_id=12 + matching feature.
+        match_spec_body = (
+            "# Stampport Design Implementation Spec\n\n"
+            "## 구현 대상 기능\n"
+            "- 기능명: 도장 인화 카드 PNG 저장 + 네이티브 공유\n"
+            "- 관련 PM HOLD 사유: 공유 카드 폴리시 미정\n\n"
+            "## 수정 대상 파일\n"
+            "- app/web/src/screens/Share.jsx\n"
+            "- app/web/src/components/PrintCard.jsx\n"
+            "- app/web/src/utils/printShare.js\n"
+        )
+        match_spec_md = (
+            "<!--\nstampport_artifact\ncycle_id: 12\nstage: design_spec\n"
+            "source_agent: designer\n"
+            "created_at: 2026-05-01T00:00:00.000000Z\n-->\n\n"
+            + match_spec_body
+        )
+
+        # A. current=PNG Share, design_spec=TitleSeal → stale.
+        total += 1
+        is_stale_a, ev_a = _cycle._classify_design_spec_freshness(
+            current_cycle_id=12,
+            current_feature="도장 인화 카드 PNG 저장 + 네이티브 공유",
+            design_spec_md=old_spec_md,
+        )
+        if (
+            is_stale_a
+            and ev_a.get("spec_cycle_id") == 11
+            and ev_a.get("spec_feature", "").startswith("칭호")
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"A: PNG Share vs TitleSeal stale check failed — "
+                f"is_stale={is_stale_a} evidence={ev_a}"
+            )
+
+        # B. PM prompt excludes stale spec body.
+        total += 1
+        block_with_stale = _cycle._build_pm_decision_prompt(
+            "(planner_revision)", "(designer_final_review)",
+            {"scores": {}, "total": 0, "ship_ready": False, "rework": [],
+             "verdict": "rework"},
+            design_spec_md="",  # caller should clear when stale
+            design_spec_acceptance_passed=False,
+            design_spec_failures=[],
+        )
+        if (
+            "TitleSeal" not in block_with_stale
+            and "design_spec 미작성" in block_with_stale
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "B: stale spec body should be absent from PM prompt — "
+                "got " + block_with_stale[:120]
+            )
+
+        # C. Same feature → spec_bypass possible (not stale).
+        total += 1
+        is_stale_c, _ = _cycle._classify_design_spec_freshness(
+            current_cycle_id=12,
+            current_feature="도장 인화 카드 PNG 저장 + 네이티브 공유",
+            design_spec_md=match_spec_md,
+        )
+        # spec_bypass should remain True when not stale.
+        _ship, bypass_c = _cycle._decide_pm_ship(
+            decision_section="ship",
+            score_gate_ok=False,
+            design_spec_status="generated",
+            design_spec_acceptance_passed=True,
+            spec_bypass_eligible=not is_stale_c,
+        )
+        if not is_stale_c and bypass_c is True:
+            passed += 1
+        else:
+            failures.append(
+                f"C: matching feature should keep spec_bypass on — "
+                f"is_stale={is_stale_c} bypass={bypass_c}"
+            )
+
+        # D. Stale spec must NOT yield READY via spec_bypass.
+        total += 1
+        _ship_d, bypass_d = _cycle._decide_pm_ship(
+            decision_section="ship",
+            score_gate_ok=False,  # only spec_bypass could ship this
+            design_spec_status="generated",
+            design_spec_acceptance_passed=True,
+            spec_bypass_eligible=False,  # caller marked stale
+        )
+        # No bypass → ship must be False (score gate also failed).
+        if bypass_d is False and _ship_d is False:
+            passed += 1
+        else:
+            failures.append(
+                f"D: stale spec must block spec_bypass / ship — "
+                f"bypass={bypass_d} ship={_ship_d}"
+            )
+
+        # E. product_planning duration 597/600 → near_timeout flag.
+        total += 1
+        run_e = SmokeRun(mode="local-cycle", timeout_sec=600)
+        run_e.started_at = _utc_now_iso()
+        run_e.finished_at = _utc_now_iso()
+        run_e.verdict = "READY_TO_REVIEW"
+        run_e.stages = [
+            StageObservation(
+                name="product_planning", status="passed",
+                duration_sec=597.0, timeout_sec=600,
+            ),
+        ]
+        _finalize_run(
+            run_e,
+            factory_state={
+                "status": "ready_to_publish",
+                "cycle": 12,
+                "qa_status": "passed",
+                "claude_apply_status": "applied",
+                "claude_apply_changed_files": ["app/web/src/screens/Share.jsx"],
+                "implementation_ticket_status": "generated",
+            },
+            observer_classification=None,
+        )
+        if (
+            run_e.product_planning_near_timeout is True
+            and run_e.product_planning_duration_sec >= 590.0
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"E: product_planning 597s should set near_timeout=true — "
+                f"got near={run_e.product_planning_near_timeout} "
+                f"dur={run_e.product_planning_duration_sec}"
+            )
+
+        # F. Existing scope_mismatch self-test still passes — sanity
+        #    check that we didn't break the public _check_scope_consistency.
+        total += 1
+        passed_scope, reason_scope, _matched, _total = (
+            _cycle._check_scope_consistency(
+                design_spec_md=match_spec_md,
+                design_spec_target_files=[
+                    "app/web/src/screens/Share.jsx",
+                    "app/web/src/components/PrintCard.jsx",
+                ],
+                design_spec_feature=(
+                    "도장 인화 카드 PNG 저장 + 네이티브 공유"
+                ),
+                diff_text="",
+                changed_files=[
+                    "app/web/src/screens/Login.jsx",  # not in target
+                ],
+                selected_feature="도장 인화 카드 PNG 저장 + 네이티브 공유",
+            )
+        )
+        if passed_scope is False and reason_scope and "scope_mismatch" in reason_scope:
+            passed += 1
+        else:
+            failures.append(
+                f"F: legacy scope_mismatch self-test broken — "
+                f"passed={passed_scope} reason={reason_scope}"
+            )
 
     return passed, total, failures
 
