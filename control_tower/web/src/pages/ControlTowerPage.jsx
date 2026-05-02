@@ -11,6 +11,9 @@ import WatchdogPanel from "../components/WatchdogPanel.jsx";
 import PipelineRecoveryPanel from "../components/PipelineRecoveryPanel.jsx";
 import AgentAccountabilityPanel from "../components/AgentAccountabilityPanel.jsx";
 import AutoPilotPanel from "../components/AutoPilotPanel.jsx";
+import AutoPilotHero from "../components/AutoPilotHero.jsx";
+import AgentOfficeScene from "../components/AgentOfficeScene.jsx";
+import AgentDetailDrawer from "../components/AgentDetailDrawer.jsx";
 import OverallStatusBar from "../components/OverallStatusBar.jsx";
 import {
   fetchAgents,
@@ -37,13 +40,31 @@ const BUBBLE_TTL_MS = 4500;
 // transient notifications, not durable state.
 const HANDOFF_LOG_MAX = 40;
 
-// Stampport Control Tower — pixel-office layout.
+// Pull autopilot status off the runner heartbeat so we know whether to
+// hide stale demo / sample artifacts behind the "Legacy Diagnostic"
+// accordion. When autopilot is RUNNING the operator wants the live
+// scene front-and-center — not a Cycle Board sample from last week.
+function pickAutopilotStatus(runners = []) {
+  for (const r of runners) {
+    const ap = r?.metadata_json?.local_factory?.autopilot;
+    if (ap?.status) return ap.status;
+  }
+  return null;
+}
+
+// Stampport Control Tower — Auto Pilot agent-office layout.
 //
-// The office is the main stage. Pipeline is a thin chip up top,
-// ping-pong and cycle artifacts live as side panels, and a game-style
-// dock floats at the bottom. There is no factory/task/event table on
-// this page — those live inside the office (speech bubbles + artifact
-// board).
+// Layout from top to bottom:
+//   1. Header (logo + demo button)
+//   2. AutoPilot Hero — story-card status banner
+//   3. AgentOfficeScene — 8 agents in a Reels-style scene
+//   4. SystemLog + OperatorCommandPanel — live signal panel
+//   5. AutoPilotPanel — start/stop knobs
+//   6. AgentAccountabilityPanel — per-agent verdict (current cycle)
+//   7. Legacy Diagnostic accordion — pixel office, ping-pong board,
+//      pipeline recovery, watchdog, cycle effectiveness, artifacts.
+//      Collapsed by default while Auto Pilot is RUNNING; expanded when
+//      the operator is idle / debugging a specific cycle.
 export default function ControlTowerPage() {
   const [agents, setAgents] = useState([]);
   const [, setTasks] = useState([]);
@@ -55,6 +76,8 @@ export default function ControlTowerPage() {
   const [handoffLog, setHandoffLog] = useState([]);
   const [isRunningDemo, setIsRunningDemo] = useState(false);
   const [apiError, setApiError] = useState(null);
+  const [selectedAgentId, setSelectedAgentId] = useState(null);
+  const [legacyOpen, setLegacyOpen] = useState(false);
 
   // ?handoffDemo=1 (or ?demo=handoff) forces the courier demo loop on
   // top of whatever the runner is reporting, so an operator can verify
@@ -185,12 +208,40 @@ export default function ControlTowerPage() {
   );
   const activeAgentId = agents.find((a) => a.status === "working")?.id || null;
 
+  const autopilotStatus = useMemo(
+    () => pickAutopilotStatus(runners),
+    [runners],
+  );
+  const autopilotRunning = autopilotStatus === "running";
+
+  const combinedEvents = useMemo(
+    () => [
+      ...events,
+      ...synthesizeCycleEvents(runners),
+      ...synthesizeDeployEvents(runners),
+      ...synthesizeWatchdogEvents(runners),
+      ...synthesizeOperatorRequestEvents(runners),
+      ...handoffLog,
+    ],
+    [events, runners, handoffLog],
+  );
+
+  // Esc closes the agent detail drawer.
+  useEffect(() => {
+    if (!selectedAgentId) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") setSelectedAgentId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedAgentId]);
+
   return (
     <div
-      className="flex min-h-screen flex-col gap-3 p-3 sm:p-4"
+      className="control-tower-page flex min-h-screen flex-col gap-3 p-3 sm:p-4"
       style={{ backgroundColor: "#050912" }}
     >
-      {/* Top bar — pixel sign + demo button. Replaces HeaderStatusBar. */}
+      {/* Top bar — pixel sign + demo button. */}
       <header
         className="flex flex-wrap items-center justify-between gap-3 px-3 py-2"
         style={{
@@ -223,16 +274,25 @@ export default function ControlTowerPage() {
         </div>
         <button
           onClick={handleRunDemo}
-          disabled={isRunningDemo}
+          disabled={isRunningDemo || autopilotRunning}
           className="px-3 py-1.5 text-[11px] font-bold tracking-[0.2em] transition disabled:opacity-50"
           style={{
-            backgroundColor: isRunningDemo ? "#1a2540" : "#0e4a3a",
-            color: isRunningDemo ? "#475569" : "#f5e9d3",
-            border: `1.5px solid ${isRunningDemo ? "#1a2540" : "#d4a843"}`,
+            backgroundColor:
+              isRunningDemo || autopilotRunning ? "#1a2540" : "#0e4a3a",
+            color:
+              isRunningDemo || autopilotRunning ? "#475569" : "#f5e9d3",
+            border: `1.5px solid ${
+              isRunningDemo || autopilotRunning ? "#1a2540" : "#d4a843"
+            }`,
             borderRadius: 3,
-            cursor: isRunningDemo ? "not-allowed" : "pointer",
-            boxShadow: isRunningDemo ? "none" : "0 0 12px #d4a84355",
+            cursor:
+              isRunningDemo || autopilotRunning ? "not-allowed" : "pointer",
+            boxShadow:
+              isRunningDemo || autopilotRunning ? "none" : "0 0 12px #d4a84355",
           }}
+          title={autopilotRunning
+            ? "Auto Pilot 실행 중에는 데모를 실행할 수 없습니다"
+            : ""}
         >
           {isRunningDemo ? "데모 실행 중..." : "▶ 데모 실행"}
         </button>
@@ -253,68 +313,111 @@ export default function ControlTowerPage() {
         </div>
       )}
 
-      {/* Single source of truth for "is the factory healthy / making
-          progress / can the operator go home" — every other panel
-          reads sub-fields of this. Never says HEALTHY when sub-systems
-          disagree (the aggregator picks the strictest verdict). */}
-      <OverallStatusBar runners={runners} />
+      {/* AUTO PILOT HERO — top-of-page primary status. Always rendered
+          first so a control_state-missing message never shows above it. */}
+      <AutoPilotHero runners={runners} />
 
-      {/* Pipeline chip — secondary status only */}
-      <PipelineTimeline
-        factory={factory}
-        agentStatuses={agentStatuses}
-        factoryEvents={factoryEvents}
+      {/* AGENT OFFICE SCENE — 8 characters, click-through to drawer. */}
+      <AgentOfficeScene
+        runners={runners}
+        selectedAgentId={selectedAgentId}
+        onAgentClick={(id) => setSelectedAgentId(id)}
       />
 
-      {/* Operations row: OperatorCommandPanel on the right, SystemLog
-          on the left taking the wide column. On mobile both stack
-          (Operator first so a phone tap on a small screen lands on
-          the input field). */}
+      {/* Operations row: SystemLog (left) + OperatorCommandPanel (right) */}
       <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <SystemLogPanel
-          events={[
-            ...events,
-            ...synthesizeCycleEvents(runners),
-            ...synthesizeDeployEvents(runners),
-            ...synthesizeWatchdogEvents(runners),
-            ...synthesizeOperatorRequestEvents(runners),
-            ...handoffLog,
-          ]}
-        />
+        <SystemLogPanel events={combinedEvents} />
         <OperatorCommandPanel runners={runners} onSent={tick} />
       </section>
 
-      {/* Main: pixel office on the left, ping-pong + artifact stack on the right.
-          On mobile/tablet the side rail collapses below. */}
-      <main className="grid flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div
-          className="relative"
-          style={{ minHeight: 600 }}
+      {/* AutoPilot knobs + per-agent accountability — current cycle data only. */}
+      <section className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <AgentAccountabilityPanel runners={runners} />
+        <AutoPilotPanel runners={runners} onSent={tick} />
+      </section>
+
+      {/* LEGACY DIAGNOSTIC — collapsed by default while Auto Pilot is
+          running so stale demo/cycle artifacts don't masquerade as
+          current. The accordion lets the operator dig back in for
+          debugging without the noise leaking onto the main scene. */}
+      <section
+        className="legacy-diagnostic flex flex-col gap-2"
+        data-testid="legacy-diagnostic"
+      >
+        <button
+          type="button"
+          onClick={() => setLegacyOpen((v) => !v)}
+          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[10px] font-bold tracking-[0.3em]"
+          style={{
+            backgroundColor: "#0a1228",
+            border: "1px dashed #1e293b",
+            color: "#94a3b8",
+            cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+          }}
         >
-          <PixelOffice
-            agentStatuses={agentStatuses}
-            bubbles={bubbles}
-            activeAgentId={activeAgentId}
-            factory={factory}
-            runners={runners}
-            onHandoff={handleHandoff}
-            forceDemoHandoff={forceDemoHandoff}
-          />
-        </div>
+          <span className="flex items-center gap-2">
+            <span style={{ color: "#d4a843" }}>{legacyOpen ? "▼" : "▶"}</span>
+            <span>LEGACY DIAGNOSTIC</span>
+            <span className="text-slate-600">
+              · pixel office · pipeline · watchdog · artifacts
+            </span>
+          </span>
+          {autopilotRunning && !legacyOpen && (
+            <span
+              className="rounded-full px-2 py-0.5 text-[9px] tracking-widest"
+              style={{
+                color: "#fbbf24",
+                border: "1px solid #fbbf2466",
+                backgroundColor: "#0a1228",
+              }}
+            >
+              Auto Pilot 실행 중에는 숨김
+            </span>
+          )}
+        </button>
 
-        <aside className="flex flex-col gap-3">
-          <AutoPilotPanel runners={runners} onSent={tick} />
-          <AgentAccountabilityPanel runners={runners} />
-          <PipelineRecoveryPanel runners={runners} />
-          <WatchdogPanel runners={runners} />
-          <CycleEffectivenessPanel runners={runners} />
-          <PingPongBoard events={events} runners={runners} />
-          <ArtifactBoard events={events} factory={factory} />
-        </aside>
-      </main>
+        {legacyOpen && (
+          <>
+            <OverallStatusBar runners={runners} />
+            <PipelineTimeline
+              factory={factory}
+              agentStatuses={agentStatuses}
+              factoryEvents={factoryEvents}
+            />
+            <main className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+              <div className="relative" style={{ minHeight: 600 }}>
+                <PixelOffice
+                  agentStatuses={agentStatuses}
+                  bubbles={bubbles}
+                  activeAgentId={activeAgentId}
+                  factory={factory}
+                  runners={runners}
+                  onHandoff={handleHandoff}
+                  forceDemoHandoff={forceDemoHandoff}
+                />
+              </div>
 
-      {/* Dock — bottom, full-width, game-style */}
-      <ControlDock factory={factory} runners={runners} onChanged={tick} />
+              <aside className="flex flex-col gap-3">
+                <PipelineRecoveryPanel runners={runners} />
+                <WatchdogPanel runners={runners} />
+                <CycleEffectivenessPanel runners={runners} />
+                <PingPongBoard events={events} runners={runners} />
+                <ArtifactBoard events={events} factory={factory} />
+              </aside>
+            </main>
+
+            <ControlDock factory={factory} runners={runners} onChanged={tick} />
+          </>
+        )}
+      </section>
+
+      <AgentDetailDrawer
+        agentId={selectedAgentId}
+        runners={runners}
+        events={combinedEvents}
+        onClose={() => setSelectedAgentId(null)}
+      />
     </div>
   );
 }

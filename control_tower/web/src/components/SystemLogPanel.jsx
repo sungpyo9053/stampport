@@ -10,8 +10,15 @@ import {
 // utils/eventClassifier.js so the same source of truth drives both
 // the chip filter and the row styling.
 //
-// Larger than ArtifactBoard by design — when something is wrong,
-// this is the panel the operator stares at.
+// Heartbeat collapse:
+//   - heartbeat events (local_runner_heartbeat) are NOISY — one tick
+//     every 1.5s drowns out the events the operator actually wants
+//     to see. They're hidden by default with a "heartbeat 보기" toggle.
+//     A small status line at the top summarizes runner online + last
+//     heartbeat time so the operator still has the pulse signal.
+//   - lifecycle events (start/stop autopilot, cycle start/verdict,
+//     git push, render smoke, health) get a gold "highlight" glow so
+//     they pop out of the firehose.
 
 const MAX_ENTRIES = 80;
 
@@ -30,6 +37,7 @@ const CATEGORY_COLOR = {
   QA:      "#fb923c",
   Git:     "#22d3ee",
   Deploy:  "#f472b6",
+  Doctor:  "#a78bfa",
   Error:   "#f87171",
 };
 
@@ -41,6 +49,21 @@ const PHASE_LABEL = {
   info:      "",
 };
 
+// Event types / message patterns that are LIFECYCLE — start/stop
+// autopilot, cycle pulses, commit/push, render/health. They get a
+// gold glow border so they don't drown in the firehose.
+const HIGHLIGHT_PATTERNS = [
+  /start_autopilot/i,
+  /stop_autopilot/i,
+  /autopilot\s+(started|stopped|failed|completed)/i,
+  /cycle\s+(started|completed|failed|produced)/i,
+  /verdict/i,
+  /commit\s+created|git\s+commit/i,
+  /git\s+push\s+(started|completed|done|success|failed)/i,
+  /render\s+smoke/i,
+  /production\s+health|health\s*check/i,
+];
+
 function fmtTime(iso) {
   if (!iso) return "—";
   try {
@@ -49,6 +72,20 @@ function fmtTime(iso) {
   } catch {
     return String(iso).slice(0, 19);
   }
+}
+
+function isHeartbeatEvent(ev) {
+  return ev?.type === "local_runner_heartbeat";
+}
+
+function isHighlightEvent(ev) {
+  if (!ev) return false;
+  const msg = ev.message || "";
+  if (!msg) return false;
+  for (const pat of HIGHLIGHT_PATTERNS) {
+    if (pat.test(msg)) return true;
+  }
+  return false;
 }
 
 function ActorPill({ actor }) {
@@ -92,12 +129,18 @@ function LogRow({ entry }) {
   const detail = entry.ev.payload && Object.keys(entry.ev.payload).length > 0
     ? entry.ev.payload
     : null;
+  const highlighted = isHighlightEvent(entry.ev);
+  const borderColor = highlighted ? "#d4a843" : `${sev.dot}33`;
   return (
     <li
-      className="rounded px-2.5 py-1.5"
+      className={
+        "rounded px-2.5 py-1.5 " +
+        (highlighted ? "system-log-highlight" : "")
+      }
       style={{
-        backgroundColor: "#0a1228",
-        border: `1px solid ${sev.dot}33`,
+        backgroundColor: highlighted ? "#150f04" : "#0a1228",
+        border: `1px solid ${borderColor}`,
+        boxShadow: highlighted ? "0 0 14px #d4a84366" : "none",
       }}
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] tracking-wider">
@@ -116,11 +159,22 @@ function LogRow({ entry }) {
             {phaseText}
           </span>
         )}
+        {highlighted && (
+          <span
+            className="rounded px-1.5 py-0.5 text-[8.5px] font-bold tracking-widest"
+            style={{
+              color: "#0a1228",
+              backgroundColor: "#d4a843",
+            }}
+          >
+            ★ KEY
+          </span>
+        )}
         <span className="ml-auto text-[9px] text-slate-600">#{entry.ev.id}</span>
       </div>
       <div
         className="mt-1 text-[12px] leading-snug"
-        style={{ color: sev.text }}
+        style={{ color: highlighted ? "#fde68a" : sev.text }}
       >
         {entry.ev.message || "(no message)"}
       </div>
@@ -143,28 +197,59 @@ function LogRow({ entry }) {
 
 export default function SystemLogPanel({ events = [] }) {
   const [filter, setFilter] = useState("All");
+  const [showHeartbeat, setShowHeartbeat] = useState(false);
 
   // Build classified entries once per `events` change. Cap to
   // MAX_ENTRIES so a long-running session doesn't render thousands
   // of DOM nodes.
   const allEntries = useMemo(() => buildSystemLogEntries(events), [events]);
 
-  const filtered = useMemo(() => {
-    const visible = filter === "All"
-      ? allEntries
-      : allEntries.filter((e) => e.category === filter);
-    return visible.slice(0, MAX_ENTRIES);
-  }, [allEntries, filter]);
+  // Heartbeat summary — runner online + last heartbeat time. Computed
+  // from raw events because allEntries already filters them out via
+  // the classifier (heartbeats sit at category=Runner severity=info,
+  // type=local_runner_heartbeat).
+  const heartbeatSummary = useMemo(() => {
+    let last = null;
+    let count = 0;
+    for (const ev of events) {
+      if (isHeartbeatEvent(ev)) {
+        count += 1;
+        if (!last || (ev.id || 0) > (last.id || 0)) last = ev;
+      }
+    }
+    return { last, count };
+  }, [events]);
 
-  // Per-category counts for the chip badges. "All" shows the total.
+  const filtered = useMemo(() => {
+    let visible = allEntries;
+    if (!showHeartbeat) {
+      visible = visible.filter((e) => !isHeartbeatEvent(e.ev));
+    }
+    if (filter !== "All") {
+      visible = visible.filter((e) => e.category === filter);
+    }
+    return visible.slice(0, MAX_ENTRIES);
+  }, [allEntries, filter, showHeartbeat]);
+
+  // Per-category counts for the chip badges (always exclude heartbeat
+  // unless the toggle is on, so the chip numbers reflect what's
+  // actually visible).
   const counts = useMemo(() => {
-    const m = { All: allEntries.length };
+    const base = showHeartbeat
+      ? allEntries
+      : allEntries.filter((e) => !isHeartbeatEvent(e.ev));
+    const m = { All: base.length };
     for (const cat of SYSTEM_LOG_CATEGORIES) {
       if (cat === "All") continue;
-      m[cat] = allEntries.filter((e) => e.category === cat).length;
+      m[cat] = base.filter((e) => e.category === cat).length;
     }
     return m;
-  }, [allEntries]);
+  }, [allEntries, showHeartbeat]);
+
+  const heartbeatLast = heartbeatSummary.last;
+  const heartbeatLabel = heartbeatLast
+    ? `RUNNER · last heartbeat ${fmtTime(heartbeatLast.created_at)} (${heartbeatSummary.count} ticks)`
+    : "RUNNER · heartbeat 대기 중";
 
   return (
     <section
@@ -187,12 +272,47 @@ export default function SystemLogPanel({ events = [] }) {
             SYSTEM LOG
           </span>
           <span className="text-[9.5px] tracking-widest text-slate-500">
-            runner · command · claude · build · QA · git · deploy
+            autopilot · cycle · git · deploy · errors
           </span>
         </div>
         <span className="text-[10px] tracking-widest text-slate-500">
           {filtered.length} / {allEntries.length}
         </span>
+      </div>
+
+      {/* Heartbeat summary strip — replaces the heartbeat firehose with
+          one line of "runner is alive". */}
+      <div
+        className="flex flex-wrap items-center gap-2 rounded px-2 py-1 text-[9.5px] tracking-widest"
+        data-testid="system-log-heartbeat-strip"
+        style={{
+          backgroundColor: "#0a1228",
+          border: "1px solid #1e293b",
+          color: "#94a3b8",
+        }}
+      >
+        <span
+          className="inline-block h-1.5 w-1.5 rounded-full"
+          style={{
+            backgroundColor: heartbeatLast ? "#34d399" : "#475569",
+            boxShadow: heartbeatLast ? "0 0 8px #34d39966" : "none",
+          }}
+        />
+        <span>{heartbeatLabel}</span>
+        <button
+          type="button"
+          onClick={() => setShowHeartbeat((v) => !v)}
+          className="ml-auto rounded px-2 py-0.5 text-[9px] font-bold tracking-widest transition"
+          style={{
+            color: showHeartbeat ? "#0a1228" : "#94a3b8",
+            backgroundColor: showHeartbeat ? "#d4a843" : "#0a1228",
+            border: "1px solid #d4a84366",
+            cursor: "pointer",
+          }}
+          data-testid="heartbeat-toggle"
+        >
+          {showHeartbeat ? "heartbeat 숨기기" : "heartbeat 보기"}
+        </button>
       </div>
 
       {/* Category filter chips */}

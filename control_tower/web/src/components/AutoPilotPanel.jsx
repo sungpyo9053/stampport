@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { startAutopilot, stopAutopilot } from "../api/controlTowerApi.js";
 
 // Auto Pilot Publish panel.
@@ -8,6 +8,13 @@ import { startAutopilot, stopAutopilot } from "../api/controlTowerApi.js";
 // in turn surfaces .runtime/autopilot_state.json. Posts start/stop
 // commands through the runner queue (allowlisted as start_autopilot /
 // stop_autopilot in schemas.py).
+//
+// Two visual modes:
+//   - Idle / stopped / failed → form is editable, defaults from a
+//     localStorage-saved draft (so the operator's last config sticks).
+//   - Running / stopping     → inputs are disabled and bound to the
+//     ACTUAL runtime config (autopilot_state.json), not the draft.
+//     Mode select must NOT flip back to safe_run while running.
 
 const MODE_LABEL = {
   safe_run: "Safe Run (cycle만 실행)",
@@ -16,11 +23,14 @@ const MODE_LABEL = {
 };
 
 const STATUS_TONE = {
-  idle: { color: "#64748b", label: "대기" },
-  running: { color: "#34d399", label: "실행 중" },
-  stopped: { color: "#94a3b8", label: "정지" },
-  failed: { color: "#f87171", label: "실패" },
+  idle:     { color: "#64748b", label: "대기" },
+  running:  { color: "#34d399", label: "실행 중" },
+  stopping: { color: "#fbbf24", label: "정지 중" },
+  stopped:  { color: "#94a3b8", label: "정지" },
+  failed:   { color: "#f87171", label: "실패" },
 };
+
+const DRAFT_KEY = "stampport.autopilot.draft.v1";
 
 function pickAutopilot(runners = []) {
   for (const r of runners) {
@@ -28,6 +38,24 @@ function pickAutopilot(runners = []) {
     if (ap) return { runnerId: r.id, state: ap };
   }
   return { runnerId: runners?.[0]?.id || null, state: null };
+}
+
+function loadDraft() {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(DRAFT_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveDraft(draft) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+  } catch {
+    /* quota / private-mode — ignore */
+  }
 }
 
 function fmtIso(iso) {
@@ -64,21 +92,81 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     [runners],
   );
 
-  const [mode, setMode] = useState(state?.mode || "safe_run");
-  const [maxCycles, setMaxCycles] = useState(state?.max_cycles || 5);
-  const [maxHours, setMaxHours] = useState(state?.max_hours || 6);
-  const [stopOnHold, setStopOnHold] = useState(
-    state?.stop_on_hold !== undefined ? !!state.stop_on_hold : true,
-  );
-  const [requireRender, setRequireRender] = useState(true);
-  const [requireHealth, setRequireHealth] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [feedback, setFeedback] = useState("");
-
   const status = state?.status || "idle";
+  const isRunning = status === "running";
+  const isStopping = status === "stopping";
+  const isLocked = isRunning || isStopping;
+
+  // Draft (idle defaults) — only used when not locked. The form values
+  // below READ from running state when locked; the draft is what the
+  // operator was last typing in.
+  const [draft, setDraft] = useState(() => {
+    const d = loadDraft();
+    return {
+      mode: d.mode || "safe_run",
+      maxCycles: d.maxCycles || 5,
+      maxHours: d.maxHours || 6,
+      stopOnHold: d.stopOnHold !== undefined ? !!d.stopOnHold : true,
+      requireRender: d.requireRender !== undefined ? !!d.requireRender : true,
+      requireHealth: d.requireHealth !== undefined ? !!d.requireHealth : true,
+    };
+  });
+
+  useEffect(() => {
+    if (!isLocked) saveDraft(draft);
+  }, [draft, isLocked]);
+
+  // Local "stop request in flight" state — flips on click and is
+  // cleared once the runner reports status=stopping or stopped.
+  const [stopRequested, setStopRequested] = useState(false);
+  const prevStatusRef = useRef(status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    if (prev !== status) {
+      // Once the runner has acknowledged (status moved off "running"
+      // toward stopping/stopped), clear the local "requested" flag.
+      if (prev === "running" && (status === "stopping" || status === "stopped")) {
+        setStopRequested(false);
+      }
+      // If the runner reports running fresh (e.g. user started again),
+      // clear stale stop request state too.
+      if (prev !== "running" && status === "running") {
+        setStopRequested(false);
+      }
+      prevStatusRef.current = status;
+    }
+  }, [status]);
+
   const tone = STATUS_TONE[status] || STATUS_TONE.idle;
-  const cycleCount = state?.cycle_count || 0;
-  const totalCycles = state?.max_cycles || maxCycles;
+  const cycleCount = state?.cycle_count ?? 0;
+  const totalCycles = state?.max_cycles ?? draft.maxCycles;
+
+  // Effective values: when locked, mirror runtime state so the UI shows
+  // what the autopilot is *actually* using — not whatever the operator
+  // happened to type before they hit start.
+  const effectiveMode = isLocked
+    ? (state?.mode || draft.mode)
+    : draft.mode;
+  const effectiveMaxCycles = isLocked
+    ? (state?.max_cycles ?? draft.maxCycles)
+    : draft.maxCycles;
+  const effectiveMaxHours = isLocked
+    ? (state?.max_hours ?? draft.maxHours)
+    : draft.maxHours;
+  const effectiveStopOnHold = isLocked
+    ? (state?.stop_on_hold !== undefined ? !!state.stop_on_hold : draft.stopOnHold)
+    : draft.stopOnHold;
+  const effectiveRequireRender = isLocked
+    ? (state?.require_render_check !== undefined
+        ? !!state.require_render_check
+        : draft.requireRender)
+    : draft.requireRender;
+  const effectiveRequireHealth = isLocked
+    ? (state?.require_api_health !== undefined
+        ? !!state.require_api_health
+        : draft.requireHealth)
+    : draft.requireHealth;
+
   const lastVerdict = state?.last_verdict || "—";
   const lastFailure = state?.last_failure_code || "";
   const lastCommit = (state?.last_commit_hash || "").slice(0, 8) || "—";
@@ -88,9 +176,11 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   const stopReason = state?.stop_reason || "—";
   const reportPath = state?.report_path || ".runtime/autopilot_report.md";
 
-  const isRunning = status === "running";
-  const canStart = !!runnerId && !busy && !isRunning;
-  const canStop = !!runnerId && !busy && isRunning;
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState("");
+
+  const canStart = !!runnerId && !busy && !isLocked && !stopRequested;
+  const canStop = !!runnerId && !busy && (isRunning || isStopping) && !stopRequested;
 
   async function handleStart() {
     if (!runnerId) {
@@ -102,13 +192,13 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     try {
       await startAutopilot(runnerId, {
         autopilot_enabled: true,
-        autopilot_mode: mode,
-        max_cycles: Number(maxCycles) || 5,
-        max_hours: Number(maxHours) || 6,
-        stop_on_hold: !!stopOnHold,
+        autopilot_mode: draft.mode,
+        max_cycles: Number(draft.maxCycles) || 5,
+        max_hours: Number(draft.maxHours) || 6,
+        stop_on_hold: !!draft.stopOnHold,
         require_scope_consistency: true,
-        require_render_check: !!requireRender,
-        require_api_health: !!requireHealth,
+        require_render_check: !!draft.requireRender,
+        require_api_health: !!draft.requireHealth,
       });
       setFeedback("Auto Pilot 시작 요청 완료 — 다음 heartbeat 에서 상태가 갱신됩니다.");
       onSent && onSent();
@@ -121,22 +211,46 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
 
   async function handleStop() {
     if (!runnerId) return;
+    // Optimistic: flip the UI immediately so the operator sees "정지
+    // 요청 중" without waiting for the next heartbeat.
+    setStopRequested(true);
     setBusy(true);
     setFeedback("");
     try {
       await stopAutopilot(runnerId, "operator stop from dashboard");
-      setFeedback("Auto Pilot 정지 요청 완료.");
+      setFeedback("Auto Pilot 정지 요청 완료 — 현재 cycle 종료를 기다립니다.");
       onSent && onSent();
     } catch (e) {
+      setStopRequested(false);
       setFeedback(`정지 실패: ${e.message || e}`);
     } finally {
       setBusy(false);
     }
   }
 
+  // Compose stop button label so the operator always sees the right
+  // phase. The runner currently writes status=running until the cycle
+  // finishes then flips to stopped — there's no real "stopping" tick
+  // in between. So the UI synthesizes it from `stopRequested`: the
+  // moment the operator clicks Stop the button immediately reads
+  // "정지 요청 중", and once the heartbeat confirms the loop has
+  // actually torn down (status=stopped) the local flag clears.
+  let stopLabel = "정지";
+  if (stopRequested && isRunning) stopLabel = "정지 요청 중 — 현재 cycle 종료 후 정지";
+  else if (stopRequested) stopLabel = "정지 요청 중...";
+  else if (isStopping) stopLabel = "현재 cycle 종료 후 정지";
+  else if (status === "stopped") stopLabel = "정지됨";
+
+  const startLabel = (() => {
+    if (busy) return "처리 중...";
+    if (isRunning) return "실행 중";
+    if (isStopping) return "정지 중";
+    return "Auto Pilot 시작";
+  })();
+
   return (
     <section
-      className="flex flex-col gap-2 p-3"
+      className="autopilot-panel flex flex-col gap-2 p-3"
       data-testid="autopilot-panel"
       style={{
         backgroundColor: "#0e1a35",
@@ -163,6 +277,18 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
           >
             {tone.label}
           </span>
+          {stopRequested && (
+            <span
+              className="rounded px-1.5 py-0.5 text-[9px] font-bold tracking-widest"
+              style={{
+                color: "#fbbf24",
+                border: "1px solid #fbbf2466",
+                backgroundColor: "#0a1228",
+              }}
+            >
+              STOP REQUESTED
+            </span>
+          )}
         </div>
         <span className="text-[10px] text-slate-500">
           runner: {runnerId || "(none)"}
@@ -171,12 +297,19 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
 
       <div className="grid grid-cols-2 gap-2 text-[11px]">
         <label className="col-span-2 flex flex-col gap-1">
-          <span className="text-slate-400">모드</span>
+          <span className="text-slate-400">
+            모드{isLocked && (
+              <span className="ml-2 text-[9px] tracking-widest text-emerald-400">
+                · runtime config
+              </span>
+            )}
+          </span>
           <select
-            value={mode}
-            disabled={isRunning}
-            onChange={(e) => setMode(e.target.value)}
+            value={effectiveMode}
+            disabled={isLocked}
+            onChange={(e) => setDraft((d) => ({ ...d, mode: e.target.value }))}
             className="rounded bg-slate-800 px-2 py-1 text-slate-100 disabled:opacity-50"
+            data-testid="autopilot-mode-select"
           >
             {Object.entries(MODE_LABEL).map(([k, v]) => (
               <option key={k} value={k}>{v}</option>
@@ -190,10 +323,13 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
             type="number"
             min={1}
             max={50}
-            value={maxCycles}
-            disabled={isRunning}
-            onChange={(e) => setMaxCycles(e.target.value)}
+            value={effectiveMaxCycles}
+            disabled={isLocked}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, maxCycles: e.target.value }))
+            }
             className="rounded bg-slate-800 px-2 py-1 text-slate-100 disabled:opacity-50"
+            data-testid="autopilot-max-cycles"
           />
         </label>
 
@@ -204,19 +340,24 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
             min={0.1}
             max={48}
             step={0.5}
-            value={maxHours}
-            disabled={isRunning}
-            onChange={(e) => setMaxHours(e.target.value)}
+            value={effectiveMaxHours}
+            disabled={isLocked}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, maxHours: e.target.value }))
+            }
             className="rounded bg-slate-800 px-2 py-1 text-slate-100 disabled:opacity-50"
+            data-testid="autopilot-max-hours"
           />
         </label>
 
         <label className="col-span-2 flex items-center gap-2">
           <input
             type="checkbox"
-            checked={stopOnHold}
-            disabled={isRunning}
-            onChange={(e) => setStopOnHold(e.target.checked)}
+            checked={effectiveStopOnHold}
+            disabled={isLocked}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, stopOnHold: e.target.checked }))
+            }
           />
           <span className="text-slate-300">Stop on HOLD</span>
         </label>
@@ -224,9 +365,11 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
-            checked={requireRender}
-            disabled={isRunning}
-            onChange={(e) => setRequireRender(e.target.checked)}
+            checked={effectiveRequireRender}
+            disabled={isLocked}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, requireRender: e.target.checked }))
+            }
           />
           <span className="text-slate-300">Render smoke</span>
         </label>
@@ -234,9 +377,11 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
-            checked={requireHealth}
-            disabled={isRunning}
-            onChange={(e) => setRequireHealth(e.target.checked)}
+            checked={effectiveRequireHealth}
+            disabled={isLocked}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, requireHealth: e.target.checked }))
+            }
           />
           <span className="text-slate-300">Production health</span>
         </label>
@@ -258,8 +403,9 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
               ? "bg-amber-500 text-slate-950 hover:bg-amber-400"
               : "cursor-not-allowed bg-slate-800/60 text-slate-500")
           }
+          data-testid="autopilot-start"
         >
-          {isRunning ? "실행 중" : "Auto Pilot 시작"}
+          {startLabel}
         </button>
         <button
           type="button"
@@ -271,8 +417,9 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
               ? "bg-rose-500 text-slate-50 hover:bg-rose-400"
               : "cursor-not-allowed bg-slate-800/60 text-slate-500")
           }
+          data-testid="autopilot-stop"
         >
-          정지
+          {stopLabel}
         </button>
       </div>
 

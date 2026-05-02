@@ -37,3 +37,121 @@ body {
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.5);
 }
+
+/* -----------------------------------------------------------------
+   Agent Office Scene + Auto Pilot Hero — Instagram-Reels animations.
+
+   prefers-reduced-motion: every animation in this block is wrapped
+   in a feature-detection block at the bottom that disables movement
+   for users who asked for it.
+   ----------------------------------------------------------------- */
+
+@keyframes autopilotPulse {
+  0%, 100% { transform: scale(1);   opacity: 1;   }
+  50%      { transform: scale(1.3); opacity: 0.6; }
+}
+
+.autopilot-pulse {
+  animation: autopilotPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes agentOfficeBounce {
+  0%, 100% { transform: translateY(0);     }
+  50%      { transform: translateY(-3px);  }
+}
+
+.agent-office-bounce {
+  animation: agentOfficeBounce 1.6s ease-in-out infinite;
+}
+
+@keyframes agentOfficeTyping {
+  0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-2px); }
+}
+
+.agent-office-typing span {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  margin-right: 1px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: agentOfficeTyping 1.2s ease-in-out infinite;
+}
+.agent-office-typing span:nth-child(2) { animation-delay: 0.15s; }
+.agent-office-typing span:nth-child(3) { animation-delay: 0.3s;  }
+
+@keyframes agentOfficeBubbleIn {
+  from { opacity: 0; transform: translate(-50%, calc(-100% + 6px)); }
+  to   { opacity: 1; transform: translate(-50%, -100%);             }
+}
+
+.agent-office-bubble {
+  animation: agentOfficeBubbleIn 0.4s ease-out;
+}
+
+@keyframes agentOfficeStamp {
+  0%   { transform: scale(0)   rotate(-15deg); opacity: 0; }
+  60%  { transform: scale(1.2) rotate(8deg);   opacity: 1; }
+  100% { transform: scale(1)   rotate(0deg);   opacity: 1; }
+}
+
+.agent-office-stamp {
+  animation: agentOfficeStamp 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+@keyframes agentOfficeAlert {
+  0%, 100% { transform: scale(1);   }
+  50%      { transform: scale(1.18); }
+}
+
+.agent-office-alert {
+  animation: agentOfficeAlert 0.9s ease-in-out infinite;
+}
+
+@keyframes systemLogHighlightGlow {
+  0%, 100% { box-shadow: 0 0 14px rgba(212, 168, 67, 0.4); }
+  50%      { box-shadow: 0 0 22px rgba(212, 168, 67, 0.7); }
+}
+
+.system-log-highlight {
+  animation: systemLogHighlightGlow 2.2s ease-in-out infinite;
+}
+
+/* Drawer slide-in from the right edge. */
+@keyframes agentDetailSlideIn {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0);    }
+}
+
+.agent-detail-panel {
+  animation: agentDetailSlideIn 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* prefers-reduced-motion: kill the bounce/pulse/typing/glow animations
+   so the office still works for users who asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .autopilot-pulse,
+  .agent-office-bounce,
+  .agent-office-typing span,
+  .agent-office-stamp,
+  .agent-office-alert,
+  .agent-office-bubble,
+  .system-log-highlight,
+  .agent-detail-panel {
+    animation: none !important;
+  }
+}
+
+/* Mobile 390px sanity — keep agent cards from overflowing horizontally
+   when the row is dense. The grid auto-shrinks but the bubble was
+   leaking past the edge on iPhone-sized viewports. */
+@media (max-width: 420px) {
+  .agent-office-bubble {
+    max-width: 140px;
+    font-size: 10px;
+  }
+  .autopilot-stat-chip {
+    min-width: 72px;
+  }
+}
