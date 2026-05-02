@@ -10,6 +10,7 @@ import CycleEffectivenessPanel from "../components/CycleEffectivenessPanel.jsx";
 import WatchdogPanel from "../components/WatchdogPanel.jsx";
 import PipelineRecoveryPanel from "../components/PipelineRecoveryPanel.jsx";
 import AgentAccountabilityPanel from "../components/AgentAccountabilityPanel.jsx";
+import AutoPilotPanel from "../components/AutoPilotPanel.jsx";
 import OverallStatusBar from "../components/OverallStatusBar.jsx";
 import {
   fetchAgents,
@@ -302,6 +303,7 @@ export default function ControlTowerPage() {
         </div>
 
         <aside className="flex flex-col gap-3">
+          <AutoPilotPanel runners={runners} onSent={tick} />
           <AgentAccountabilityPanel runners={runners} />
           <PipelineRecoveryPanel runners={runners} />
           <WatchdogPanel runners={runners} />

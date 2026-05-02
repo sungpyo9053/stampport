@@ -86,4 +86,10 @@ export const sendRunnerCommand = (runnerId, command, payload = {}) =>
     payload,
   });
 
+export const startAutopilot = (runnerId, payload = {}) =>
+  sendRunnerCommand(runnerId, "start_autopilot", payload);
+
+export const stopAutopilot = (runnerId, reason = "operator stop") =>
+  sendRunnerCommand(runnerId, "stop_autopilot", { reason });
+
 export { API_BASE };

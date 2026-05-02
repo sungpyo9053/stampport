@@ -259,6 +259,13 @@ ALLOWED_COMMANDS: tuple[str, ...] = (
     # for refusing to commit/push on validation/secret/conflict
     # failures. The dashboard sends payload {prompt, auto_commit_push}.
     "operator_request",
+    # Auto Pilot Publish — Control Tower button drives the factory
+    # cycle in a loop. The runner handler delegates to the autopilot
+    # module which spawns factory_smoke per cycle, runs the publish
+    # gate (qa + scope + render smoke + secret scan + production
+    # health), and only commits/pushes when every gate passes.
+    "start_autopilot",
+    "stop_autopilot",
 )
 
 

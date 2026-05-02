@@ -441,6 +441,60 @@ def _h_test_check(_payload: dict) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Auto Pilot Publish handlers
+# ---------------------------------------------------------------------------
+#
+# The dashboard's Auto Pilot toggle enqueues `start_autopilot` /
+# `stop_autopilot` commands. The handlers here are tiny — the real work
+# (factory_smoke loop + publish gate + render smoke + production health)
+# lives in control_tower.local_runner.autopilot so it stays self-test-
+# able without dragging the whole runner module in.
+
+
+def _h_start_autopilot(payload: dict) -> tuple[bool, str]:
+    try:
+        from . import autopilot as _autopilot
+    except Exception as exc:  # noqa: BLE001
+        return False, f"autopilot import failed: {exc}"
+    cfg = _autopilot.AutopilotConfig.from_payload(payload or {})
+    if not cfg.autopilot_enabled:
+        return False, "autopilot_enabled=false in payload"
+    ok, msg = _autopilot.start(cfg)
+    return ok, msg
+
+
+def _h_stop_autopilot(payload: dict) -> tuple[bool, str]:
+    try:
+        from . import autopilot as _autopilot
+    except Exception as exc:  # noqa: BLE001
+        return False, f"autopilot import failed: {exc}"
+    reason = (payload or {}).get("reason") or "operator stop"
+    ok, msg = _autopilot.stop(str(reason))
+    # `stop` returns False when the loop wasn't running — surface it as
+    # success-with-note so a duplicate click doesn't paint the UI red.
+    return True, msg
+
+
+def _build_autopilot_meta() -> dict:
+    """Compose the heartbeat's `metadata.local_factory.autopilot` block.
+
+    Reads .runtime/autopilot_state.json best-effort. Empty payload when
+    autopilot has never run on this runner."""
+    state_file = RUNTIME_DIR / "autopilot_state.json"
+    if not state_file.is_file():
+        return {"status": "idle"}
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8")) or {}
+    except (json.JSONDecodeError, OSError):
+        return {"status": "idle"}
+    # Cap history length so heartbeats stay small.
+    history = data.get("history") or []
+    if isinstance(history, list) and len(history) > 20:
+        data = {**data, "history": history[-20:]}
+    return data
+
+
+# ---------------------------------------------------------------------------
 # publish_changes helpers
 # ---------------------------------------------------------------------------
 
@@ -4391,6 +4445,8 @@ COMMAND_HANDLERS: dict[str, Callable[[dict], tuple[bool, str]]] = {
     "operator_fix_request":    _h_operator_fix_request,
     "operator_fix_and_publish": _h_operator_fix_and_publish,
     "operator_request":        _h_operator_request,
+    "start_autopilot":         _h_start_autopilot,
+    "stop_autopilot":          _h_stop_autopilot,
 }
 
 
@@ -8168,6 +8224,7 @@ def _build_local_factory_meta() -> dict:
         # the dashboard can decide enabled=true/false on the runner
         # side, instead of every consumer guessing.
         "ping_pong": _build_pingpong_meta(state),
+        "autopilot": _build_autopilot_meta(),
         "log_tail": _log_tail(8),
     }
 
