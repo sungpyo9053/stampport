@@ -2039,9 +2039,9 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 한 문장으로 구체화한 핵심 병목 1개. 추상명 X.
 근거: `path:line` (또는 화면 동작 사례)
 
-## 신규 장치 아이디어 후보
+## 신규 기능 아이디어 후보
 
-| 장치 | 자극하는 욕구(2개 이상) | 사용자 가치 | 구현 난이도 | 제품 임팩트 | 리스크 |
+| 기능 | 자극하는 욕구(2개 이상) | 사용자 가치 | 구현 난이도 | 제품 임팩트 | 리스크 |
 |---|---|---|---|---|---|
 | 후보1 | 예: 수집욕 + 과시욕 | ... | 낮/중/높 | 낮/중/높 | ... |
 | 후보2 | 다른 조합 | ... | ... | ... | ... |
@@ -2077,8 +2077,8 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 - 기대 행동 변화: ...
 - 디자이너에게 던질 질문: ...
 
-## 이번 사이클 선정 장치
-선정한 장치명 한 줄. Stampport 톤의 고유 이름.
+## 이번 사이클 선정 기능
+선정한 기능명 한 줄. Stampport 톤의 고유 이름.
 
 ## 선정 이유
 이번 병목을 가장 잘 해결하는 이유 한 문단.
@@ -2132,24 +2132,155 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 """
 
 
+def _load_pm_hold_rework_context() -> str:
+    """If the previous cycle's PM verdict was HOLD, build a
+    "Previous PM HOLD" rework context block to prepend to the next
+    planner prompt.
+
+    Reads pm_decision.md (출하 결정 / 결정 이유 / 다음 단계 담당) and
+    designer_final_review.md (욕구 점수표 / 약점). Returns "" when
+    there's no HOLD signal so callers can use the boolean-ish return.
+
+    The block is *advisory* — the planner is told the prior cycle's
+    weakness must be the bottleneck of this cycle, not a free choice
+    of new candidates.
+    """
+    pm_md = _read_artifact(PM_DECISION_FILE) or ""
+    designer_md = _read_artifact(DESIGNER_FINAL_REVIEW_FILE) or ""
+    if not pm_md.strip():
+        return ""
+
+    decision = _extract_md_section(pm_md, "출하 결정").lower()
+    if "hold" not in decision:
+        return ""
+
+    reason = _extract_md_section(pm_md, "결정 이유")
+    next_owners = _extract_md_section(pm_md, "다음 단계 담당")
+    qa_extra = _extract_md_section(pm_md, "QA가 추가로 점검할 것")
+    weaknesses = _extract_md_section(designer_md, "약점")
+    score_section = _extract_md_section(designer_md, "욕구 점수표")
+    final = _extract_md_section(designer_md, "최종 판단")
+
+    score_summary = ""
+    if score_section:
+        # Pull all "| <축> | <n> |" rows so the next planner sees the
+        # exact gates it must close. Cheap heuristic — anything with a
+        # standalone digit 1-5 in cell 2 counts.
+        rows: list[str] = []
+        for line in score_section.splitlines():
+            s = line.strip()
+            if not s.startswith("|") or not s.endswith("|"):
+                continue
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if len(cells) >= 2 and re.fullmatch(r"[1-5]", cells[1]):
+                rows.append(f"  - {cells[0]}: {cells[1]} / 5")
+        if rows:
+            score_summary = "\n".join(rows)
+
+    pieces: list[str] = [
+        "=== Previous PM HOLD (직전 사이클 재작업 입력) ===",
+        "이번 사이클은 직전 사이클의 PM HOLD 지시를 해소하는 **rework cycle** 이다.",
+        "직전 약점을 무시하고 새 후보 3개를 무작위로 제안하지 마라. 기존 HOLD 해소가 최우선 병목이다.",
+        "",
+        "## PM 출하 결정",
+        "- hold (재작업 후 다음 사이클)",
+    ]
+    if reason:
+        pieces += ["", "## 결정 이유", reason.strip()]
+    if score_summary:
+        pieces += ["", "## 직전 미달 점수 (욕구 점수표)", score_summary]
+    if weaknesses:
+        pieces += ["", "## 디자이너가 지적한 약점", weaknesses.strip()]
+    if next_owners:
+        pieces += ["", "## PM 다음 단계 담당", next_owners.strip()]
+    if qa_extra:
+        pieces += ["", "## QA 추가 점검 항목", qa_extra.strip()]
+    if final:
+        pieces += ["", "## 디자이너 최종 판단", final.strip()]
+
+    pieces += [
+        "",
+        "## 이번 사이클이 반드시 만족해야 할 제약",
+        "- 직전 약점 (위 \"디자이너가 지적한 약점\" 섹션) 을 해소할 후보 1개 선정.",
+        "- PM \"다음 단계 담당\" 의 디자이너/기획자 항목을 그대로 후보의 구현 범위에 포함.",
+        "- `selectedTitle` 이 string 인 문제, 잠금 조건이 `progress === 0` 인 문제,"
+        " ShareCard 칭호 라인 위치, SVG 배지 3종 (원형/방패/왕관) 등 직전 PM 결정에 명시된 구현 구멍을 다루는 후보를 우선.",
+        "- 후보 3개 중 최소 1개는 직전 HOLD 사유와 직접적으로 연결되어야 한다.",
+        "- 새 후보가 직전 약점을 우회하기만 하면 안 된다 — 해소를 명시적으로 제안하라.",
+        "=== END Previous PM HOLD ===",
+        "",
+    ]
+    return "\n".join(pieces)
+
+
 def _build_product_planner_prompt(goal: str) -> str:
     profile = _load_stampport_profile_text()
     collab = _load_agent_collab_text()
-    return PRODUCT_PLANNER_PROMPT_TEMPLATE.format(
+    base = PRODUCT_PLANNER_PROMPT_TEMPLATE.format(
         goal=goal.strip() or DEFAULT_GOAL,
         domain_profile=profile or "(stampport.json 미존재)",
         collab_doc=collab or "(agent-collaboration.md 미존재)",
     )
+    rework = _load_pm_hold_rework_context()
+    if rework:
+        # Prepend rework context so the LLM reads the constraint
+        # *before* the role description. We keep the role intro intact
+        # below so the planner's behavior contract is unchanged.
+        return rework + base
+    return base
+
+
+# Planner heading aliases — accepted variants for the canonical
+# "기능" headings. The earlier prompt iterations used "장치" instead
+# of "기능" so old / out-of-date Claude outputs would fail the gate
+# even though the body shape was fine. We accept the alias at parse /
+# validate time and rewrite to the canonical form via
+# `_normalize_planner_body` so downstream stages see one shape.
+PLANNER_HEADING_ALIASES: dict[str, tuple[str, ...]] = {
+    "신규 기능 아이디어 후보": ("신규 장치 아이디어 후보",),
+    "이번 사이클 선정 기능":   ("이번 사이클 선정 장치",),
+}
+
+
+def _heading_variants(heading: str) -> tuple[str, ...]:
+    aliases = PLANNER_HEADING_ALIASES.get(heading, ())
+    return (heading, *aliases)
 
 
 def _extract_md_section(md: str, heading: str) -> str:
-    """Return the body under '## heading' until the next ## or end-of-doc."""
-    pat = (
-        r"^##\s+" + re.escape(heading)
-        + r"\s*\n(.*?)(?=\n##\s|\Z)"
-    )
-    m = re.search(pat, md, re.MULTILINE | re.DOTALL)
-    return m.group(1).strip() if m else ""
+    """Return the body under '## heading' until the next ## or end-of-doc.
+
+    Tries every accepted alias for `heading` before giving up — see
+    `PLANNER_HEADING_ALIASES`. The first match wins.
+    """
+    for variant in _heading_variants(heading):
+        pat = (
+            r"^##\s+" + re.escape(variant)
+            + r"\s*\n(.*?)(?=\n##\s|\Z)"
+        )
+        m = re.search(pat, md, re.MULTILINE | re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _normalize_planner_body(body: str) -> str:
+    """Rewrite alias headings to the canonical "기능" form so downstream
+    parsers / readers see one shape. Idempotent — running twice is safe.
+
+    Only operates on `## ` headings so prose text containing the alias
+    word ("이 장치는 ...") is left alone.
+    """
+    out = body
+    for canonical, aliases in PLANNER_HEADING_ALIASES.items():
+        for alias in aliases:
+            out = re.sub(
+                r"^##\s+" + re.escape(alias) + r"\s*$",
+                f"## {canonical}",
+                out,
+                flags=re.MULTILINE,
+            )
+    return out
 
 
 def _strip_md_emphasis(line: str) -> str:
@@ -2724,6 +2855,11 @@ def stage_product_planning(state: CycleState) -> StageResult:
         )
         return sr
     body = body[idx:].rstrip()
+
+    # Repair-normalize: rewrite heading aliases ("장치" → "기능") to
+    # the canonical form so the gate doesn't punish the LLM for using
+    # the older prompt's wording. Idempotent.
+    body = _normalize_planner_body(body)
 
     # Quality gate — refuse to advance with a half-baked plan. Instead
     # of bailing, fall back to the safe template so downstream stages

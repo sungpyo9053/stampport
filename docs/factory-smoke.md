@@ -72,6 +72,7 @@ All paths are relative to the repository's `.runtime/` directory.
 | `factory_smoke.log`               | Always                     | Chronological log of the smoke run + the cycle subprocess's stdout.    |
 | `factory_failure_report.md`       | When `verdict == FAIL`     | Failure report with Observer evidence and stage table.                 |
 | `claude_repair_prompt.md`         | When `verdict == FAIL`     | Claude-direct repair prompt with target files + verification steps.    |
+| `claude_rework_prompt.md`         | When `verdict == HOLD`     | Next-cycle planner input — PM HOLD 약점 / 다음 단계 / 미달 점수 정리. |
 
 ## Default-safe environment
 
@@ -120,6 +121,14 @@ verdict is `HOLD` — a non-failure outcome. The operator can opt out
 with `FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT=true` for cases where the
 planner-rework loop is broken and forward progress is required anyway.
 
+When verdict is `HOLD`, the smoke runner writes
+`.runtime/claude_rework_prompt.md` (not `claude_repair_prompt.md` —
+nothing failed). The next cycle's `stage_product_planning` reads
+`pm_decision.md` + `designer_final_review.md` and prepends a
+`Previous PM HOLD` section to the planner prompt so the next planner
+treats the prior weakness as the bottleneck instead of proposing a
+fresh, unrelated set of candidates.
+
 ## implementation_ticket statuses
 
 | Status                              | Meaning                                                                  |
@@ -145,7 +154,7 @@ planner-rework loop is broken and forward progress is required anyway.
 ## Self-test fixtures
 
 `python3 -m control_tower.local_runner.factory_smoke --self-test`
-runs eleven acceptance fixtures, all stdlib-only, no `claude` calls
+runs fifteen acceptance fixtures, all stdlib-only, no `claude` calls
 required:
 
 1. **fresh runtime** → `fresh_idle` (info, healthy).
@@ -159,6 +168,10 @@ required:
 9. **smoke timeout** → repair prompt mentions `smoke_timeout` + the suspect stage.
 10. **multi-state mock** → verdict resolves to `PASS` / `READY_TO_REVIEW` / `HOLD`.
 11. **output writers** → `factory_smoke_state.json` + report always emitted.
+12. **planner heading contract** — both `## 신규 기능 아이디어 후보` and the legacy `## 신규 장치 아이디어 후보` alias pass the gate; selected feature extracts under both `이번 사이클 선정 기능` and `이번 사이클 선정 장치`.
+13. **PM HOLD rework prompt** — `verdict == HOLD` writes `.runtime/claude_rework_prompt.md`, leaves `claude_repair_prompt.md` absent, and surfaces the rework path in `factory_smoke_report.md`.
+14. **PM HOLD planner injection** — when `pm_decision.md` says hold, the next planner prompt prepends a `Previous PM HOLD` section with 약점 / 다음 단계 / 미달 점수.
+15. **HOLD ≠ FAIL contract** — observer + smoke + factory_state all classify HOLD as non-failure; `implementation_ticket_status` stays `skipped_hold`.
 
 The Observer's own self-test
 (`python3 -m control_tower.local_runner.factory_observer --self-test`)

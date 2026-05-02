@@ -911,13 +911,15 @@ def classify(
             "category": "hold",
             "root_cause": (
                 "PM 결정이 HOLD — 이번 사이클은 의도적으로 재작업 사이클입니다. "
-                "claude_propose / implementation_ticket / claude_apply 미실행이 정상."
+                "claude_propose / implementation_ticket / claude_apply 미실행이 정상. "
+                "다음 사이클의 planner 는 `.runtime/claude_rework_prompt.md` 를 입력으로 사용해야 합니다."
             ),
             "evidence": [
                 f"factory_state.status={fs_status or '—'}",
                 f"control_state.status={cs_status_for_fresh or '—'}",
                 f"pm_decision_status={fs.get('pm_decision_status') or '—'}",
                 f"pm_decision_message={fs.get('pm_decision_message') or '—'}",
+                "rework_prompt=.runtime/claude_rework_prompt.md",
             ],
             "auto_fix_possible": False,
             "is_failure": False,

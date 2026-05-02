@@ -100,6 +100,18 @@ def _claude_repair_path() -> Path:
     return _runtime_dir() / "claude_repair_prompt.md"
 
 
+def _claude_rework_path() -> Path:
+    return _runtime_dir() / "claude_rework_prompt.md"
+
+
+def _pm_decision_path() -> Path:
+    return _runtime_dir() / "pm_decision.md"
+
+
+def _designer_final_review_path() -> Path:
+    return _runtime_dir() / "designer_final_review.md"
+
+
 def _read_json(path: Path) -> dict | None:
     if not path.is_file():
         return None
@@ -226,6 +238,7 @@ PREFLIGHT_RUNTIME_FILES: tuple[str, ...] = (
     "factory_smoke_state.json",
     "factory_failure_report.md",
     "claude_repair_prompt.md",
+    "claude_rework_prompt.md",
     "factory_smoke_report.md",
     "factory_smoke.log",
     "auto_publish_request.json",
@@ -781,6 +794,15 @@ def write_outputs(
             _claude_repair_path(),
             _build_repair_prompt(run, observer_classification),
         )
+    if run.verdict == "HOLD":
+        # PM HOLD is a successful — but rework-pending — verdict.
+        # claude_repair_prompt.md is intentionally absent (nothing to
+        # repair); claude_rework_prompt.md is *required* so the next
+        # cycle's planner has the prior weakness as its input.
+        _safe_write_text(
+            _claude_rework_path(),
+            _build_rework_prompt(run, factory_state),
+        )
 
 
 def _serialize_run(run: SmokeRun) -> dict:
@@ -885,6 +907,10 @@ def _build_report(run: SmokeRun, factory_state: dict) -> str:
             f"- 실패 리포트: `.runtime/factory_failure_report.md`",
             f"- Claude repair prompt: `.runtime/claude_repair_prompt.md`",
         ]
+    if run.verdict == "HOLD":
+        lines.append(
+            f"- Claude rework prompt: `.runtime/claude_rework_prompt.md`"
+        )
     if run.notes:
         lines += ["", "## Notes"]
         lines.extend(f"- {n}" for n in run.notes)
@@ -906,7 +932,8 @@ def _recommend_next(run: SmokeRun) -> list[str]:
     if run.verdict == "HOLD":
         return [
             "- PM 결정이 HOLD — 디자이너/기획자 rework 항목을 반영해 다음 사이클을 진행하세요.",
-            "- `pm_decision.md` / `designer_final_review.md` 참고.",
+            "- `.runtime/claude_rework_prompt.md` 가 다음 사이클 planner 입력으로 자동 작성됩니다.",
+            "- 원본 산출물: `.runtime/pm_decision.md` / `.runtime/designer_final_review.md`.",
         ]
     # FAIL
     if run.failure_code == "smoke_timeout":
@@ -1012,6 +1039,135 @@ def _build_repair_prompt(
     lines.append(f"- last_successful_stage: `{run.last_successful_stage or '—'}`")
     lines.append(f"- failed_stage: `{run.failed_stage or '—'}`")
     lines.append(f"- factory_state.status: `{run.factory_status}`")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# PM HOLD rework prompt
+#
+# When the smoke verdict is HOLD, claude_repair_prompt.md is intentionally
+# absent (the cycle didn't fail — it produced a valid HOLD verdict). The
+# rework prompt below is *the* hand-off doc the next planner cycle reads
+# to know "this is not a fresh ideation — solve the prior weakness first".
+# ---------------------------------------------------------------------------
+
+
+def _read_md_section_local(md: str, heading: str) -> str:
+    """Mini extractor — pulls the body under "## heading" (or any of the
+    accepted heading aliases) until the next ## or end-of-doc.
+
+    factory_smoke is stdlib-only and must NOT import from cycle.py at
+    runtime, so this duplicates the small subset of `_extract_md_section`
+    behavior we actually need here.
+    """
+    import re as _re
+    aliases: dict[str, tuple[str, ...]] = {
+        "신규 기능 아이디어 후보": ("신규 장치 아이디어 후보",),
+        "이번 사이클 선정 기능":   ("이번 사이클 선정 장치",),
+    }
+    variants = (heading, *aliases.get(heading, ()))
+    for v in variants:
+        pat = (
+            r"^##\s+" + _re.escape(v) + r"\s*\n(.*?)(?=\n##\s|\Z)"
+        )
+        m = _re.search(pat, md, _re.MULTILINE | _re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _build_rework_prompt(run: SmokeRun, factory_state: dict) -> str:
+    """Build .runtime/claude_rework_prompt.md from pm_decision.md +
+    designer_final_review.md.
+
+    The next cycle's planner (or an operator running Claude directly)
+    reads this file to understand:
+      - why the prior cycle was held
+      - which axes (Visual Desire / Share / Rarity / Revisit) underscored
+      - which 약점 the designer flagged
+      - which 다음 단계 the PM assigned to designer / planner
+      - the smoke command to re-run after the rework
+    """
+    pm_md = ""
+    designer_md = ""
+    try:
+        if _pm_decision_path().is_file():
+            pm_md = _pm_decision_path().read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        if _designer_final_review_path().is_file():
+            designer_md = _designer_final_review_path().read_text(encoding="utf-8")
+    except OSError:
+        pass
+
+    decision = _read_md_section_local(pm_md, "출하 결정") or "hold"
+    reason = _read_md_section_local(pm_md, "결정 이유")
+    ship_unit = _read_md_section_local(pm_md, "출하 단위 (가장 작은)")
+    next_owners = _read_md_section_local(pm_md, "다음 단계 담당")
+    qa_extra = _read_md_section_local(pm_md, "QA가 추가로 점검할 것")
+    weaknesses = _read_md_section_local(designer_md, "약점")
+    score_section = _read_md_section_local(designer_md, "욕구 점수표")
+    final_judgment = _read_md_section_local(designer_md, "최종 판단")
+    improve_guide = _read_md_section_local(designer_md, "개선 지침")
+
+    pm_message = factory_state.get("pm_decision_message") or "—"
+    cycle_id = factory_state.get("cycle") or run.cycle_id or "—"
+
+    lines: list[str] = [
+        "# Stampport Factory Smoke — PM HOLD Rework Prompt",
+        "",
+        f"Smoke verdict: **HOLD** · cycle: `{cycle_id}` · "
+        f"factory_state.status: `{run.factory_status or '—'}`",
+        "",
+        "## PM HOLD 요약",
+        f"- PM 결정: {decision.strip() or 'hold'}",
+        f"- PM 메시지: {pm_message}",
+    ]
+    if reason:
+        lines += ["", "## 결정 이유", reason.strip()]
+    if score_section:
+        lines += ["", "## 미달 점수 (욕구 점수표)", score_section.strip()]
+    if weaknesses:
+        lines += ["", "## 디자이너가 지적한 약점", weaknesses.strip()]
+    if next_owners:
+        lines += ["", "## PM 다음 단계 담당", next_owners.strip()]
+    if ship_unit:
+        lines += ["", "## 출하 단위 (가장 작은)", ship_unit.strip()]
+    if improve_guide:
+        lines += ["", "## 디자이너 개선 지침", improve_guide.strip()]
+    if final_judgment:
+        lines += ["", "## 디자이너 최종 판단", final_judgment.strip()]
+    if qa_extra:
+        lines += ["", "## QA 추가 점검 항목", qa_extra.strip()]
+
+    lines += [
+        "",
+        "## 해결해야 할 항목",
+        "- 직전 사이클 PM HOLD 의 **모든** 약점을 다음 사이클의 첫 번째 후보로 삼는다.",
+        "- 디자이너가 명시한 SVG / 레이아웃 / 문구 지침은 새 후보의 MVP 구현 범위에 그대로 포함.",
+        "- PM \"다음 단계 담당\" 의 디자이너/기획자 지시를 무시하지 않는다.",
+        "",
+        "## 다음 cycle 목표",
+        "- 직전 약점 해소 후 desire scorecard 의 미달 게이트 (Visual Desire / Share / Rarity 등) 가",
+        "  ship 기준 (≥4 / ≥4 / ≥3) 을 충족하도록 디자인 + 코드 변경을 함께 ship.",
+        "- 새로운 무관한 후보 3개를 무작위 제안하지 마라.",
+        "",
+        "## planner / designer 에게 전달할 제약",
+        "- planner: 후보 3개 중 최소 1개는 위 \"디자이너가 지적한 약점\" 을 직접 해소.",
+        "- designer: 위 \"개선 지침\" 의 색상 / 카드 / 아이콘 / 문구 지침을 그대로 비주얼 가이드로 사용.",
+        "- PM: 미달 점수 게이트가 회복되지 않으면 다시 HOLD.",
+        "",
+        "## smoke 재실행 명령",
+        f"`python3 -m control_tower.local_runner.factory_smoke --mode {run.mode or 'local-cycle'} "
+        f"--timeout {run.timeout_sec or 1800}`",
+        "",
+        "## 참고 산출물",
+        "- `.runtime/pm_decision.md`",
+        "- `.runtime/designer_final_review.md`",
+        "- `.runtime/desire_scorecard.json`",
+        "- `.runtime/factory_smoke_report.md`",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -1363,7 +1519,386 @@ def self_test() -> tuple[int, int, list[str]]:
             else:
                 os.environ.pop("LOCAL_RUNNER_REPO", None)
 
+    # 12. Planner heading contract: alias "신규 장치 아이디어 후보" passes
+    #     guard (case A); canonical form passes too (case B); selected
+    #     feature is extracted under both "## 이번 사이클 선정 장치"
+    #     (case C) and "## 이번 사이클 선정 기능" (case D).
+    total += 1
+    try:
+        from . import cycle as _cycle
+    except Exception as exc:
+        _cycle = None  # type: ignore
+        failures.append(f"12: import cycle.py failed: {exc}")
+    if _cycle is not None:
+        body_alias = _STAMPPORT_PLANNER_FIXTURE.replace(
+            "## 신규 기능 아이디어 후보", "## 신규 장치 아이디어 후보"
+        ).replace(
+            "## 이번 사이클 선정 기능", "## 이번 사이클 선정 장치"
+        )
+        body_canonical = _STAMPPORT_PLANNER_FIXTURE
+        # Normalize is the gate the cycle.stage_product_planning calls
+        # before validation — exercise that path.
+        norm_alias = _cycle._normalize_planner_body(body_alias)
+        norm_canon = _cycle._normalize_planner_body(body_canonical)
+        fails_alias = _cycle._validate_planner_report(norm_alias)
+        fails_canon = _cycle._validate_planner_report(norm_canon)
+        sel_alias = _cycle._extract_selected_feature(norm_alias)
+        sel_canon = _cycle._extract_selected_feature(norm_canon)
+        # Also confirm direct extraction from the *un*-normalized alias
+        # body works through the alias-aware extractor.
+        sel_alias_raw = _cycle._extract_selected_feature(body_alias)
+        if (
+            not fails_alias
+            and not fails_canon
+            and sel_alias
+            and sel_canon
+            and sel_alias_raw
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"12: planner heading alias — fails_alias={fails_alias[:2]} "
+                f"fails_canon={fails_canon[:2]} sel_alias={sel_alias!r} "
+                f"sel_canon={sel_canon!r} sel_alias_raw={sel_alias_raw!r}"
+            )
+
+    # 13. PM HOLD fixture — claude_rework_prompt.md is created with the
+    #     designer 약점, PM 다음 단계, 미달 점수 surfaced; the report's
+    #     Output files lists the rework prompt path.
+    total += 1
+    repo = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            (runtime / "pm_decision.md").write_text(
+                _PM_DECISION_FIXTURE, encoding="utf-8"
+            )
+            (runtime / "designer_final_review.md").write_text(
+                _DESIGNER_FINAL_REVIEW_FIXTURE, encoding="utf-8"
+            )
+            run = SmokeRun(mode="local-cycle", timeout_sec=1800)
+            run.started_at = _utc_now_iso()
+            run.finished_at = _utc_now_iso()
+            run.verdict = "HOLD"
+            run.factory_status = "hold_for_rework"
+            run.cycle_id = 1
+            run.ticket_status = "skipped_hold"
+            run.pm_decision_ship_ready = False
+            run.changed_files_count = 0
+            fs = {
+                "status": "hold_for_rework",
+                "cycle": 1,
+                "pm_decision_status": "generated",
+                "pm_decision_ship_ready": False,
+                "implementation_ticket_status": "skipped_hold",
+                "pm_decision_message": "HOLD (총점 19/30)",
+            }
+            write_outputs(run, factory_state=fs, observer_classification=None)
+            rework = runtime / "claude_rework_prompt.md"
+            repair = runtime / "claude_repair_prompt.md"
+            report = (runtime / "factory_smoke_report.md").read_text(
+                encoding="utf-8"
+            )
+            ok = (
+                rework.is_file()
+                and not repair.exists()
+                and "claude_rework_prompt.md" in report
+                and "selectedTitle" in rework.read_text(encoding="utf-8")
+                and "디자이너가 지적한 약점" in rework.read_text(encoding="utf-8")
+                and "PM 다음 단계 담당" in rework.read_text(encoding="utf-8")
+                # implementation_ticket_status must remain skipped_hold —
+                # we don't write a ticket on HOLD.
+                and run.ticket_status == "skipped_hold"
+            )
+            if ok:
+                passed += 1
+            else:
+                failures.append(
+                    "13: PM HOLD rework prompt — missing artifact / sections / "
+                    f"rework_exists={rework.is_file()} repair_absent={not repair.exists()}"
+                )
+        finally:
+            if repo is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 14. PM HOLD fixture also feeds the next planner prompt — when
+    #     pm_decision.md/designer_final_review.md are present and HOLD,
+    #     _build_product_planner_prompt prepends a "Previous PM HOLD"
+    #     section that mirrors the 약점 / 다음 단계 / 미달 점수.
+    total += 1
+    if _cycle is None:
+        failures.append("14: skipped — cycle import failed earlier")
+    else:
+        repo_root_prev = os.environ.get("REPO_ROOT")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".runtime").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / ".runtime" / "pm_decision.md").write_text(
+                _PM_DECISION_FIXTURE, encoding="utf-8"
+            )
+            (Path(tmp) / ".runtime" / "designer_final_review.md").write_text(
+                _DESIGNER_FINAL_REVIEW_FIXTURE, encoding="utf-8"
+            )
+            # cycle.py reads PM_DECISION_FILE / DESIGNER_FINAL_REVIEW_FILE
+            # at import time from REPO_ROOT — patch the constants directly
+            # for this test instead of re-importing the module.
+            saved_pm = _cycle.PM_DECISION_FILE
+            saved_dr = _cycle.DESIGNER_FINAL_REVIEW_FILE
+            _cycle.PM_DECISION_FILE = Path(tmp) / ".runtime" / "pm_decision.md"
+            _cycle.DESIGNER_FINAL_REVIEW_FILE = (
+                Path(tmp) / ".runtime" / "designer_final_review.md"
+            )
+            try:
+                prompt = _cycle._build_product_planner_prompt("test goal")
+            finally:
+                _cycle.PM_DECISION_FILE = saved_pm
+                _cycle.DESIGNER_FINAL_REVIEW_FILE = saved_dr
+                if repo_root_prev is not None:
+                    os.environ["REPO_ROOT"] = repo_root_prev
+        ok = (
+            "Previous PM HOLD" in prompt
+            and "디자이너가 지적한 약점" in prompt
+            and "PM 다음 단계 담당" in prompt
+            and "selectedTitle" in prompt
+            and "기존 HOLD 해소" in prompt
+        )
+        if ok:
+            passed += 1
+        else:
+            failures.append(
+                "14: planner prompt did not include Previous PM HOLD context"
+            )
+
+    # 15. HOLD verdict is NOT FAIL — observer + smoke + factory_status agree.
+    total += 1
+    state = {
+        "status": "hold_for_rework",
+        "cycle": 99,
+        "pm_decision_status": "generated",
+        "pm_decision_ship_ready": False,
+        "implementation_ticket_status": "skipped_hold",
+    }
+    verdict, code, _ = resolve_verdict(state, exit_code=0)
+    obs_state = _observer._empty_state()
+    obs_state["factory_state"] = state
+    obs_state["control_state"] = {"status": "hold_for_rework", "liveness": {"runner_online": True}}
+    cls = _observer.classify(
+        obs_state,
+        runner_processes=["python -m control_tower.local_runner.runner"],
+        caffeinate_processes=[],
+    )
+    if (
+        verdict == "HOLD"
+        and code == "pm_hold_for_rework"
+        and cls["diagnostic_code"] == "pm_hold_for_rework"
+        and cls["category"] == "hold"
+        and cls["is_failure"] is False
+        and state["implementation_ticket_status"] == "skipped_hold"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"15: HOLD!=FAIL contract — verdict={verdict}/{code} "
+            f"observer={cls['diagnostic_code']}/{cls['is_failure']}"
+        )
+
     return passed, total, failures
+
+
+# ---------------------------------------------------------------------------
+# Acceptance fixtures (kept inline so factory_smoke remains stdlib-only)
+# ---------------------------------------------------------------------------
+
+
+_PM_DECISION_FIXTURE = """\
+# Stampport PM Decision
+
+## 출하 결정
+hold (재작업 후 다음 사이클)
+
+## 결정 이유
+총점 19점으로 출하 기준 24점에 5점 미달이며, Visual Desire(3) 와 Share(3) 두 필수
+게이트가 동시에 미달이다. selectedTitle 이 string 이라 Share.jsx 에서 level 파악
+방식이 없고, 잠금 조건 progress === 0 이 Lv2/Lv3 잠금 슬롯 설계와 충돌한다.
+
+## 출하 단위 (가장 작은)
+- badges.js 에 level 필드 추가 후 Lv 분기
+- ShareCard 칭호 라인을 share-foot 외부로 이동
+- 원형/방패/왕관 SVG 3종 컴포넌트
+
+## 다음 단계 담당
+- 디자이너: 원형/방패/왕관 SVG 3종을 단일 컴포넌트로 설계.
+- 기획자: selectedTitle string 문제 해결 방식 제안 (selectedTitleId 또는 titleLabel→id 역매핑).
+- 프론트/백엔드: N/A
+
+## QA가 추가로 점검할 것
+- Lv.3 ShareCard gold serif 칭호가 iOS Safari 390px 에서 Lv.1 과 육안으로 구분되는지.
+- 카페 1곳 방문 후 Badges 에서 cafe_lover/cafe_master 가 잠금 슬롯으로 노출되는지.
+"""
+
+
+_DESIGNER_FINAL_REVIEW_FIXTURE = """\
+# Stampport Designer Final Review
+
+## 첫인상
+방향은 맞다.
+
+## 욕구 점수표
+
+| 축 | 점수 (1~5) | 이유 |
+|---|---|---|
+| Collection Score | 3 | 카테고리 하나에만 적용되어 반쪽이다 |
+| Share Score | 3 | gold serif 방향은 맞으나 칭호가 share-foot 에 묻힘 |
+| Progression Score | 4 | 진행 바 + 모달 조합은 명확 |
+| Rarity Score | 2 | 잠금 조건이 progress === 0 과 충돌 |
+| Revisit Score | 4 | 진행 바가 재방문 임계값을 낮춤 |
+| Visual Desire Score | 3 | SVG 미결로 모바일 390px 렌더링 보장 X |
+
+## 약점
+selectedTitle 은 string 이라 Share.jsx 에서 level 파악 방식이 없다.
+잠금 조건 progress === 0 은 Lv2/Lv3 잠금 슬롯 설계와 충돌한다.
+ShareCard 칭호 라인이 share-foot 하단에 묻혀 카드 위계를 바꾸지 못한다.
+
+## 개선 지침
+- ShareCard 칭호 라인을 share-foot 외부 share-note 아래 독립 블록으로.
+- 원형/방패/왕관 SVG 3종을 size prop 단일 컴포넌트로.
+
+## 최종 판단
+revise — 세 구멍이 막히지 않으면 MVP 구현 시 버그 + 시각 효과 미달 동시 발생.
+"""
+
+
+# A canonical-form planner report fixture used to test that the gate
+# accepts both heading variants. Intentionally compact but covers all
+# REQUIRED sections in `_validate_planner_report`. We split the
+# multiline string with %s placeholders for the candidate-detail section
+# so test 12 can swap headings without touching the rest of the body.
+_STAMPPORT_PLANNER_FIXTURE = """\
+# Stampport Product Planner Report
+
+## 제품 방향
+Stampport 는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모으는 로컬 취향 RPG 서비스다.
+
+## 사용자가 가진 욕구 중 가장 약한 곳
+재방문 욕구가 가장 약하다. 방문 후 다시 열 이유가 없다.
+
+## 현재 제품의 한계
+`app/web/src/screens/MyPassport.jsx:42` 에서 다음 방문 신호가 부재.
+
+## 이번 사이클의 가장 큰 병목
+사용자가 다음 방문을 만들 시각/보상 신호가 없어 재방문 동기가 약하다. 근거: `app/web/src/screens/MyPassport.jsx:42`.
+
+## 신규 기능 아이디어 후보
+
+| 기능 | 자극하는 욕구(2개 이상) | 사용자 가치 | 구현 난이도 | 제품 임팩트 | 리스크 |
+|---|---|---|---|---|---|
+| 후보1 | 수집욕 + 과시욕 | 동네 정복 시각 증거 | 낮 | 중 | 카테고리 1개로 좁음 |
+| 후보2 | 성장욕 + 재방문 | 칭호 진화 헤더 | 중 | 중 | 데이터 임계값 튜닝 필요 |
+| 후보3 | 재방문 + 희소성 | 추천 슬롯 | 낮 | 중 | 추천이 강요로 보일 위험 |
+
+## 후보 상세
+
+### 후보 1: Local Visa 배지
+- 사용자 욕구: 수집욕 + 과시욕 (동네별 시각 자산을 얻고 친구에게 자랑)
+- 핵심 루프: 방문 → 도장 → Visa 발급 → ShareCard 공유
+- MVP 구현 범위:
+  - Visa 배지 1종
+  - 자동 발급 룰 (dong_code 3회)
+  - ShareCard 노출
+- 기대 행동 변화: 같은 동네 재방문률 상승, ShareCard 열람 증가
+- 디자이너에게 던질 질문:
+  1. 도장과 어떻게 시각적으로 구분?
+  2. 발급 모먼트가 충분히 emotional 한가?
+  3. 카드 위 위치는 어디가 적절?
+
+### 후보 2: Taste Title 진화
+- 사용자 욕구: 성장욕 + 재방문 (단계별 진화 + 다음 단계 자극)
+- 핵심 루프: 카테고리 누적 → 칭호 진화 → 헤더 갱신 → 친구 공유
+- MVP 구현 범위:
+  - 카테고리 1종
+  - 3단계 임계값
+  - 헤더 갱신
+- 기대 행동 변화: 카테고리 집중 방문 비율 상승
+- 디자이너에게 던질 질문:
+  1. 진화 단계 시각언어?
+  2. 진화 모멘트 모달?
+  3. 칭호 폰트?
+
+### 후보 3: Passport 발급 대기 슬롯
+- 사용자 욕구: 재방문 + 희소성 (추천 슬롯이 다음 방문을 만든다)
+- 핵심 루프: 추천 → 방문 → 도장 → 슬롯 갱신
+- MVP 구현 범위:
+  - 슬롯 3개
+  - 룰 기반 추천
+  - 갱신 표시
+- 기대 행동 변화: 미방문 동네 방문률 증가
+- 디자이너에게 던질 질문:
+  1. 추천 톤?
+  2. 슬롯 형태?
+  3. 갱신 애니메이션?
+
+## 이번 사이클 선정 기능
+Local Visa 배지
+
+## 선정 이유
+가장 작은 변경 범위에서 수집/과시 욕구를 동시에 자극하고 BE 변경이 없다.
+다른 후보를 채택하지 않은 이유:
+- 후보2: 진화 단계 모달이 한 사이클 범위를 넘는다.
+- 후보3: 추천 정확도 기준이 필요해 LLM 의존 발생.
+
+## 사용자 시나리오
+사용자는 단골 동네 카페 두 곳을 며칠에 걸쳐 방문해 도장을 찍는다. 세 번째 방문에서 Visa 가 자동 발급되고 MyPassport 헤더에 노출된다.
+
+## 해결 방식 (자체 판단)
+- 핵심 패턴: 방문 카운팅 + 임계값 기반 자동 발급
+- 근거: 클라이언트 LocalStorage 만으로 결정론적으로 동작.
+
+## LLM 필요 여부
+- 불필요
+- 이유: 결정론적 룰 기반.
+- 입력: dong_code 카운터.
+- 출력 JSON schema: { "visa": "string" }
+- fallback 방식: 룰 기반 그대로.
+
+## 데이터 저장 필요 여부
+- 필요
+- 클라이언트 LocalStorage 에 dong_code 별 카운터.
+
+## 외부 연동 필요 여부
+- 불필요
+- 외부 SNS 게시는 다음 사이클.
+
+## 프론트 변경 범위
+- `app/web/src/screens/MyPassport.jsx` — Visa 헤더 노출
+- `app/web/src/components/ShareCard.jsx` — Visa 일러스트 추가
+- `app/web/src/components/VisaBadge.jsx` (신규)
+
+## 백엔드 변경 범위
+- 백엔드 변경 불필요 — 사유: 클라이언트 LocalStorage 기반 룰만 사용.
+
+## 이번 사이클 MVP 범위
+- Visa 배지 1종
+- 자동 발급 룰
+- ShareCard 노출
+
+## 이번 사이클에서 하지 않을 것
+- 서버 sync
+- 카테고리 확장
+- 외부 SNS 게시
+
+## 디자이너에게 던질 질문
+- 이 도장/뱃지/카드가 정말 갖고 싶게 보이는가?
+- 이 카드가 인스타 스토리에 자랑하고 싶게 보이는가?
+- 이 슬롯/장치가 다음 방문 욕구를 만드는가?
+
+## 성공 기준
+1. 동일 dong_code 도장 3회 누적 시 Visa 자동 발급
+2. MyPassport / ShareCard 두 화면에 Visa 시각적 노출
+3. ShareCard caption 에 Visa 라벨 포함
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1434,6 +1969,8 @@ def _print_summary(run: SmokeRun) -> None:
     if run.verdict == "FAIL":
         print(f"  failure=.runtime/factory_failure_report.md")
         print(f"  repair=.runtime/claude_repair_prompt.md")
+    if run.verdict == "HOLD":
+        print(f"  rework=.runtime/claude_rework_prompt.md")
 
 
 if __name__ == "__main__":
