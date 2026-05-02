@@ -113,8 +113,34 @@ DIAGNOSTIC_CODES: tuple[str, ...] = (
     "publish_required",
     "actions_pending_timeout",
     "old_deploy_failed_stale",
+    # 2026-05-02: extended diagnostics for the smoke-test driven loop.
+    # See docs/factory-smoke.md — these distinguish "not really a
+    # failure" cases (fresh_idle, ready_to_review, pm_hold_for_rework)
+    # from real ones, and add smoke-runner specific failure codes.
+    "fresh_idle",
+    "bridge_pause_mismatch",
+    "pm_hold_for_rework",
+    "pm_scope_missing_target_files",
+    "ready_to_review",
+    "smoke_timeout",
+    "smoke_passed",
+    "smoke_failed",
     "unknown",
 )
+
+
+# Categories: which diagnostic codes are NOT failures.
+INFO_CODES: frozenset[str] = frozenset({
+    "fresh_idle",
+    "smoke_passed",
+})
+REVIEW_CODES: frozenset[str] = frozenset({
+    "publish_required",
+    "ready_to_review",
+})
+HOLD_CODES: frozenset[str] = frozenset({
+    "pm_hold_for_rework",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +447,60 @@ PROMOTED_DIAGNOSTIC_META: dict[str, dict[str, Any]] = {
             "코드 변경 + QA 통과 — commit / push 만 남은 review 상태. 실패 아님."
         ),
     },
+    "fresh_idle": {
+        "severity": "info", "category": "healthy", "is_failure": False,
+        "root_cause": (
+            "factory_state.json / cycle_id 없음 — fresh runtime. cycle 시작 전 "
+            "산출물 부재는 실패가 아닙니다."
+        ),
+    },
+    "bridge_pause_mismatch": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "desired=running 인데 runner 가 pause marker 를 작성함 — "
+            "_reconcile_continuous_mode 정책 위반."
+        ),
+    },
+    "pm_hold_for_rework": {
+        "severity": "info", "category": "hold", "is_failure": False,
+        "root_cause": (
+            "PM 결정이 HOLD — 이번 사이클은 재작업입니다. 개발 단계 (claude_propose / "
+            "implementation_ticket / claude_apply) 는 의도적으로 미실행."
+        ),
+    },
+    "pm_scope_missing_target_files": {
+        "severity": "warning", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "PM SHIP 결정인데 PM/planner 산출물에 수정 대상 파일이 명시되지 않음 — "
+            "implementation_ticket 을 만들 수 없음. PM 단계 prompt 보강 필요."
+        ),
+    },
+    "ready_to_review": {
+        "severity": "info", "category": "review", "is_failure": False,
+        "root_cause": (
+            "코드 변경 + QA 통과 — 자동 배포가 꺼져 있어 사람 리뷰 대기. 실패 아님."
+        ),
+    },
+    "smoke_timeout": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "factory_smoke 가 timeout 초과로 검증을 종료함 — 단계가 stuck 이거나 "
+            "cycle subprocess 가 응답 없음."
+        ),
+    },
+    "smoke_passed": {
+        "severity": "info", "category": "healthy", "is_failure": False,
+        "root_cause": (
+            "factory_smoke 가 PASS / READY / HOLD 중 하나로 정상 종료."
+        ),
+    },
+    "smoke_failed": {
+        "severity": "error", "category": "failure", "is_failure": True,
+        "root_cause": (
+            "factory_smoke 가 실패 verdict 로 종료 — factory_smoke_report.md 와 "
+            "claude_repair_prompt.md 참조."
+        ),
+    },
 }
 
 
@@ -554,6 +634,84 @@ def _build_promoted_classification(
     }
 
 
+# Bridge pause mismatch — log patterns that prove desired=running but
+# pause was applied. We accept both the legacy bad message format
+# ("(continuous=False, desired=running)") and the new format
+# ("(desired=paused, continuous=...)" — which is fine — but
+# "(desired=running, ..." with "pause applied" is NEVER fine).
+_BRIDGE_PAUSE_BAD_PATTERNS: tuple[str, ...] = (
+    "factory bridge · pause applied (continuous=False, desired=running)",
+    "factory bridge · pause applied (desired=running",
+)
+
+
+def _looks_like_bridge_pause_mismatch(log_tail: str) -> bool:
+    if not log_tail:
+        return False
+    return any(pat in log_tail for pat in _BRIDGE_PAUSE_BAD_PATTERNS)
+
+
+def _bridge_mismatch_evidence(log_tail: str) -> list[str]:
+    if not log_tail:
+        return []
+    out: list[str] = []
+    for line in log_tail.splitlines()[-200:]:
+        if any(pat in line for pat in _BRIDGE_PAUSE_BAD_PATTERNS):
+            out.append(line.strip()[:300])
+        if len(out) >= 4:
+            break
+    return out or ["pause applied with desired=running pattern detected"]
+
+
+def _looks_like_publish_disabled_review(state: dict) -> bool:
+    """Detect the 'ready_to_review (publish disabled)' shape.
+
+    Conditions (all must hold):
+      - claude_apply_status == "applied"
+      - claude_apply_changed_files length > 0
+      - qa_status == "passed"
+      - no commit_hash on the current cycle
+      - LOCAL_RUNNER_ALLOW_PUBLISH=false (or unset → defaults to false)
+    """
+    fs = state.get("factory_state") or {}
+    cs = state.get("control_state") or {}
+    fpub = state.get("factory_publish") or {}
+    deploy_block = cs.get("deploy") or {}
+
+    apply_status = _str(fs.get("claude_apply_status"))
+    changed = list(fs.get("claude_apply_changed_files") or [])
+    qa = _str(fs.get("qa_status"))
+    deploy_commit = _str(deploy_block.get("commit_hash"))
+    last_commit = _str(fpub.get("last_commit_hash"))
+
+    allow_publish = (os.environ.get("LOCAL_RUNNER_ALLOW_PUBLISH") or "").strip().lower()
+    publish_disabled = allow_publish in {"", "false", "0", "no", "off"}
+
+    return bool(
+        apply_status == "applied"
+        and len(changed) > 0
+        and qa == "passed"
+        and not deploy_commit
+        and not last_commit
+        and publish_disabled
+    )
+
+
+def _ready_to_review_evidence(state: dict) -> list[str]:
+    fs = state.get("factory_state") or {}
+    cs = state.get("control_state") or {}
+    deploy_block = cs.get("deploy") or {}
+    changed = list(fs.get("claude_apply_changed_files") or [])
+    return [
+        f"changed_files_count={len(changed) or deploy_block.get('changed_files_count') or 0}",
+        f"qa_status={fs.get('qa_status') or deploy_block.get('qa_status') or '—'}",
+        f"claude_apply_status={fs.get('claude_apply_status') or '—'}",
+        f"commit_hash={deploy_block.get('commit_hash') or '—'}",
+        f"LOCAL_RUNNER_ALLOW_PUBLISH="
+        f"{os.environ.get('LOCAL_RUNNER_ALLOW_PUBLISH') or '(unset → false)'}",
+    ]
+
+
 def classify(
     state: dict,
     runner_processes: list[str] | None = None,
@@ -684,6 +842,138 @@ def classify(
             ),
             "auto_fix_possible": False,
             "is_failure": True,
+        }
+
+    # 2.5 bridge_pause_mismatch — runner emitted "pause applied" while
+    # desired=running. Detected from the new (and the legacy bad) log
+    # patterns. desired=running must NEVER produce a pause marker; the
+    # log line is the canonical evidence even when the pause file was
+    # later cleared.
+    if _looks_like_bridge_pause_mismatch(log_tail):
+        return {
+            "diagnostic_code": "bridge_pause_mismatch",
+            "severity": "error",
+            "category": "failure",
+            "root_cause": (
+                "desired=running 인데 runner 가 pause marker 를 작성했습니다 — "
+                "_reconcile_continuous_mode 정책 위반. continuous=False 는 "
+                "'반복하지 않음' 일 뿐 'pause' 가 아닙니다."
+            ),
+            "evidence": _bridge_mismatch_evidence(log_tail),
+            "auto_fix_possible": False,
+            "is_failure": True,
+        }
+
+    # 2.6 fresh_idle — no cycle has run yet. Don't penalize the absence
+    # of product_planner_report.md / implementation_ticket.md /
+    # changed_files when factory_state.json is empty or has no cycle_id.
+    # This is the policy that stops the observer from screaming
+    # "current_stage_stuck" / "implementation_ticket_missing" on a
+    # fresh checkout.
+    fs_status = _str(fs.get("status"))
+    fs_cycle = fs.get("cycle")
+    fresh_state = (
+        not fs
+        or fs_cycle in (None, 0, "0", "")
+        or fs_status in {"", "idle", "ready", "paused"}
+    )
+    cs_status_for_fresh = _str(cs.get("status"))
+    cs_diag_for_fresh = _str(cs.get("diagnostic_code"))
+    if (
+        fresh_state
+        and cs_status_for_fresh in {"", "idle", "ready"}
+        and cs_diag_for_fresh in {"", "healthy"}
+        and not log_tail.strip()
+    ):
+        return {
+            "diagnostic_code": "fresh_idle",
+            "severity": "info",
+            "category": "healthy",
+            "root_cause": (
+                "factory_state.json 이 비어있거나 cycle 이 시작되지 않았습니다 — "
+                "fresh runtime. cycle 시작 전 산출물 부재는 실패가 아닙니다."
+            ),
+            "evidence": [
+                f"factory_state.cycle={fs_cycle or '—'}",
+                f"factory_state.status={fs_status or '—'}",
+                f"control_state.status={cs_status_for_fresh or '—'}",
+                f"control_state.diagnostic_code={cs_diag_for_fresh or '—'}",
+            ],
+            "auto_fix_possible": False,
+            "is_failure": False,
+        }
+
+    # 2.7 pm_hold_for_rework — PM 결정이 HOLD 인 정상 종료. 실패 아님.
+    if fs_status == "hold_for_rework" or cs_status_for_fresh == "hold_for_rework":
+        return {
+            "diagnostic_code": "pm_hold_for_rework",
+            "severity": "info",
+            "category": "hold",
+            "root_cause": (
+                "PM 결정이 HOLD — 이번 사이클은 의도적으로 재작업 사이클입니다. "
+                "claude_propose / implementation_ticket / claude_apply 미실행이 정상."
+            ),
+            "evidence": [
+                f"factory_state.status={fs_status or '—'}",
+                f"control_state.status={cs_status_for_fresh or '—'}",
+                f"pm_decision_status={fs.get('pm_decision_status') or '—'}",
+                f"pm_decision_message={fs.get('pm_decision_message') or '—'}",
+            ],
+            "auto_fix_possible": False,
+            "is_failure": False,
+        }
+
+    # 2.8 pm_scope_missing_target_files — PM SHIP 인데 target_files 없음.
+    impl_ticket_status = _str(fs.get("implementation_ticket_status"))
+    if impl_ticket_status == "pm_scope_missing_target_files":
+        return {
+            "diagnostic_code": "pm_scope_missing_target_files",
+            "severity": "warning",
+            "category": "failure",
+            "root_cause": (
+                "PM 결정에 수정 대상 파일이 명시되지 않아 implementation_ticket 을 "
+                "만들 수 없음. 'implementation_ticket_missing' 와 분리된 분류 — "
+                "fix 는 PM prompt 보강 (must include explicit list of files to "
+                "modify under app/* or control_tower/*)."
+            ),
+            "evidence": [
+                f"implementation_ticket_status={impl_ticket_status}",
+                f"pm_decision_status={fs.get('pm_decision_status') or '—'}",
+                f"pm_decision_ship_ready={fs.get('pm_decision_ship_ready')}",
+            ],
+            "auto_fix_possible": False,
+            "is_failure": True,
+        }
+
+    # 2.9 ready_to_review — 자동 배포가 꺼진 상태에서 코드 변경 + qa 통과 + commit 없음.
+    # publish_required 와 분리: ready_to_review 는 "자동 배포 비활성 (사람 리뷰
+    # 대기) 으로 인한" 의도적 보류, publish_required 는 "publish 명령을
+    # 기다리는" 일반 케이스. 둘 다 실패 아님.
+    # 단, control_state 가 이미 publish_required 를 명시했다면 promotion 에
+    # 위임 — 운영자가 publish_changes 를 부르는 즉시 release 가능한 상태이므로
+    # "review 대기" 라벨로 다시 덮어쓰지 않습니다.
+    # Only the EXPLICIT promotion signal (diagnostic_code) suppresses
+    # ready_to_review — status=="ready_to_publish" alone is just the
+    # cycle's "I produced shippable code" claim, which we want to relabel
+    # as ready_to_review whenever auto-publish is disabled.
+    publish_required_signal_present = (cs_diag_for_fresh == "publish_required")
+    if not publish_required_signal_present and (
+        fs_status == "ready_to_review"
+        or cs_status_for_fresh == "ready_to_review"
+        or _looks_like_publish_disabled_review(state)
+    ):
+        return {
+            "diagnostic_code": "ready_to_review",
+            "severity": "info",
+            "category": "review",
+            "root_cause": (
+                "코드 변경 + QA 통과 + 자동 배포 비활성 — 사람 리뷰 대기. 실패 아님. "
+                "LOCAL_RUNNER_ALLOW_PUBLISH=true 로 켜기 전에는 git commit/push 가 "
+                "실행되지 않습니다."
+            ),
+            "evidence": _ready_to_review_evidence(state),
+            "auto_fix_possible": False,
+            "is_failure": False,
         }
 
     # 3. CURRENT-STATE PROMOTION — if any canonical state file already
@@ -2130,6 +2420,153 @@ def self_test() -> tuple[int, int, list[str]]:
         failures.append(
             f"Q: blocked + unknown diagnostic_code should fall to unknown "
             f"with no_known_diagnostic_in marker, got {c['diagnostic_code']}"
+        )
+
+    # ---- New 2026-05-02 fixtures (smoke / hold / fresh / bridge) ----
+
+    # S. fresh runtime — empty factory_state → fresh_idle (info, healthy).
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if (
+        c["diagnostic_code"] == "fresh_idle"
+        and c["category"] == "healthy"
+        and c["is_failure"] is False
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"S: fresh runtime should be fresh_idle/healthy, got "
+            f"{c['diagnostic_code']} ({c['category']}, is_failure={c['is_failure']})"
+        )
+
+    # T. PM HOLD — factory_state.status=hold_for_rework → pm_hold_for_rework.
+    total += 1
+    s = _empty_state()
+    s["factory_state"] = {
+        "status": "hold_for_rework",
+        "cycle": 7,
+        "pm_decision_status": "generated",
+        "pm_decision_message": "HOLD (총점 19/30, rework=visual_desire,share)",
+        "pm_decision_ship_ready": False,
+    }
+    s["control_state"] = {
+        "status": "hold_for_rework",
+        "liveness": {"runner_online": True},
+    }
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if (
+        c["diagnostic_code"] == "pm_hold_for_rework"
+        and c["is_failure"] is False
+        and c["category"] == "hold"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"T: pm_hold_for_rework expected (hold, not failure), got "
+            f"{c['diagnostic_code']} ({c['category']}, is_failure={c['is_failure']})"
+        )
+
+    # U. PM SHIP + target_files=0 → pm_scope_missing_target_files.
+    total += 1
+    s = _empty_state()
+    s["factory_state"] = {
+        "status": "planning_only",
+        "cycle": 8,
+        "pm_decision_status": "generated",
+        "pm_decision_ship_ready": True,
+        "implementation_ticket_status": "pm_scope_missing_target_files",
+    }
+    s["control_state"] = {
+        "status": "blocked",
+        "liveness": {"runner_online": True},
+    }
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] == "pm_scope_missing_target_files":
+        passed += 1
+    else:
+        failures.append(
+            f"U: pm_scope_missing_target_files expected, got {c['diagnostic_code']}"
+        )
+
+    # V. ready_to_review (publish disabled) — changed_files=3 + qa passed +
+    # no commit + LOCAL_RUNNER_ALLOW_PUBLISH unset → ready_to_review.
+    total += 1
+    s = _empty_state()
+    s["factory_state"] = {
+        "status": "succeeded",
+        "cycle": 9,
+        "claude_apply_status": "applied",
+        "claude_apply_changed_files": ["app/web/src/foo.jsx", "b.py", "c.md"],
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+    }
+    s["control_state"] = {
+        "status": "ready_to_publish",
+        "deploy": {"changed_files_count": 3, "qa_status": "passed",
+                    "commit_hash": None, "push_status": None},
+        "liveness": {"runner_online": True},
+    }
+    prev_env = os.environ.pop("LOCAL_RUNNER_ALLOW_PUBLISH", None)
+    try:
+        c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    finally:
+        if prev_env is not None:
+            os.environ["LOCAL_RUNNER_ALLOW_PUBLISH"] = prev_env
+    if (
+        c["diagnostic_code"] == "ready_to_review"
+        and c["category"] == "review"
+        and c["is_failure"] is False
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"V: ready_to_review expected (review/non-failure), got "
+            f"{c['diagnostic_code']} ({c['category']}, is_failure={c['is_failure']})"
+        )
+
+    # W. bridge_pause_mismatch — log shows "pause applied (... desired=running)".
+    total += 1
+    s = _empty_state()
+    s["factory_state"] = {"status": "running", "cycle": 10}
+    s["control_state"] = {"liveness": {"runner_online": True}}
+    s["log_tail"] = (
+        "[2026-05-02T01:00:00Z] factory bridge · pause applied "
+        "(continuous=False, desired=running)\n"
+    )
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] == "bridge_pause_mismatch":
+        passed += 1
+    else:
+        failures.append(
+            f"W: bridge_pause_mismatch expected, got {c['diagnostic_code']}"
+        )
+
+    # X. fresh runtime + leftover product_planner_gate_failures (empty) does
+    # NOT trigger planner_required_output_missing.
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] != "planner_required_output_missing":
+        passed += 1
+    else:
+        failures.append(
+            "X: fresh runtime should not be planner_required_output_missing"
+        )
+
+    # Y. fresh runtime → not implementation_ticket_missing (pm_decision_status
+    # is empty, so the field-shape rule must not fire).
+    total += 1
+    s = _empty_state()
+    s["control_state"] = {"liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] != "implementation_ticket_missing":
+        passed += 1
+    else:
+        failures.append(
+            "Y: fresh runtime should not be implementation_ticket_missing"
         )
 
     # R. publish_required promoted from state preserves category=review,

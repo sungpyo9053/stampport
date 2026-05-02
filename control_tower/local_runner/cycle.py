@@ -3650,6 +3650,22 @@ def stage_claude_propose(state: CycleState) -> StageResult:
     if not _factory_flag_enabled("FACTORY_RUN_CLAUDE", default_on=True):
         return _skip("FACTORY_RUN_CLAUDE=false — Claude 호출 명시적 비활성")
 
+    # Pre-condition 1b: PM HOLD gate. When the PM-decision verdict is
+    # "hold" (재작업 필요) we MUST NOT advance to development stages —
+    # claude_propose, implementation_ticket, claude_apply are all
+    # skipped. The operator can opt out with
+    # FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT=true for cases where the
+    # planner-rework loop is broken and we want to force forward
+    # progress anyway.
+    if (
+        state.pm_decision_status == "generated"
+        and not state.pm_decision_ship_ready
+        and not _factory_flag_enabled(
+            "FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT", default_on=False,
+        )
+    ):
+        return _skip("PM HOLD — 재작업 사이클이라 Claude 제안 건너뜀")
+
     # Pre-condition 2: don't ask Claude to propose changes when the
     # working tree is leaking secrets / build artifacts.
     if state.risky_files:
@@ -3978,6 +3994,30 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     if state.publish_blocked:
         return _skip("차단 사유로 ticket 작성 보류")
 
+    # PM HOLD gate — implementation_ticket must NOT be generated when
+    # the PM verdict is hold. The operator can opt out with
+    # FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT=true.
+    if (
+        state.pm_decision_status == "generated"
+        and not state.pm_decision_ship_ready
+        and not _factory_flag_enabled(
+            "FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT", default_on=False,
+        )
+    ):
+        sr.status = "skipped"
+        sr.message = "PM HOLD — 이번 사이클은 재작업 (hold_for_rework) 입니다."
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.implementation_ticket_status = "skipped_hold"
+        state.implementation_ticket_skipped_reason = "pm_hold_for_rework"
+        state.implementation_ticket_target_files = []
+        state.implementation_ticket_target_screens = []
+        state.implementation_ticket_message = sr.message
+        _emit_cycle_log(
+            state, "implementation_ticket_skipped_hold",
+            "implementation_ticket skipped — PM HOLD (재작업 사이클)",
+        )
+        return sr
+
     pm_md = ""
     planner_md = ""
     proposal_md = ""
@@ -4038,19 +4078,25 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             return sr
         sr.status = "skipped"
         sr.message = (
-            "Implementation Ticket 비어 있음 — 수정 대상 파일이 명시되지 않아 "
-            "이번 사이클은 planning_only 로 종료됩니다."
+            "PM 결정에 수정 대상 파일이 명시되지 않음 — "
+            "pm_scope_missing_target_files 로 분류, planning_only 로 종료."
         )
         sr.duration_sec = round(time.time() - t0, 3)
-        state.implementation_ticket_status = "missing"
+        # 'pm_scope_missing_target_files' separates "PM didn't list any
+        # files" from "ticket generation crashed" — the observer / smoke
+        # test treat these differently. The original 'missing' status
+        # is retained as an alias so older consumers still see a
+        # known-bad value.
+        state.implementation_ticket_status = "pm_scope_missing_target_files"
         state.implementation_ticket_path = str(IMPLEMENTATION_TICKET_FILE)
         state.implementation_ticket_at = utc_now_iso()
         state.implementation_ticket_target_files = []
         state.implementation_ticket_target_screens = list(target_screens)
         state.implementation_ticket_message = sr.message
         _emit_cycle_log(
-            state, "implementation_ticket_missing",
-            "implementation ticket missing — 수정 대상 파일 없음, planning_only 로 종료 예정",
+            state, "implementation_ticket_pm_scope_missing",
+            "implementation ticket missing — PM 결정에 수정 대상 파일 없음, "
+            "planning_only 로 종료 예정",
             feature=feature,
         )
         return sr
@@ -6190,9 +6236,12 @@ def main() -> int:
                     ][:20],
                 )
     else:
-        # No failed stages, but no actual code change either. Distinguish
-        # planning_only (planner / designer / pm artifact freshly generated)
-        # vs no_code_change (everything skipped).
+        # No failed stages, but no actual code change either. Distinguish:
+        #   hold_for_rework   — PM verdict was hold (재작업)
+        #   planning_only     — planner/designer/pm artifacts were generated,
+        #                       but development phase didn't run for some
+        #                       other reason (e.g. apply skipped, no diff)
+        #   no_code_change    — everything skipped
         planner_generated = (
             state.product_planner_status in {"generated", "fallback_generated"}
             or state.designer_critique_status == "generated"
@@ -6207,11 +6256,36 @@ def main() -> int:
             or "claude_apply 미실행"
         )
         state.code_changed = False
-        state.no_code_change_reason = (
+        pm_hold = (
+            state.pm_decision_status == "generated"
+            and not state.pm_decision_ship_ready
+        )
+        if pm_hold:
+            state.status = "hold_for_rework"
+            state.no_code_change_reason = (
+                f"hold_for_rework:{state.pm_decision_message or 'PM HOLD'}"
+            )
+            state.last_message = (
+                "PM HOLD — 이번 사이클은 재작업 사이클입니다 "
+                f"(pm_decision={state.pm_decision_message or 'HOLD'})."
+            )
+            state.suggested_action = (
+                "기획자/디자이너 단계의 rework 항목을 반영해 다음 사이클을 진행하세요."
+            )
+            _emit_cycle_log(
+                state, "cycle_hold_for_rework",
+                "cycle hold_for_rework — PM 결정 HOLD (재작업)",
+                pm_decision=state.pm_decision_message or "HOLD",
+            )
+            # Skip the planning_only / no_code_change branches below.
+            planner_generated = False  # short-circuit
+        state.no_code_change_reason = state.no_code_change_reason or (
             f"planning_only:{reason}" if planner_generated
             else f"no_code_change:{reason}"
         )
-        if planner_generated:
+        if pm_hold:
+            pass  # handled above
+        elif planner_generated:
             state.status = "planning_only"
             state.last_message = (
                 "기획/디자인 산출물만 생성됨 — 코드 변경 없음 ("
@@ -6233,10 +6307,11 @@ def main() -> int:
                 f"cycle produced no code change: {reason}",
                 claude_apply_status=apply_status,
             )
-        state.suggested_action = (
-            "FACTORY_APPLY_CLAUDE=true 로 켠 뒤 다시 실행하거나, "
-            "operator_request 로 수동 변경 지시를 내리세요."
-        )
+        if not pm_hold:
+            state.suggested_action = (
+                "FACTORY_APPLY_CLAUDE=true 로 켠 뒤 다시 실행하거나, "
+                "operator_request 로 수동 변경 지시를 내리세요."
+            )
 
     # Agent Supervisor gate — last chance to refuse a "succeeded" verdict
     # when the agents produced artifacts but no real code change. Lives
@@ -6409,11 +6484,16 @@ def main() -> int:
         f"changed={len(state.claude_apply_changed_files or [])}건"
     )
     # Exit 0 covers any non-failed terminal state — succeeded /
-    # planning_only / no_code_change all leave the working tree clean.
-    # The bash factory loop reads the exit code as "did the cycle
-    # crash?", not "did it ship code", so a clean planning_only run
-    # should not look like a crash.
-    return 0 if state.status in {"succeeded", "planning_only", "no_code_change"} else 1
+    # planning_only / no_code_change / hold_for_rework / docs_only all
+    # leave the working tree clean. The bash factory loop reads the
+    # exit code as "did the cycle crash?", not "did it ship code", so
+    # a clean planning_only / hold_for_rework run should not look like
+    # a crash.
+    CLEAN_TERMINAL_STATES = {
+        "succeeded", "planning_only", "no_code_change",
+        "hold_for_rework", "docs_only",
+    }
+    return 0 if state.status in CLEAN_TERMINAL_STATES else 1
 
 
 def _safe_main() -> int:

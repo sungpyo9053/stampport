@@ -14,8 +14,13 @@
 
 const STATUS_TONE = {
   idle:              { label: "IDLE",              color: "#94a3b8" },
+  fresh_idle:        { label: "READY",             color: "#94a3b8" },
+  ready:             { label: "READY",             color: "#94a3b8" },
   running:           { label: "RUNNING",           color: "#34d399" },
+  ready_to_review:   { label: "READY TO REVIEW",   color: "#7dd3fc" },
   ready_to_publish:  { label: "READY TO PUBLISH",  color: "#d4a843" },
+  hold_for_rework:   { label: "NEEDS REWORK",      color: "#a78bfa" },
+  needs_rework:      { label: "NEEDS REWORK",      color: "#a78bfa" },
   blocked:           { label: "BLOCKED",           color: "#fb923c" },
   failed:            { label: "FAILED",            color: "#f87171" },
   operator_required: { label: "OPERATOR REQUIRED", color: "#f87171" },

@@ -1207,6 +1207,7 @@ def _clear_continuous_pause() -> bool:
 
 
 _LAST_FACTORY_RECONCILE_AT: float = 0.0
+_LAST_RUN_REQUEST_LOGGED_AT: float = 0.0
 FACTORY_RECONCILE_INTERVAL_SEC = 30.0
 
 # Auto-publish marker that cycle.py drops when a successful cycle is
@@ -1247,26 +1248,47 @@ def _reconcile_continuous_mode() -> None:
     desired = (snap.get("desired_status") or "").strip().lower()
     actual = (snap.get("status") or "").strip().lower()
 
-    # The dashboard's intent: if Continuous is OFF, the operator wants
-    # the loop to stop after the current cycle. desired_status reflects
-    # the same intent more directly when the operator explicitly
-    # paused/stopped.
-    want_paused = (not continuous_mode) or desired in {"paused", "idle"}
-
-    if want_paused:
+    # Pause policy (after 2026-05-02 fix):
+    #   desired in {paused, idle}             → write pause marker
+    #   desired == running, continuous=true   → no pause (loop continuously)
+    #   desired == running, continuous=false  → no pause (single-shot run)
+    #   desired empty / unknown               → leave existing markers alone
+    #
+    # Critically, continuous=False is "do not loop", NOT "halt". The
+    # bash factory loop owns the looping decision; the pause marker is
+    # only for halting the cycle. Conflating those two caused a runner
+    # to log "factory bridge · pause applied (continuous=False,
+    # desired=running)" and then ignore desired=running cycles.
+    if desired in {"paused", "idle"}:
         if _set_continuous_pause(
-            reason=f"continuous_mode={continuous_mode} desired={desired} actual={actual}"
+            reason=f"desired={desired} continuous_mode={continuous_mode} actual={actual}"
         ):
             _log_event(
-                f"factory bridge · pause applied (continuous={continuous_mode}, "
-                f"desired={desired})"
+                f"factory bridge · pause applied (desired={desired}, "
+                f"continuous={continuous_mode})"
             )
-    else:
+    elif desired == "running":
+        # desired=running ALWAYS clears any runner-managed pause —
+        # whether continuous_mode is true (loop) or false (single-shot).
         if _clear_continuous_pause():
             _log_event(
-                f"factory bridge · pause lifted (continuous={continuous_mode}, "
-                f"desired={desired})"
+                f"factory bridge · pause lifted (desired=running, "
+                f"continuous={continuous_mode})"
             )
+        else:
+            # Defensive: log the cycle-start signal once when desired
+            # transitions to running so the smoke test / observer can
+            # see "run requested" rather than silently treating
+            # desired=running as a no-op.
+            global _LAST_RUN_REQUEST_LOGGED_AT
+            now2 = time.time()
+            if now2 - _LAST_RUN_REQUEST_LOGGED_AT > 60.0:
+                _log_event(
+                    f"factory bridge · run requested (desired=running, "
+                    f"continuous={continuous_mode})"
+                )
+                _LAST_RUN_REQUEST_LOGGED_AT = now2
+    # desired blank / unrecognized → don't toggle markers either way.
 
 
 # ---------------------------------------------------------------------------

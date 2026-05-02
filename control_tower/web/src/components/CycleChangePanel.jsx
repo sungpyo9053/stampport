@@ -15,12 +15,17 @@
 const FILE_LIST_VISIBLE = 10;
 
 const STATUS_PILL = {
-  succeeded:       { label: "코드 변경 + 검증 통과", dot: "#34d399", text: "#86efac" },
-  planning_only:   { label: "기획/디자인만 산출",   dot: "#fbbf24", text: "#fde68a" },
-  no_code_change:  { label: "코드 변경 없음",       dot: "#94a3b8", text: "#cbd5e1" },
-  failed:          { label: "사이클 실패",          dot: "#f87171", text: "#fecaca" },
-  running:         { label: "사이클 진행 중",       dot: "#7dd3fc", text: "#bae6fd" },
-  idle:            { label: "대기",                 dot: "#475569", text: "#94a3b8" },
+  succeeded:        { label: "코드 변경 + 검증 통과",      dot: "#34d399", text: "#86efac" },
+  ready_to_review:  { label: "사람 리뷰 대기",             dot: "#7dd3fc", text: "#bae6fd" },
+  ready_to_publish: { label: "Publish 대기",               dot: "#d4a843", text: "#fde68a" },
+  hold_for_rework:  { label: "PM HOLD — 재작업 사이클",    dot: "#a78bfa", text: "#ddd6fe" },
+  needs_rework:     { label: "재작업 필요",                dot: "#a78bfa", text: "#ddd6fe" },
+  planning_only:    { label: "기획/디자인만 산출",         dot: "#fbbf24", text: "#fde68a" },
+  no_code_change:   { label: "코드 변경 없음",             dot: "#94a3b8", text: "#cbd5e1" },
+  failed:           { label: "사이클 실패",                dot: "#f87171", text: "#fecaca" },
+  running:          { label: "사이클 진행 중",             dot: "#7dd3fc", text: "#bae6fd" },
+  idle:             { label: "대기",                       dot: "#475569", text: "#94a3b8" },
+  fresh_idle:       { label: "Fresh — 사이클 미시작",      dot: "#475569", text: "#94a3b8" },
 };
 
 function formatRelative(iso) {

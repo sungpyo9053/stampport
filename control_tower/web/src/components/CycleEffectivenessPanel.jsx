@@ -17,12 +17,17 @@
 // We deliberately keep this small enough to live next to PingPongBoard.
 
 const STATUS_TONE = {
-  succeeded:       { label: "실제 코드 변경", color: "#34d399", glow: "#34d39955" },
-  docs_only:       { label: "Docs/Config 만",  color: "#fbbf24", glow: "#fbbf2455" },
-  planning_only:   { label: "기획만",          color: "#a78bfa", glow: "#a78bfa55" },
-  no_code_change:  { label: "변경 없음",        color: "#94a3b8", glow: "#94a3b855" },
-  failed:          { label: "실패",            color: "#f87171", glow: "#f8717155" },
-  running:         { label: "진행 중",         color: "#38bdf8", glow: "#38bdf855" },
+  succeeded:        { label: "실제 코드 변경",        color: "#34d399", glow: "#34d39955" },
+  ready_to_review:  { label: "사람 리뷰 대기",        color: "#7dd3fc", glow: "#7dd3fc55" },
+  ready_to_publish: { label: "Publish 대기",         color: "#d4a843", glow: "#d4a84355" },
+  hold_for_rework:  { label: "PM HOLD — 재작업",      color: "#a78bfa", glow: "#a78bfa55" },
+  needs_rework:     { label: "재작업 필요",           color: "#a78bfa", glow: "#a78bfa55" },
+  docs_only:        { label: "Docs/Config 만",        color: "#fbbf24", glow: "#fbbf2455" },
+  planning_only:    { label: "기획만",                color: "#a78bfa", glow: "#a78bfa55" },
+  no_code_change:   { label: "변경 없음",             color: "#94a3b8", glow: "#94a3b855" },
+  failed:           { label: "실패",                  color: "#f87171", glow: "#f8717155" },
+  running:          { label: "진행 중",               color: "#38bdf8", glow: "#38bdf855" },
+  fresh_idle:       { label: "Fresh — 미시작",        color: "#475569", glow: "#47556955" },
 };
 
 function pickPrimaryRunner(runners = []) {
@@ -98,6 +103,11 @@ export default function CycleEffectivenessPanel({ runners = [] }) {
   const suggestedAction = ce?.suggested_action || null;
 
   // Headline copy — operator-readable single sentence.
+  // Sanity guard: a "planning_only" claim with changed_files > 0 is a
+  // status-shape inconsistency. We surface that explicitly rather than
+  // silently lying about "기획만 진행" when code actually changed.
+  const inconsistentPlanningWithChanges =
+    status === "planning_only" && changedCount > 0;
   let headline = "";
   if (status === "succeeded") {
     const fe = ce?.frontend_changed ? "프론트" : null;
@@ -105,15 +115,33 @@ export default function CycleEffectivenessPanel({ runners = [] }) {
     const ct = ce?.control_tower_changed ? "관제실" : null;
     const tiers = [fe, be, ct].filter(Boolean).join(" + ") || "코드";
     headline = `이번 사이클은 실제 ${tiers} 코드를 ${changedCount}개 변경했습니다.`;
+  } else if (status === "ready_to_review") {
+    headline =
+      `코드 ${changedCount}개 변경 + QA 통과. 자동 배포가 꺼져 있어 ` +
+      "사람 리뷰 대기 중입니다.";
+  } else if (status === "ready_to_publish") {
+    headline =
+      `코드 ${changedCount}개 변경 + QA 통과. publish_changes / ` +
+      "deploy_to_server 명령으로 commit · push 만 남았습니다.";
+  } else if (status === "hold_for_rework" || status === "needs_rework") {
+    headline =
+      "PM 결정이 HOLD — 디자이너/기획자의 rework 항목을 반영해 다음 사이클을 " +
+      "진행하세요. 개발 단계는 의도적으로 미실행입니다.";
   } else if (status === "docs_only") {
     headline =
       `이번 사이클은 docs/config 파일 ${changedCount}개만 바뀌어, ` +
       "사용자 영향이 있는 코드 변경은 없습니다.";
+  } else if (inconsistentPlanningWithChanges) {
+    headline =
+      `상태 불일치: planning_only 인데 변경 파일이 ${changedCount}개입니다. ` +
+      "control_state 와 cycle.py 출력 비교 필요.";
   } else if (status === "planning_only") {
     headline =
-      ticketStatus === "missing"
-        ? "Implementation Ticket 의 수정 대상 파일이 없어 개발 단계로 넘어가지 않았습니다."
-        : "이번 사이클은 기획 산출물만 생성되어 코드 변경이 없습니다.";
+      ticketStatus === "pm_scope_missing_target_files"
+        ? "PM 결정에 수정 대상 파일이 명시되지 않아 implementation_ticket 을 만들 수 없습니다."
+        : ticketStatus === "missing"
+          ? "Implementation Ticket 의 수정 대상 파일이 없어 개발 단계로 넘어가지 않았습니다."
+          : "이번 사이클은 기획 산출물만 생성되어 코드 변경이 없습니다.";
   } else if (status === "no_code_change") {
     headline = "이번 사이클은 코드 변경이 발생하지 않았습니다.";
   } else if (status === "failed") {
@@ -121,6 +149,10 @@ export default function CycleEffectivenessPanel({ runners = [] }) {
       failedStage
         ? `${failedStage} 단계에서 실패해 push 하지 않았습니다.`
         : "단계 실패 — push 하지 않았습니다.";
+  } else if (status === "fresh_idle") {
+    headline =
+      "Fresh runtime — 사이클이 아직 시작되지 않았습니다. " +
+      "factory_smoke --mode local-cycle 으로 첫 사이클을 시작하세요.";
   } else {
     headline = "사이클 진행 중 — 결과 대기 중";
   }
