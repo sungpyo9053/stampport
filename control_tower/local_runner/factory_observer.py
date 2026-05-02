@@ -1455,6 +1455,13 @@ REPAIR_TARGETS_BY_CODE: dict[str, list[str]] = {
         "control_tower/local_runner/control_state.py (stale_state filter)",
         "control_tower/web/src (UI 의 deploy badge 표시 로직)",
     ],
+    "scope_mismatch": [
+        "control_tower/local_runner/cycle.py (stage_implementation_ticket / "
+        "stage_claude_apply 의 spec_bypass 경로)",
+        "control_tower/local_runner/cycle.py (_check_scope_consistency / "
+        "_extract_design_spec_scope_keywords)",
+        ".runtime/design_spec.md / .runtime/implementation_ticket.md 정합성",
+    ],
     "unknown": [
         "(분류 추가 필요 — control_tower/local_runner/factory_observer.py 의 classify())",
     ],
@@ -1556,6 +1563,19 @@ REPAIR_REQUIREMENTS_BY_CODE: dict[str, str] = {
         "UI 측 stale — Web UI 의 badge 결정 로직을 control_state 우선으로 변경.\n"
         "3. 또는 새 cycle 한 번 돌려 deploy_progress 자체를 갱신."
     ),
+    "scope_mismatch": (
+        "1. .runtime/factory_smoke_report.md 의 Scope consistency 섹션 확인 — "
+        "design_spec_feature 와 implementation_ticket_feature 가 다르면 spec_bypass "
+        "경로가 단일 source of truth (design_spec.md) 를 따르지 않은 것.\n"
+        "2. .runtime/claude_apply.diff 와 .runtime/design_spec.md 의 수정 대상 파일 / "
+        "키워드 매칭 결과를 비교.\n"
+        "3. 다음 사이클은 claude_proposal.md 를 무시하고 design_spec.md 기반으로 "
+        "implementation_ticket / claude_apply 를 다시 작성하도록 강제 (cycle.py 의 "
+        "spec_bypass 경로가 enable 된 상태인지 확인).\n"
+        "4. 같은 scope_mismatch 가 2회 이상 발생하면 design_spec acceptance 가 "
+        "통과한 spec_bypass 라도 디자이너에게 더 명시적인 키워드 / 컴포넌트 이름을 "
+        "요구."
+    ),
     "unknown": (
         "1. control_state.json / factory_state.json / pipeline_state.json / "
         "forward_progress_state.json 의 raw 필드를 읽고 어떤 시그널이 비어있고 어떤 "
@@ -1623,6 +1643,11 @@ ACCEPTANCE_TEMPLATE_BY_CODE: dict[str, str] = {
     "old_deploy_failed_stale": (
         "- deploy_progress.status != 'failed'\n"
         "- 또는 UI badge 가 control_state.deploy.status 를 따름"
+    ),
+    "scope_mismatch": (
+        "- factory_state.scope_consistency_status == 'passed' (또는 미설정)\n"
+        "- claude_apply.diff 가 design_spec target_files 중 ≥1 변경 + 키워드 ≥3 매칭\n"
+        "- design_spec_feature == implementation_ticket_selected_feature"
     ),
     "unknown": (
         "- factory_observer 가 새 diagnostic_code 로 분류\n"
@@ -1889,6 +1914,7 @@ def _suggest_commit_message(code: str) -> str:
         "runner_offline": "(no code change — restart runner)",
         "actions_pending_timeout": "Refresh actions polling on long-pending workflow",
         "old_deploy_failed_stale": "UI: prefer control_state.deploy over deploy_progress for badge",
+        "scope_mismatch": "Enforce scope consistency between design_spec and claude_apply",
         "unknown": "(diagnose-only — extend factory_observer.classify with new code)",
     }
     return headers.get(code, "Repair factory cycle blocker")

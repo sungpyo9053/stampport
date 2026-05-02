@@ -601,6 +601,24 @@ class CycleState:
     implementation_ticket_target_screens: list[str] = field(default_factory=list)
     implementation_ticket_message: str | None = None
     implementation_ticket_skipped_reason: str | None = None
+    # Where each piece of the cycle's "what to build" answer came from.
+    # On spec_bypass cycles, all three should be `design_spec` so an old
+    # planner feature (e.g. Local Visa) cannot leak into the ticket /
+    # apply / diff. The factory_smoke report cross-checks these against
+    # the design_spec acceptance gate.
+    selected_feature: str | None = None
+    selected_feature_source: str | None = None     # planner|design_spec|...
+    implementation_ticket_source: str | None = None  # planner_proposal|design_spec
+    claude_apply_source: str | None = None         # claude_proposal|design_spec
+    design_spec_feature: str | None = None
+    # Scope-consistency QA gate — set by claude_apply when the diff is
+    # checked against design_spec target_files + keywords on spec_bypass
+    # cycles. failed → verdict downgrades to FAIL (factory_smoke surfaces
+    # diagnostic_code=scope_mismatch).
+    scope_consistency_status: str | None = None    # passed|failed|not_applicable
+    scope_mismatch_reason: str | None = None
+    scope_consistency_keywords_matched: list[str] = field(default_factory=list)
+    scope_consistency_keywords_total: int = 0
     # Per-tier file-change flags — set in main() after claude_apply by
     # _categorize_changed_files. The dashboard shows "FE 변경 / BE 변경 /
     # 관제실 변경" badges off these so the operator can tell at a glance
@@ -738,6 +756,19 @@ class CycleState:
             "implementation_ticket_target_screens": list(self.implementation_ticket_target_screens),
             "implementation_ticket_message": self.implementation_ticket_message,
             "implementation_ticket_skipped_reason": self.implementation_ticket_skipped_reason,
+            "selected_feature": self.selected_feature
+                or self.implementation_ticket_selected_feature
+                or self.product_planner_selected_feature,
+            "selected_feature_source": self.selected_feature_source,
+            "implementation_ticket_source": self.implementation_ticket_source,
+            "claude_apply_source": self.claude_apply_source,
+            "design_spec_feature": self.design_spec_feature,
+            "scope_consistency_status": self.scope_consistency_status,
+            "scope_mismatch_reason": self.scope_mismatch_reason,
+            "scope_consistency_keywords_matched": list(
+                self.scope_consistency_keywords_matched
+            ),
+            "scope_consistency_keywords_total": self.scope_consistency_keywords_total,
             "frontend_changed": self.frontend_changed,
             "backend_changed": self.backend_changed,
             "control_tower_changed": self.control_tower_changed,
@@ -3937,6 +3968,170 @@ def _extract_design_spec_svg_paths(body: str) -> list[str]:
     return out
 
 
+def _extract_design_spec_feature(body: str) -> str | None:
+    """Pull the design_spec's chosen feature name out of the
+    "## 구현 대상 기능" block. Returns None when absent — callers
+    fall back to selected_feature heuristics in that case."""
+    section = _extract_md_section(body, "구현 대상 기능")
+    if not section:
+        return None
+    for raw in section.splitlines():
+        line = raw.strip().lstrip("-").strip()
+        m = re.match(r"^기능명\s*[:：]\s*(.+)$", line)
+        if m:
+            name = m.group(1).strip()
+            return name[:120] or None
+    return None
+
+
+# Tokens we always recognize as schema fields when they appear in the
+# design_spec's badges.js section. Used as the curated whitelist for
+# scope-consistency keyword extraction so generic English words like
+# "level" still get picked up (they lack camelCase / hyphen markers).
+_DESIGN_SPEC_SCHEMA_FIELDS = (
+    "level", "tier", "titleLabel", "lockedUntilLevel",
+    "currentTitleLevel", "relatedBadge",
+)
+
+
+def _extract_design_spec_scope_keywords(body: str) -> list[str]:
+    """Curated identifiers we can verify in claude_apply.diff to confirm
+    the cycle actually built the design_spec (not a different feature).
+
+    Pulls four classes of token:
+      1. Capitalized component basenames from "## 수정 대상 파일"
+         (e.g. TitleSeal from `app/web/src/components/TitleSeal.jsx`).
+      2. Schema field names from "## badges.js 스키마 변경"
+         (e.g. level, tier, titleLabel, lockedUntilLevel).
+      3. CSS class names from "## ShareCard 레이아웃 명세"
+         matching the `share-*` pattern.
+      4. Pixel constants like `560px`, `390px` from any section so a
+         hard-coded ShareCard size constraint shows up as a signal.
+
+    Order is deterministic and de-duplicated.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tok: str) -> None:
+        t = tok.strip()
+        if not t:
+            return
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(t)
+
+    for path in _extract_design_spec_target_files(body):
+        base = path.rsplit("/", 1)[-1]
+        name = base.rsplit(".", 1)[0] if "." in base else base
+        if name and name[0].isupper() and len(name) >= 4:
+            _add(name)
+
+    badges_section = _extract_md_section(body, "badges.js 스키마 변경")
+    for fixed in _DESIGN_SPEC_SCHEMA_FIELDS:
+        if re.search(rf"\b{fixed}\b", badges_section):
+            _add(fixed)
+
+    sharecard_section = _extract_md_section(body, "ShareCard 레이아웃 명세")
+    for tok in re.findall(r"\b(share-[a-z][a-z0-9-]{2,})\b", sharecard_section):
+        _add(tok)
+
+    for section in (sharecard_section, body):
+        for tok in re.findall(r"\b(\d{2,4})\s*px\b", section):
+            try:
+                v = int(tok)
+            except ValueError:
+                continue
+            if 100 <= v <= 2000:
+                _add(f"{v}px")
+
+    return out
+
+
+def _check_scope_consistency(
+    *,
+    design_spec_md: str,
+    design_spec_target_files: list[str],
+    design_spec_feature: str | None,
+    diff_text: str,
+    changed_files: list[str],
+    selected_feature: str | None,
+    min_keyword_matches: int = 3,
+) -> tuple[bool, str | None, list[str], int]:
+    """Verify the apply diff actually built what design_spec said.
+
+    Three gates (any failing → scope_mismatch):
+      G1. changed_files ∩ design_spec_target_files ≥ 1
+      G2. selected_feature aligns with design_spec_feature
+      G3. claude_apply.diff contains ≥ min_keyword_matches of the
+          curated scope keywords
+
+    Returns (passed, reason_if_failed, matched_keywords, total_keywords).
+    """
+    spec_files_norm = {f.strip().lower() for f in design_spec_target_files if f}
+    changed_norm = {f.strip().lower() for f in changed_files if f}
+    if spec_files_norm and not (spec_files_norm & changed_norm):
+        return (
+            False,
+            (
+                "scope_mismatch: changed_files 가 design_spec target_files 와 "
+                "교집합이 없음 — design_spec 외 다른 기능이 적용된 것으로 보임"
+            ),
+            [],
+            0,
+        )
+
+    if (
+        design_spec_feature
+        and selected_feature
+        and design_spec_feature.strip()
+        and selected_feature.strip()
+    ):
+        ds = design_spec_feature.strip()
+        sel = selected_feature.strip()
+        if (
+            ds not in sel
+            and sel not in ds
+            and ds.split()[0] not in sel
+            and sel.split()[0] not in ds
+        ):
+            return (
+                False,
+                (
+                    f"scope_mismatch: implementation_ticket selected_feature="
+                    f"'{sel}' 가 design_spec 기능명='{ds}' 와 일치하지 않음"
+                ),
+                [],
+                0,
+            )
+
+    keywords = _extract_design_spec_scope_keywords(design_spec_md)
+    if not keywords:
+        # No keywords to anchor on — trust the file/feature gates we
+        # already passed. Mark passed but with 0/0.
+        return True, None, [], 0
+    haystack = (diff_text or "").lower()
+    matched: list[str] = []
+    for kw in keywords:
+        if kw.lower() in haystack:
+            matched.append(kw)
+    if len(matched) < min_keyword_matches:
+        return (
+            False,
+            (
+                f"scope_mismatch: claude_apply.diff 가 design_spec 키워드 "
+                f"{min_keyword_matches}개 이상을 포함하지 않음 — "
+                f"매칭 {len(matched)}/{len(keywords)}"
+                + (f" ({', '.join(matched[:6])})" if matched else "")
+            ),
+            matched,
+            len(keywords),
+        )
+    return True, None, matched, len(keywords)
+
+
 def _validate_design_spec(body: str) -> list[str]:
     """Acceptance: PM treats design_spec as SHIP-equivalent when this
     returns []. Any non-empty list keeps PM in HOLD."""
@@ -4790,6 +4985,149 @@ def _build_ticket_markdown(
     )
 
 
+def _build_ticket_from_design_spec(
+    design_spec_md: str,
+    *,
+    target_files: list[str],
+    target_screens: list[str],
+) -> tuple[str, str | None]:
+    """Compose implementation_ticket.md from design_spec.md ALONE.
+
+    No proposal / planner / PM body is consulted. This is the spec_bypass
+    path: when design_spec_acceptance has passed, the design_spec is the
+    single source of truth for the cycle, and a stale Local Visa proposal
+    cannot leak into a TitleSeal cycle's ticket.
+
+    Returns (body, feature_name_or_none).
+    """
+    feature = _extract_design_spec_feature(design_spec_md)
+    impl_target = _extract_md_section(design_spec_md, "구현 대상 기능")
+    svg_section = _extract_md_section(design_spec_md, "SVG Path 명세")
+    titlelabel_section = _extract_md_section(
+        design_spec_md, "titleLabel 최종 목록"
+    )
+    badges_section = _extract_md_section(
+        design_spec_md, "badges.js 스키마 변경"
+    )
+    sharecard_section = _extract_md_section(
+        design_spec_md, "ShareCard 레이아웃 명세"
+    )
+    qa_section = _extract_md_section(design_spec_md, "QA 기준")
+
+    # Extract user problem from "관련 PM HOLD 사유" line inside 구현 대상 기능.
+    user_problem = "(자료 없음)"
+    for raw in (impl_target or "").splitlines():
+        line = raw.strip().lstrip("-").strip()
+        m = re.match(r"^관련 PM HOLD 사유\s*[:：]\s*(.+)$", line)
+        if m:
+            user_problem = m.group(1).strip()
+            break
+
+    files_block = (
+        "\n".join(f"- {p}" for p in target_files)
+        if target_files else "(없음)"
+    )
+    screens_block = (
+        "\n".join(f"- {s}" for s in target_screens)
+        if target_screens else "(별도 표기 없음)"
+    )
+
+    behavior_parts: list[str] = []
+    if svg_section:
+        behavior_parts.append("### SVG Path 명세\n" + svg_section.strip())
+    if titlelabel_section:
+        behavior_parts.append(
+            "### titleLabel 최종 목록\n" + titlelabel_section.strip()
+        )
+    if badges_section:
+        behavior_parts.append(
+            "### badges.js 스키마 변경\n" + badges_section.strip()
+        )
+    if sharecard_section:
+        behavior_parts.append(
+            "### ShareCard 레이아웃 명세\n" + sharecard_section.strip()
+        )
+    behavior_block = (
+        "\n\n".join(behavior_parts)
+        or "(design_spec.md 본문 참조)"
+    )
+
+    body = (
+        "# Implementation Ticket\n\n"
+        "<!-- source: design_spec — 단일 source of truth -->\n\n"
+        f"## 선택한 기능\n{feature or '(design_spec 기능명 미기재)'}\n\n"
+        f"## 사용자 문제\n{user_problem}\n\n"
+        "## 이번 사이클 구현 범위\n"
+        + (impl_target.strip() if impl_target else "(design_spec 구현 대상 기능 참조)")
+        + "\n\n"
+        f"## 수정 대상 화면\n{screens_block}\n\n"
+        f"## 수정 대상 파일\n{files_block}\n\n"
+        "## 구현해야 할 동작\n"
+        + behavior_block
+        + "\n\n"
+        "## UI 변경사항\n"
+        "claude_apply 단계에서 위 SVG Path / ShareCard 레이아웃 / "
+        "TitleSeal 명세를 그대로 적용한다.\n\n"
+        "## 데이터 변경사항\n"
+        + (badges_section.strip() if badges_section else
+           "(badges.js 스키마 외 데이터 변경 없음)")
+        + "\n\n"
+        "## 제외 범위\n"
+        "- 위 파일 목록에 없는 경로 수정 금지\n"
+        "- 이전 사이클의 selected_feature 를 다시 적용하지 마라 — "
+        "이번 사이클의 단일 source of truth 는 design_spec.md\n"
+        "- claude_proposal.md 본문 무시 (있더라도 사용하지 않음)\n\n"
+        "## 수동 QA 시나리오\n"
+        + (qa_section.strip() if qa_section else "(QA 기준 미기재)")
+        + "\n\n"
+        "## 성공 기준\n"
+        "- design_spec acceptance 조건 만족 (SVG 3종 / titleLabel ≥13 / "
+        "수정 대상 파일 / ShareCard 렌더 조건 / QA 기준)\n"
+        "- `npm run build` 통과\n"
+        "- 위 수동 QA 시나리오 통과\n"
+    )
+    return body, feature
+
+
+def _build_apply_input_from_design_spec(
+    *,
+    design_spec_md: str,
+    ticket_md: str,
+    target_files: list[str],
+) -> str:
+    """Assemble the proposal-shaped body that claude_apply consumes on
+    a spec_bypass cycle. Uses the existing CLAUDE_APPLY_PROMPT_TEMPLATE
+    structure so the prompt's "수정 제안" / "변경 대상 파일" anchors
+    stay valid, but the *content* comes from the ticket + design_spec —
+    not from claude_proposal.md."""
+    files_block = (
+        "\n".join(
+            f"- `{p}` — design_spec 명세 그대로 적용"
+            for p in target_files
+        )
+        if target_files else "(없음)"
+    )
+    return (
+        "# Stampport 구현 적용 (Design Spec 기반)\n\n"
+        "이번 사이클의 단일 source of truth 는 implementation_ticket.md / "
+        "design_spec.md 입니다. claude_proposal.md 가 있더라도 무시하세요.\n\n"
+        "## 수정 제안\n"
+        + ticket_md.strip()
+        + "\n\n## 변경 대상 파일\n"
+        + files_block
+        + "\n\n## 검증 방법\n"
+        "- `npm run build` 통과\n"
+        "- design_spec QA 기준 충족\n"
+        "- design_spec target_files 외 다른 경로는 수정 금지\n\n"
+        "## 적용 여부 판단 기준\n"
+        "- design_spec.md 의 SVG Path / titleLabel / badges.js 스키마 / "
+        "ShareCard 레이아웃 명세를 그대로 반영하지 못하는 변경은 거부.\n\n"
+        "=== START Design Spec (단일 source of truth) ===\n"
+        + design_spec_md.strip()
+        + "\n=== END Design Spec ===\n"
+    )
+
+
 def stage_implementation_ticket(state: CycleState) -> StageResult:
     """Compose .runtime/implementation_ticket.md from the cycle's
     upstream artifacts. Marks the ticket "missing" when no concrete
@@ -4874,14 +5212,17 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     except OSError:
         design_spec_md = ""
 
-    feature = _selected_feature_for_ticket(state)
-    state.implementation_ticket_selected_feature = feature
+    spec_bypass = bool(
+        design_spec_md
+        and state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+    )
 
     # Source priority: design_spec.md takes precedence whenever its
     # acceptance gate passed, since that's the spec PM accepted as the
     # ship signal. Otherwise fall through to proposal / pm / planner.
     target_files: list[str] = []
-    if design_spec_md and state.design_spec_acceptance_passed:
+    if spec_bypass:
         target_files = _extract_design_spec_target_files(design_spec_md)
     if not target_files:
         for src in (proposal_md, pm_md, planner_md):
@@ -4891,6 +5232,18 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             if target_files:
                 break
     target_screens = _parse_screens_from_md(planner_md) or _parse_screens_from_md(pm_md)
+
+    if spec_bypass:
+        # Design-spec single-source-of-truth: derive the feature name
+        # from design_spec.md itself, NOT from prior planner state. This
+        # is the gate that prevents an old "Local Visa" selected_feature
+        # from contaminating a TitleSeal cycle's ticket.
+        ds_feature = _extract_design_spec_feature(design_spec_md)
+        feature = ds_feature or "(design_spec 기능명 미기재)"
+        state.design_spec_feature = ds_feature
+    else:
+        feature = _selected_feature_for_ticket(state)
+    state.implementation_ticket_selected_feature = feature
 
     if not target_files:
         # No concrete file targets → ticket is "missing". We still write
@@ -4942,15 +5295,34 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         )
         return sr
 
-    body = _build_ticket_markdown(
-        state,
-        feature=feature,
-        target_files=target_files,
-        target_screens=target_screens,
-        pm_md=pm_md,
-        planner_md=planner_md,
-        proposal_md=proposal_md,
-    )
+    if spec_bypass:
+        body, ds_feature_for_body = _build_ticket_from_design_spec(
+            design_spec_md,
+            target_files=target_files,
+            target_screens=target_screens,
+        )
+        ticket_source = "design_spec"
+        feature_source = "design_spec"
+        if ds_feature_for_body:
+            feature = ds_feature_for_body
+            state.implementation_ticket_selected_feature = ds_feature_for_body
+            state.design_spec_feature = ds_feature_for_body
+    else:
+        body = _build_ticket_markdown(
+            state,
+            feature=feature,
+            target_files=target_files,
+            target_screens=target_screens,
+            pm_md=pm_md,
+            planner_md=planner_md,
+            proposal_md=proposal_md,
+        )
+        ticket_source = "claude_proposal" if proposal_md else "planner"
+        feature_source = (
+            "planner"
+            if state.product_planner_selected_feature
+            else "implementation_ticket"
+        )
     ok_write = safe_write_artifact(
         IMPLEMENTATION_TICKET_FILE, body,
         cycle_id=state.cycle, stage="implementation_ticket",
@@ -4958,6 +5330,7 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         extra={
             "target_files_count": len(target_files),
             "selected_feature": feature or "—",
+            "ticket_source": ticket_source,
         },
     )
     if not ok_write:
@@ -4973,8 +5346,12 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     state.implementation_ticket_at = utc_now_iso()
     state.implementation_ticket_target_files = list(target_files)
     state.implementation_ticket_target_screens = list(target_screens)
+    state.implementation_ticket_source = ticket_source
+    state.selected_feature = feature
+    state.selected_feature_source = feature_source
     state.implementation_ticket_message = (
         f"Implementation Ticket 작성됨 — 대상 파일 {len(target_files)}개"
+        + (" (design_spec 기반)" if spec_bypass else "")
     )
     _emit_cycle_log(
         state, "implementation_ticket_created",
@@ -5406,10 +5783,21 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     if not _factory_flag_enabled("FACTORY_APPLY_CLAUDE", default_on=True):
         return _skip("FACTORY_APPLY_CLAUDE=false — Claude 적용 명시적 비활성")
 
+    # spec_bypass: when design_spec_acceptance has passed, the design
+    # spec is the cycle's single source of truth. claude_proposal.md is
+    # ignored even if present, and claude_propose's status is allowed to
+    # be skipped (the ticket + design_spec carry enough detail).
+    apply_spec_bypass = bool(
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+        and DESIGN_SPEC_FILE.is_file()
+        and IMPLEMENTATION_TICKET_FILE.is_file()
+    )
+
     # Pre-condition 2: this cycle must have produced a fresh proposal.
     # We refuse to apply a stale proposal from a previous run because
     # the working tree may have shifted underneath it.
-    if state.claude_proposal_status != "generated":
+    if not apply_spec_bypass and state.claude_proposal_status != "generated":
         return _skip(
             f"이번 사이클의 claude_propose가 generated 아님 ({state.claude_proposal_status}) — 적용 건너뜀"
         )
@@ -5443,15 +5831,29 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         names = ", ".join(s.name for s in failed_prior)
         return _skip(f"이전 단계 실패({names}) — 적용 건너뜀")
 
-    # Pre-condition 5: tools.
+    # Pre-condition 5: tools + input source.
     claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     if not claude_bin:
         return _skip("claude CLI 미설치 — 스킵")
-    if not PROPOSAL_FILE.is_file():
-        return _skip("claude_proposal.md 없음 — 스킵")
-    proposal_text = PROPOSAL_FILE.read_text(encoding="utf-8").strip()
-    if not proposal_text:
-        return _skip("제안 본문이 비어있음 — 스킵")
+    if apply_spec_bypass:
+        try:
+            design_spec_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
+            ticket_md = IMPLEMENTATION_TICKET_FILE.read_text(encoding="utf-8")
+        except OSError as e:
+            return _skip(f"design_spec / ticket 읽기 실패: {e}")
+        proposal_text = _build_apply_input_from_design_spec(
+            design_spec_md=design_spec_md,
+            ticket_md=ticket_md,
+            target_files=list(state.implementation_ticket_target_files),
+        )
+        state.claude_apply_source = "design_spec"
+    else:
+        if not PROPOSAL_FILE.is_file():
+            return _skip("claude_proposal.md 없음 — 스킵")
+        proposal_text = PROPOSAL_FILE.read_text(encoding="utf-8").strip()
+        if not proposal_text:
+            return _skip("제안 본문이 비어있음 — 스킵")
+        state.claude_apply_source = "claude_proposal"
 
     # Snapshot before — we'll diff against this to know what to roll back.
     before_hashes = _hash_tracked_under_allowed()
@@ -5584,6 +5986,64 @@ def stage_claude_apply(state: CycleState) -> StageResult:
             sr.duration_sec = round(time.time() - t0, 3)
             return sr
 
+    # spec_bypass scope-consistency QA gate. Verifies the diff actually
+    # builds what design_spec said: changed_files ∩ design_spec.target
+    # files, selected_feature alignment, and ≥3 design_spec keywords in
+    # the diff body. Failure rolls back the apply and routes verdict to
+    # FAIL/scope_mismatch — the operator must reconcile the spec / proposal
+    # mismatch before another cycle runs.
+    if apply_spec_bypass:
+        try:
+            ds_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
+        except OSError:
+            ds_md = ""
+        ds_targets = _extract_design_spec_target_files(ds_md)
+        ds_feature = _extract_design_spec_feature(ds_md)
+        sel_feature = (
+            state.implementation_ticket_selected_feature
+            or state.selected_feature
+        )
+        scope_ok, scope_reason, kw_matched, kw_total = _check_scope_consistency(
+            design_spec_md=ds_md,
+            design_spec_target_files=ds_targets,
+            design_spec_feature=ds_feature,
+            diff_text=(diff_out or ""),
+            changed_files=diff_files,
+            selected_feature=sel_feature,
+        )
+        state.scope_consistency_keywords_matched = list(kw_matched)
+        state.scope_consistency_keywords_total = kw_total
+        if not scope_ok:
+            ok_rb, rb_msg = _rollback_apply(changed_tracked, new_untracked)
+            sr.status = "failed"
+            sr.message = (
+                "스코프 일관성 검증 실패 — design_spec 과 무관한 변경으로 "
+                "판단되어 롤백"
+                + ("" if ok_rb else " (일부 실패)")
+            )
+            sr.detail = f"사유: {scope_reason}\n{rb_msg}"
+            state.claude_apply_status = "rolled_back"
+            state.claude_apply_rollback = True
+            state.claude_apply_changed_files = []
+            state.claude_apply_message = sr.message
+            state.scope_consistency_status = "failed"
+            state.scope_mismatch_reason = scope_reason
+            state.failed_stage = "claude_apply"
+            state.failed_reason = scope_reason
+            _emit_cycle_log(
+                state, "claude_apply_scope_mismatch",
+                "claude apply rolled back — scope mismatch",
+                reason=scope_reason,
+                changed_files=diff_files[:20],
+                target_files=list(ds_targets[:20]),
+                keywords_matched=kw_matched[:10],
+                keywords_total=kw_total,
+            )
+            sr.duration_sec = round(time.time() - t0, 3)
+            return sr
+        state.scope_consistency_status = "passed"
+        state.scope_mismatch_reason = None
+
     # Success path. Save the diff so the human reviewer has the full
     # patch in one place. NOT committed, NOT pushed.
     if ok:
@@ -5598,6 +6058,12 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     state.claude_apply_rollback = False
     state.claude_apply_message = (
         f"{len(diff_files)}개 파일 변경, 빌드/문법/위험 파일 재검증 통과"
+        + (
+            f" + scope_consistency=passed ("
+            f"{len(state.scope_consistency_keywords_matched)}/"
+            f"{state.scope_consistency_keywords_total} keywords)"
+            if apply_spec_bypass else ""
+        )
     )
 
     _emit_cycle_log(

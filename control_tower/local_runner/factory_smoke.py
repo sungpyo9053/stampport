@@ -217,8 +217,23 @@ class SmokeRun:
     design_spec_acceptance_passed: bool | None = None
     design_spec_acceptance_errors: list[str] = field(default_factory=list)
     design_spec_title_label_count: int | None = None
+    design_spec_target_files: list[str] = field(default_factory=list)
     design_spec_target_files_count: int = 0
     design_spec_svg_path_valid: bool | None = None
+    design_spec_feature: str | None = None
+    # Per-cycle source provenance — answers "where did the cycle's
+    # 'what to build' answer come from?" so the operator can detect a
+    # spec/proposal mismatch at a glance.
+    selected_feature: str | None = None
+    selected_feature_source: str | None = None
+    implementation_ticket_source: str | None = None
+    claude_apply_source: str | None = None
+    # Scope-consistency QA gate result.
+    scope_consistency_status: str | None = None
+    scope_mismatch_reason: str | None = None
+    scope_consistency_keywords_matched: list[str] = field(default_factory=list)
+    scope_consistency_keywords_total: int = 0
+    changed_files: list[str] = field(default_factory=list)
     stale_artifacts_moved: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -471,7 +486,22 @@ def resolve_verdict(state: dict, *, exit_code: int | None = None) -> tuple[str, 
         in {"", "false", "0", "no", "off"}
     )
 
+    # Scope-consistency QA gate (spec_bypass cycles). When the diff
+    # didn't actually build what design_spec promised, the cycle MUST
+    # NOT surface as READY_TO_REVIEW even if every other status looks
+    # green — the operator would otherwise approve an unrelated change.
+    if (state.get("scope_consistency_status") or "").strip() == "failed":
+        return ("FAIL", "scope_mismatch",
+                state.get("scope_mismatch_reason")
+                or "claude_apply.diff 가 design_spec 과 일치하지 않음")
+
     if exit_code is not None and exit_code != 0 and fs_status == "failed":
+        # If the underlying failure was a scope mismatch, surface that
+        # specific code so the report doesn't say "cycle exited 1".
+        reason = (state.get("failed_reason") or "").lower()
+        if "scope_mismatch" in reason or "스코프 일관성" in reason:
+            return ("FAIL", "scope_mismatch",
+                    state.get("failed_reason") or reason)
         return ("FAIL", "cycle_subprocess_failed",
                 f"cycle exited {exit_code}, factory_state.status=failed")
 
@@ -515,8 +545,11 @@ def resolve_verdict(state: dict, *, exit_code: int | None = None) -> tuple[str, 
                 "factory.paused marker present — cycle did not start")
 
     if fs_status == "failed":
-        return ("FAIL", "cycle_failed",
-                state.get("failed_reason") or "factory_state.status=failed")
+        reason = state.get("failed_reason") or "factory_state.status=failed"
+        low = reason.lower() if isinstance(reason, str) else ""
+        if "scope_mismatch" in low or "스코프 일관성" in low:
+            return ("FAIL", "scope_mismatch", reason)
+        return ("FAIL", "cycle_failed", reason)
 
     if fs_status == "running":
         return ("FAIL", "current_stage_stuck",
@@ -816,7 +849,26 @@ def _finalize_run(
         )
     target_files = factory_state.get("design_spec_target_files") or []
     if isinstance(target_files, list):
+        run.design_spec_target_files = [str(p) for p in target_files]
         run.design_spec_target_files_count = len(target_files)
+    run.design_spec_feature = factory_state.get("design_spec_feature")
+    run.selected_feature = factory_state.get("selected_feature")
+    run.selected_feature_source = factory_state.get("selected_feature_source")
+    run.implementation_ticket_source = factory_state.get(
+        "implementation_ticket_source"
+    )
+    run.claude_apply_source = factory_state.get("claude_apply_source")
+    run.scope_consistency_status = factory_state.get("scope_consistency_status")
+    run.scope_mismatch_reason = factory_state.get("scope_mismatch_reason")
+    sc_kw = factory_state.get("scope_consistency_keywords_matched") or []
+    if isinstance(sc_kw, list):
+        run.scope_consistency_keywords_matched = [str(k) for k in sc_kw]
+    sc_tot = factory_state.get("scope_consistency_keywords_total")
+    if isinstance(sc_tot, int):
+        run.scope_consistency_keywords_total = sc_tot
+    cf = factory_state.get("claude_apply_changed_files") or []
+    if isinstance(cf, list):
+        run.changed_files = [str(p) for p in cf]
     errors = (
         factory_state.get("design_spec_acceptance_errors")
         or factory_state.get("design_spec_acceptance_failures")
@@ -915,8 +967,21 @@ def _serialize_run(run: SmokeRun) -> dict:
         "design_spec_acceptance_passed": run.design_spec_acceptance_passed,
         "design_spec_acceptance_errors": list(run.design_spec_acceptance_errors),
         "design_spec_title_label_count": run.design_spec_title_label_count,
+        "design_spec_target_files": list(run.design_spec_target_files),
         "design_spec_target_files_count": run.design_spec_target_files_count,
         "design_spec_svg_path_valid": run.design_spec_svg_path_valid,
+        "design_spec_feature": run.design_spec_feature,
+        "selected_feature": run.selected_feature,
+        "selected_feature_source": run.selected_feature_source,
+        "implementation_ticket_source": run.implementation_ticket_source,
+        "claude_apply_source": run.claude_apply_source,
+        "scope_consistency_status": run.scope_consistency_status,
+        "scope_mismatch_reason": run.scope_mismatch_reason,
+        "scope_consistency_keywords_matched": list(
+            run.scope_consistency_keywords_matched
+        ),
+        "scope_consistency_keywords_total": run.scope_consistency_keywords_total,
+        "changed_files": list(run.changed_files),
         "stale_artifacts_moved": list(run.stale_artifacts_moved),
         "stages": [_serialize_stage(s) for s in run.stages],
         "notes": list(run.notes),
@@ -970,6 +1035,7 @@ def _build_report(
     ]
 
     lines.extend(_build_design_spec_section(run))
+    lines.extend(_build_scope_consistency_section(run))
     lines.extend(_build_stale_artifact_section(run))
 
     lines += [
@@ -1137,6 +1203,61 @@ def _diagnose_design_spec_hold(run: SmokeRun) -> list[str]:
     return out
 
 
+def _build_scope_consistency_section(run: SmokeRun) -> list[str]:
+    """Render a Scope consistency block whenever the cycle ran on the
+    spec_bypass path (claude_apply_source == design_spec) — regardless
+    of pass/fail. Lets the operator see at a glance whether the diff
+    actually built the design_spec or a different feature.
+    """
+    if (
+        not run.scope_consistency_status
+        and run.claude_apply_source != "design_spec"
+        and not run.design_spec_feature
+        and not run.design_spec_target_files
+    ):
+        return []
+    out = ["", "## Scope consistency"]
+    out.append(
+        f"- scope_consistency_status: `{run.scope_consistency_status or '—'}`"
+    )
+    out.append(f"- design_spec_feature: `{run.design_spec_feature or '—'}`")
+    out.append(
+        f"- implementation_ticket_feature: `{run.selected_feature or '—'}`"
+    )
+    out.append(
+        f"- selected_feature_source: `{run.selected_feature_source or '—'}`"
+    )
+    out.append(
+        f"- implementation_ticket_source: `{run.implementation_ticket_source or '—'}`"
+    )
+    out.append(
+        f"- claude_apply_source: `{run.claude_apply_source or '—'}`"
+    )
+    if run.design_spec_target_files:
+        out.append("")
+        out.append("### design_spec target_files")
+        for p in run.design_spec_target_files[:20]:
+            out.append(f"- `{p}`")
+    if run.changed_files:
+        out.append("")
+        out.append("### changed_files")
+        for p in run.changed_files[:20]:
+            out.append(f"- `{p}`")
+    if run.scope_consistency_keywords_total:
+        kw = ", ".join(run.scope_consistency_keywords_matched[:8]) or "—"
+        out.append("")
+        out.append(
+            f"- design_spec keyword matches: "
+            f"{len(run.scope_consistency_keywords_matched)}/"
+            f"{run.scope_consistency_keywords_total} ({kw})"
+        )
+    if run.scope_mismatch_reason:
+        out.append("")
+        out.append("### scope_mismatch_reason")
+        out.append(f"> {run.scope_mismatch_reason}")
+    return out
+
+
 def _build_stale_artifact_section(run: SmokeRun) -> list[str]:
     """Render which per-cycle code-output artifacts the smoke runner
     moved aside on preflight, plus any leftover implementation_ticket.md
@@ -1212,6 +1333,13 @@ def _recommend_next(run: SmokeRun) -> list[str]:
                 run.last_successful_stage or "—"
             ),
             "- `tail -200 .runtime/factory_smoke.log` 로 실제 출력 확인.",
+        ]
+    if run.failure_code == "scope_mismatch":
+        return [
+            "- claude_apply 가 design_spec 과 무관한 변경을 적용해 롤백되었습니다.",
+            "- `.runtime/factory_smoke_report.md` 의 Scope consistency 섹션 확인.",
+            "- 다음 사이클은 design_spec.md 를 단일 source of truth 로 다시 적용하세요. "
+            "claude_proposal.md 가 남아 있다면 stale 로 분류되어 사용되지 않아야 합니다.",
         ]
     return [
         "- `.runtime/factory_failure_report.md` 와 `.runtime/claude_repair_prompt.md` 확인.",
@@ -3172,6 +3300,303 @@ def self_test() -> tuple[int, int, list[str]]:
             else:
                 os.environ.pop("LOCAL_RUNNER_REPO", None)
 
+    # 30A. Scope-consistency — design_spec for TitleSeal but ticket
+    #      selected_feature is "Local Visa" → fail with scope_mismatch.
+    total += 1
+    if _cycle is not None:
+        ds_md = _DESIGN_SPEC_FIXTURE_TITLESEAL
+        ok_a, reason_a, _, _ = _cycle._check_scope_consistency(
+            design_spec_md=ds_md,
+            design_spec_target_files=_cycle._extract_design_spec_target_files(ds_md),
+            design_spec_feature=_cycle._extract_design_spec_feature(ds_md),
+            diff_text="",
+            changed_files=[
+                "app/web/src/data/badges.js",
+                "app/web/src/screens/Share.jsx",
+            ],
+            selected_feature="Local Visa 배지",
+        )
+        if not ok_a and reason_a and "scope_mismatch" in reason_a:
+            passed += 1
+        else:
+            failures.append(
+                f"30A: feature mismatch did not flag scope_mismatch — "
+                f"ok={ok_a} reason={reason_a!r}"
+            )
+    else:
+        failures.append("30A: skipped — cycle import failed earlier")
+
+    # 30B. Scope-consistency — design_spec target_files match but the
+    #      diff body only mentions Local Visa / computeDynamicAreaVisas
+    #      (no TitleSeal / level / share-title-seal) → scope_mismatch.
+    total += 1
+    if _cycle is not None:
+        ds_md = _DESIGN_SPEC_FIXTURE_TITLESEAL
+        diff_localvisa = (
+            "diff --git a/app/web/src/data/badges.js b/app/web/src/data/badges.js\n"
+            "+ export function computeDynamicAreaVisas(stamps) {\n"
+            "+   const counts = stamps.reduce(...);\n"
+            "+ }\n"
+            "diff --git a/app/web/src/screens/Share.jsx b/app/web/src/screens/Share.jsx\n"
+            "+ const earnedVisa = areaVisaList.find(v => v.area === currentArea);\n"
+        )
+        ok_b, reason_b, kw_b, total_b = _cycle._check_scope_consistency(
+            design_spec_md=ds_md,
+            design_spec_target_files=_cycle._extract_design_spec_target_files(ds_md),
+            design_spec_feature=_cycle._extract_design_spec_feature(ds_md),
+            diff_text=diff_localvisa,
+            changed_files=[
+                "app/web/src/data/badges.js",
+                "app/web/src/screens/Share.jsx",
+            ],
+            selected_feature=_cycle._extract_design_spec_feature(ds_md),
+        )
+        if (
+            not ok_b
+            and reason_b and "scope_mismatch" in reason_b
+            and total_b > 0
+            and len(kw_b) < 3
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"30B: keyword check did not flag scope_mismatch — "
+                f"ok={ok_b} matched={kw_b} total={total_b} reason={reason_b!r}"
+            )
+    else:
+        failures.append("30B: skipped — cycle import failed earlier")
+
+    # 30C. Scope-consistency — diff includes TitleSeal / level / tier /
+    #      share-title-seal → scope passes (≥3 keywords matched).
+    total += 1
+    if _cycle is not None:
+        ds_md = _DESIGN_SPEC_FIXTURE_TITLESEAL
+        diff_titleseal = (
+            "diff --git a/app/web/src/components/TitleSeal.jsx b/...\n"
+            "+ export default function TitleSeal({ level, tier }) {\n"
+            "+   return <div className=\"share-title-seal\">{tier}</div>;\n"
+            "+ }\n"
+            "diff --git a/app/web/src/data/badges.js b/...\n"
+            "+ export const BADGES = [{ id: 'cafe_starter', level: 1, tier: 'starter', "
+            "titleLabel: '카페 입문자', lockedUntilLevel: 0 }];\n"
+            "diff --git a/app/web/src/App.css b/...\n"
+            "+ .share-title-seal { font-family: serif; max-height: 560px; }\n"
+        )
+        ok_c, reason_c, kw_c, total_c = _cycle._check_scope_consistency(
+            design_spec_md=ds_md,
+            design_spec_target_files=_cycle._extract_design_spec_target_files(ds_md),
+            design_spec_feature=_cycle._extract_design_spec_feature(ds_md),
+            diff_text=diff_titleseal,
+            changed_files=[
+                "app/web/src/components/TitleSeal.jsx",
+                "app/web/src/data/badges.js",
+                "app/web/src/App.css",
+            ],
+            selected_feature=_cycle._extract_design_spec_feature(ds_md),
+        )
+        if ok_c and reason_c is None and len(kw_c) >= 3:
+            passed += 1
+        else:
+            failures.append(
+                f"30C: TitleSeal-rich diff did not pass scope — "
+                f"ok={ok_c} matched={kw_c} reason={reason_c!r}"
+            )
+    else:
+        failures.append("30C: skipped — cycle import failed earlier")
+
+    # 30D. Spec_bypass ticket builder — feature comes from design_spec,
+    #      not from a stale planner selected_feature.
+    total += 1
+    if _cycle is not None:
+        body, feature_d = _cycle._build_ticket_from_design_spec(
+            _DESIGN_SPEC_FIXTURE_TITLESEAL,
+            target_files=_cycle._extract_design_spec_target_files(
+                _DESIGN_SPEC_FIXTURE_TITLESEAL
+            ),
+            target_screens=["Badges", "Share"],
+        )
+        ok = (
+            feature_d
+            and "TitleSeal" in feature_d
+            and "TitleSeal" in body
+            and "Local Visa" not in body
+            and "claude_proposal.md" in body  # exclusion clause documents bypass
+            and "단일 source of truth" in body
+        )
+        if ok:
+            passed += 1
+        else:
+            failures.append(
+                f"30D: design_spec ticket — feature={feature_d!r} body_local_visa="
+                f"{'Local Visa' in body}"
+            )
+    else:
+        failures.append("30D: skipped — cycle import failed earlier")
+
+    # 30E. Spec_bypass apply input — synthetic proposal for claude_apply
+    #      embeds design_spec.md and ignores claude_proposal.
+    total += 1
+    if _cycle is not None:
+        ticket_md = (
+            "# Implementation Ticket\n\n## 선택한 기능\nTitleSeal\n\n"
+            "## 수정 대상 파일\n- app/web/src/components/TitleSeal.jsx\n"
+        )
+        apply_input = _cycle._build_apply_input_from_design_spec(
+            design_spec_md=_DESIGN_SPEC_FIXTURE_TITLESEAL,
+            ticket_md=ticket_md,
+            target_files=["app/web/src/components/TitleSeal.jsx"],
+        )
+        ok = (
+            "Design Spec (단일 source of truth)" in apply_input
+            and "claude_proposal.md 가 있더라도 무시" in apply_input
+            and "TitleSeal" in apply_input
+            and "## 수정 제안" in apply_input
+            and "## 변경 대상 파일" in apply_input
+        )
+        if ok:
+            passed += 1
+        else:
+            failures.append(
+                "30E: spec_bypass apply input missing required anchors"
+            )
+    else:
+        failures.append("30E: skipped — cycle import failed earlier")
+
+    # 30F. READY_TO_REVIEW report renders Scope consistency section when
+    #      claude_apply_source == design_spec.
+    total += 1
+    repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            run = SmokeRun(mode="local-cycle", timeout_sec=1800)
+            run.started_at = _utc_now_iso()
+            run.finished_at = _utc_now_iso()
+            run.verdict = "READY_TO_REVIEW"
+            run.factory_status = "ready_to_publish"
+            run.cycle_id = 1
+            run.ticket_status = "generated"
+            run.changed_files_count = 3
+            run.design_spec_status = "generated"
+            run.design_spec_acceptance_passed = True
+            run.design_spec_feature = "TitleSeal 컴포넌트"
+            run.selected_feature = "TitleSeal 컴포넌트"
+            run.selected_feature_source = "design_spec"
+            run.implementation_ticket_source = "design_spec"
+            run.claude_apply_source = "design_spec"
+            run.scope_consistency_status = "passed"
+            run.scope_consistency_keywords_matched = [
+                "TitleSeal", "level", "share-title-seal", "560px",
+            ]
+            run.scope_consistency_keywords_total = 8
+            run.design_spec_target_files = [
+                "app/web/src/components/TitleSeal.jsx",
+                "app/web/src/data/badges.js",
+                "app/web/src/screens/Share.jsx",
+            ]
+            run.changed_files = [
+                "app/web/src/components/TitleSeal.jsx",
+                "app/web/src/data/badges.js",
+                "app/web/src/screens/Share.jsx",
+            ]
+            fs = {
+                "status": "ready_to_publish", "cycle": 1,
+                "claude_apply_status": "applied",
+                "claude_apply_changed_files": run.changed_files,
+                "qa_status": "passed",
+                "implementation_ticket_status": "generated",
+                "design_spec_status": "generated",
+                "design_spec_acceptance_passed": True,
+                "design_spec_feature": run.design_spec_feature,
+                "selected_feature": run.selected_feature,
+                "selected_feature_source": "design_spec",
+                "implementation_ticket_source": "design_spec",
+                "claude_apply_source": "design_spec",
+                "scope_consistency_status": "passed",
+                "scope_consistency_keywords_matched":
+                    run.scope_consistency_keywords_matched,
+                "scope_consistency_keywords_total": 8,
+            }
+            write_outputs(run, factory_state=fs, observer_classification=None)
+            report = (runtime / "factory_smoke_report.md").read_text(
+                encoding="utf-8"
+            )
+            ok = (
+                "## Scope consistency" in report
+                and "scope_consistency_status" in report
+                and "design_spec_feature" in report
+                and "implementation_ticket_feature" in report
+                and "claude_apply_source" in report
+                and "design_spec target_files" in report
+                and "changed_files" in report
+            )
+            if ok:
+                passed += 1
+            else:
+                failures.append(
+                    "30F: READY_TO_REVIEW report missing Scope consistency"
+                )
+        finally:
+            if repo_prev is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 30G. resolve_verdict downgrades to FAIL/scope_mismatch when
+    #      factory_state has scope_consistency_status=failed, regardless
+    #      of other green signals.
+    total += 1
+    fake_state_g = {
+        "status": "failed", "cycle": 1,
+        "claude_apply_status": "rolled_back",
+        "claude_apply_changed_files": [],
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+        "scope_consistency_status": "failed",
+        "scope_mismatch_reason": (
+            "scope_mismatch: claude_apply.diff 가 design_spec 키워드 3개 미만"
+        ),
+        "failed_reason": "scope_mismatch: ...",
+    }
+    v_g, c_g, _ = resolve_verdict(fake_state_g, exit_code=1)
+    if v_g == "FAIL" and c_g == "scope_mismatch":
+        passed += 1
+    else:
+        failures.append(
+            f"30G: failed/scope_mismatch should resolve FAIL/scope_mismatch — "
+            f"got {v_g}/{c_g}"
+        )
+
+    # 30H. Existing planner→ticket path stays untouched: when there's no
+    #      design_spec and PM SHIP gives target_files, ticket builds from
+    #      proposal/planner and resolve_verdict still reaches READY_TO_REVIEW.
+    total += 1
+    fake_state_h = {
+        "status": "ready_to_publish", "cycle": 2,
+        "claude_apply_status": "applied",
+        "claude_apply_changed_files": ["app/web/src/screens/Share.jsx"],
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+        "design_spec_status": "skipped",
+        "design_spec_acceptance_passed": False,
+        # No scope_consistency_status set — non-spec_bypass cycle.
+    }
+    prev = os.environ.pop("LOCAL_RUNNER_ALLOW_PUBLISH", None)
+    try:
+        v_h, c_h, _ = resolve_verdict(fake_state_h, exit_code=0)
+    finally:
+        if prev is not None:
+            os.environ["LOCAL_RUNNER_ALLOW_PUBLISH"] = prev
+    if v_h == "READY_TO_REVIEW":
+        passed += 1
+    else:
+        failures.append(
+            f"30H: legacy planner ticket path should still produce "
+            f"READY_TO_REVIEW — got {v_h}/{c_h}"
+        )
+
     return passed, total, failures
 
 
@@ -3593,6 +4018,73 @@ _DESIGN_SPEC_FIXTURE_TABLE_BACKTICK = (
     .replace("| verified_collector |", "| `verified_collector` |")
     .replace("| traveler_starter |", "| `traveler_starter` |")
 )
+
+
+# Mirrors the production cycle's TitleSeal-focused design_spec — the
+# concrete prod case where claude_apply went off-script and shipped
+# Local Visa code instead. Used by 30A/30B/30C to verify the scope
+# consistency check catches the mismatch.
+_DESIGN_SPEC_FIXTURE_TITLESEAL = """\
+# Stampport Design Implementation Spec
+
+## 구현 대상 기능
+- 기능명: TitleSeal 컴포넌트
+- 관련 PM HOLD 사유: titleLabel 시각 위계가 share-foot 에 묻혀 share에서 살아나지 못함.
+
+## SVG Path 명세
+
+### Tier 1 원형
+- viewBox: 0 0 80 80
+- 정의: <circle cx="40" cy="40" r="28" stroke="#1f3d2b" fill="none" stroke-width="3" />
+
+### Tier 2 방패
+- viewBox: 0 0 80 80
+- path: M14,8 L66,8 Q74,8 74,16 Q70,34 72,52 C66,64 54,72 40,76 C26,72 14,64 8,52 Q10,34 6,16 Q6,8 14,8 Z
+
+### Tier 3 왕관
+- viewBox: 0 0 80 80
+- path: M8,64 L72,64 L72,46 L60,46 L60,20 L50,38 L40,10 L30,38 L20,20 L20,46 L8,46 Z
+
+## titleLabel 최종 목록
+
+| badge id | titleLabel | level | lockedUntilLevel |
+|---|---|---|---|
+| `cafe_starter` | 카페 입문자 | 1 | 0 |
+| `bakery_pilgrim` | 빵지 순례자 | 1 | 0 |
+| `restaurant_explorer` | 맛집 탐험가 | 2 | 1 |
+| `dessert_explorer` | 디저트 탐험가 | 2 | 1 |
+| `seongsu_cafe_visa` | 성수 카페 영사 | 2 | 1 |
+| `mangwon_dessert_visa` | 망원 디저트 영사 | 2 | 1 |
+| `yeonnam_visa` | 연남 단골 영사 | 2 | 1 |
+| `gwanak_explorer` | 관악 로컬 영사 | 2 | 1 |
+| `salt_bread_collector` | 소금빵 수집가 | 2 | 1 |
+| `solo_starter` | 혼밥 미식 대사 | 3 | 2 |
+| `weekend_explorer` | 주말 탐험 대사 | 3 | 2 |
+| `verified_collector` | 여권 비자 대사 | 3 | 2 |
+| `traveler_starter` | 동네 탐험가 | 1 | 0 |
+
+## badges.js 스키마 변경
+- 각 badge 에 `level`, `tier`, `titleLabel`, `lockedUntilLevel` 4개 필드 추가
+- currentTitleLevel = max(unlocked.level)
+- relatedBadge 가 null 이면 lockedUntilLevel 매칭 불가 → 잠금 슬롯으로 렌더
+
+## ShareCard 레이아웃 명세
+- share-title-seal: share-note 아래 독립 블록
+- share-foot 의 기존 Lv 텍스트 제거
+- share-canvas: max-height: 560px / max-width: 390px / overflow hidden
+
+## 수정 대상 파일
+- `app/web/src/components/TitleSeal.jsx`
+- `app/web/src/data/badges.js`
+- `app/web/src/screens/Badges.jsx`
+- `app/web/src/screens/Share.jsx`
+- `app/web/src/App.css`
+
+## QA 기준
+- iOS Safari 390px 에서 Lv1 / Lv2 / Lv3 카드 육안 구분
+- relatedBadge null 시 잠금 슬롯 스타일 렌더
+- share-canvas 가 560px 를 넘지 않는다
+"""
 
 
 # A spec where the titleLabel section has only the table header — no
