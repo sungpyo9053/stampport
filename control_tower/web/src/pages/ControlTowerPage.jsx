@@ -317,21 +317,32 @@ export default function ControlTowerPage() {
           first so a control_state-missing message never shows above it. */}
       <AutoPilotHero runners={runners} />
 
-      {/* AGENT OFFICE SCENE — 8 characters, click-through to drawer. */}
-      <AgentOfficeScene
-        runners={runners}
-        selectedAgentId={selectedAgentId}
-        onAgentClick={(id) => setSelectedAgentId(id)}
-      />
+      {/* AGENT OFFICE SCENE — 8 characters, click-through to drawer.
+          The desktop drawer narrows the stage to 60% via the
+          .is-drawer-open CSS class so the office and detail panel
+          read side-by-side without overlap. */}
+      <div
+        className={
+          "agent-office-stage-wrapper flex gap-3 " +
+          (selectedAgentId ? "agent-office-stage-with-drawer" : "")
+        }
+      >
+        <AgentOfficeScene
+          runners={runners}
+          selectedAgentId={selectedAgentId}
+          onAgentClick={(id) => setSelectedAgentId(id)}
+          drawerOpen={!!selectedAgentId}
+        />
+      </div>
 
       {/* Operations row: SystemLog (left) + OperatorCommandPanel (right) */}
-      <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(380px,400px)] control-tower-right-rail">
         <SystemLogPanel events={combinedEvents} />
         <OperatorCommandPanel runners={runners} onSent={tick} />
       </section>
 
       {/* AutoPilot knobs + per-agent accountability — current cycle data only. */}
-      <section className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <section className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(380px,420px)] control-tower-right-rail">
         <AgentAccountabilityPanel runners={runners} />
         <AutoPilotPanel runners={runners} onSent={tick} />
       </section>

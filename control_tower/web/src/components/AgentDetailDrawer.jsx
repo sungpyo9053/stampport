@@ -1,5 +1,14 @@
 import { useEffect, useMemo } from "react";
 import { buildSystemLogEntries } from "../utils/eventClassifier.js";
+import {
+  FRESHNESS_LABEL,
+  derivePhase,
+  freshnessOf,
+  hasActiveCycle,
+  isRunningPhase,
+  pickRunnerMeta,
+  stageToWorkingAgent,
+} from "../utils/autopilotPhase.js";
 
 // AgentDetailDrawer — slide-in detail panel for a single agent.
 //
@@ -67,77 +76,113 @@ function fileMatchesAgent(path, agentId) {
   });
 }
 
-function deriveCurrentTask(agentId, meta) {
+function deriveCurrentTask(agentId, meta, ctx) {
   const aa = meta?.agent_accountability || {};
   const fs = meta?.factory_state || {};
   const ap = meta?.autopilot || {};
   const pr = meta?.pipeline_recovery || {};
+  const { phase, workingAgentId } = ctx;
 
-  // Stage-based.
+  // Honest answer first: if autopilot isn't running, this agent has
+  // no current task. Don't grasp at stale fields.
+  if (!isRunningPhase(phase)) {
+    return { text: "대기 중 (Auto Pilot 정지됨)", source: "autopilot_state" };
+  }
+  // No active cycle at all → loop is between cycles.
+  if (!hasActiveCycle(meta)) {
+    return { text: "다음 사이클 시작 대기 중", source: "autopilot_state" };
+  }
+  // Active stage owns me?
   const stage = pr.current_stage || fs.current_stage;
+  if (stage && workingAgentId === agentId) {
+    return { text: `현재 stage: ${stage} (이 에이전트 작업 중)`, source: "factory_state" };
+  }
+  if (stage && workingAgentId && workingAgentId !== agentId) {
+    return {
+      text: `대기 중 — 현재 stage ${stage} (${workingAgentId.toUpperCase()} 작업 중)`,
+      source: "factory_state",
+    };
+  }
   if (stage) {
-    return `현재 stage: ${stage}`;
+    return { text: `현재 stage: ${stage}`, source: "factory_state" };
   }
-
-  // Per-agent specific.
-  if (agentId === "pm") {
-    if (fs.pm_decision_status) return `pm_decision_status: ${fs.pm_decision_status}`;
-  }
-  if (agentId === "planner") {
-    if (fs.product_planner_status) return `product_planner: ${fs.product_planner_status}`;
-  }
-  if (agentId === "qa") {
-    const qa = meta?.qa_gate || {};
-    if (qa.qa_status) return `qa_status: ${qa.qa_status}`;
-  }
-  if (agentId === "deploy") {
-    const pub = meta?.publish || {};
-    if (pub.last_push_status) return `last_push: ${pub.last_push_status}`;
-  }
-
-  if (ap.status === "running") {
-    return `Auto Pilot ${ap.mode || ""} 진행 중 — cycle ${ap.cycle_count || 0}/${ap.max_cycles || "?"}`;
-  }
-  return "다음 cycle 대기";
+  return { text: "대기 중", source: "autopilot_state" };
 }
 
-function deriveFailureReason(agentId, meta) {
+function deriveFailureReason(agentId, meta, ctx) {
   const aa = meta?.agent_accountability || {};
-  const fs = meta?.factory_state || {};
   const acc = (aa.agents || {})[agentId] || {};
-  if (Array.isArray(acc.problems) && acc.problems.length > 0) {
-    return acc.problems.join(" / ");
-  }
-  if (aa.blocking_agent === agentId && aa.blocking_reason) {
-    return aa.blocking_reason;
-  }
-  if (agentId === "qa") {
-    const qa = meta?.qa_gate || {};
-    if (qa.qa_status === "failed") return qa.qa_failed_reason || "QA failed";
-  }
-  if (agentId === "deploy") {
-    const pub = meta?.publish || {};
-    if (pub.last_push_status === "failed") return pub.last_push_reason || "push failed";
-  }
-  // Smoke failure_code if relevant.
-  const smoke = meta?.factory_smoke || meta?.smoke || {};
-  if (smoke.failure_code) {
-    return `smoke failure_code: ${smoke.failure_code}`;
+  const isFresh = ctx.freshness === "current_run" || ctx.freshness === "current_cycle";
+
+  // Only render a "current failure" when the data is fresh. Stale
+  // problems get bumped to the previousIssue derivation below.
+  if (isFresh) {
+    if (Array.isArray(acc.problems) && acc.problems.length > 0) {
+      return { text: acc.problems.join(" / "), source: "agent_accountability" };
+    }
+    if (aa.blocking_agent === agentId && aa.blocking_reason) {
+      return { text: aa.blocking_reason, source: "agent_accountability" };
+    }
+    if (agentId === "qa") {
+      const qa = meta?.qa_gate || {};
+      if (qa.qa_status === "failed") {
+        return { text: qa.qa_failed_reason || "QA failed", source: "factory_state" };
+      }
+    }
+    if (agentId === "deploy") {
+      const pub = meta?.publish || {};
+      if (pub.last_push_status === "failed") {
+        return { text: pub.last_push_reason || "push failed", source: "publish" };
+      }
+    }
+    const smoke = meta?.factory_smoke || meta?.smoke || {};
+    if (smoke.failure_code) {
+      return { text: `smoke failure_code: ${smoke.failure_code}`, source: "factory_smoke_state" };
+    }
   }
   return null;
 }
 
-function deriveNextAction(agentId, meta) {
+function derivePreviousIssue(agentId, meta, ctx) {
+  // Surface a prior failure/problem WITHOUT painting it as current.
+  // This is what fills the "이전 cycle 미해결" collapsible.
+  if (ctx.freshness === "current_run" || ctx.freshness === "current_cycle") return null;
   const aa = meta?.agent_accountability || {};
   const acc = (aa.agents || {})[agentId] || {};
-  if (acc.retry_prompt) return acc.retry_prompt;
-  if (aa.blocking_agent === agentId && aa.next_action) return aa.next_action;
+  if (Array.isArray(acc.problems) && acc.problems.length > 0) {
+    return {
+      text: acc.problems.join(" / "),
+      source: "agent_accountability (stale)",
+    };
+  }
+  if (aa.blocking_agent === agentId && aa.blocking_reason) {
+    return { text: aa.blocking_reason, source: "agent_accountability (stale)" };
+  }
+  return null;
+}
+
+function deriveNextAction(agentId, meta, ctx) {
+  const aa = meta?.agent_accountability || {};
+  const acc = (aa.agents || {})[agentId] || {};
+  const isFresh = ctx.freshness === "current_run" || ctx.freshness === "current_cycle";
+  if (isFresh && acc.retry_prompt) {
+    return { text: acc.retry_prompt, source: "agent_accountability" };
+  }
+  if (isFresh && aa.blocking_agent === agentId && aa.next_action) {
+    return { text: aa.next_action, source: "agent_accountability" };
+  }
   const fs = meta?.factory_state || {};
-  if (agentId === "pm" && fs.claude_rework_prompt) return fs.claude_rework_prompt;
-  if (fs.claude_repair_prompt) return fs.claude_repair_prompt;
+  if (agentId === "pm" && fs.claude_rework_prompt) {
+    return { text: fs.claude_rework_prompt, source: "factory_state" };
+  }
+  if (fs.claude_repair_prompt) {
+    return { text: fs.claude_repair_prompt, source: "factory_state" };
+  }
   const ap = meta?.autopilot || {};
-  if (ap.stop_reason) return `정지 사유: ${ap.stop_reason}`;
-  return "다음 cycle 대기";
+  if (ap.stop_reason) {
+    return { text: `정지 사유: ${ap.stop_reason}`, source: "autopilot_state" };
+  }
+  return { text: "다음 cycle 대기", source: "fallback" };
 }
 
 function deriveChangedFiles(agentId, meta) {
@@ -202,12 +247,19 @@ function fmtTime(iso) {
   }
 }
 
-function Section({ title, children }) {
+function Section({ title, source, children }) {
   return (
     <div className="agent-detail-section flex flex-col gap-1.5">
-      <h4 className="text-[9.5px] font-bold uppercase tracking-[0.3em] text-amber-300">
-        {title}
-      </h4>
+      <div className="flex items-center gap-2 flex-wrap">
+        <h4 className="text-[10px] font-bold uppercase tracking-[0.3em] text-amber-300">
+          {title}
+        </h4>
+        {source && (
+          <span className="agent-detail-source" data-testid="agent-detail-source">
+            source: {source}
+          </span>
+        )}
+      </div>
       <div className="text-[12px] leading-snug text-slate-200">{children}</div>
     </div>
   );
@@ -267,17 +319,33 @@ export default function AgentDetailDrawer({
     };
   }, [agentId]);
 
+  const phase = useMemo(() => derivePhase(meta), [meta]);
+  const workingAgentId = useMemo(() => stageToWorkingAgent(meta, phase), [meta, phase]);
+  const freshness = useMemo(
+    () => freshnessOf({
+      artifactCycleId: meta?.agent_accountability?.cycle_id,
+      artifactAt: meta?.agent_accountability?.evaluated_at,
+      autopilot: meta?.autopilot,
+    }),
+    [meta],
+  );
+  const ctx = { phase, workingAgentId, freshness };
+
   const currentTask = useMemo(
-    () => (agentId ? deriveCurrentTask(agentId, meta) : ""),
-    [agentId, meta],
+    () => (agentId ? deriveCurrentTask(agentId, meta, ctx) : null),
+    [agentId, meta, phase, workingAgentId, freshness],
   );
   const failureReason = useMemo(
-    () => (agentId ? deriveFailureReason(agentId, meta) : null),
-    [agentId, meta],
+    () => (agentId ? deriveFailureReason(agentId, meta, ctx) : null),
+    [agentId, meta, phase, workingAgentId, freshness],
+  );
+  const previousIssue = useMemo(
+    () => (agentId ? derivePreviousIssue(agentId, meta, ctx) : null),
+    [agentId, meta, phase, workingAgentId, freshness],
   );
   const nextAction = useMemo(
-    () => (agentId ? deriveNextAction(agentId, meta) : ""),
-    [agentId, meta],
+    () => (agentId ? deriveNextAction(agentId, meta, ctx) : null),
+    [agentId, meta, phase, workingAgentId, freshness],
   );
   const changedFiles = useMemo(
     () => (agentId ? deriveChangedFiles(agentId, meta) : []),
@@ -291,6 +359,8 @@ export default function AgentDetailDrawer({
     () => (agentId ? findLastCommand(agentId, events) : null),
     [agentId, events],
   );
+
+  const freshnessMeta = FRESHNESS_LABEL[freshness] || FRESHNESS_LABEL.unknown;
 
   if (!agentId) return null;
 
@@ -316,7 +386,7 @@ export default function AgentDetailDrawer({
         }}
       >
         {/* Header */}
-        <header className="flex items-start justify-between gap-2">
+        <header className="flex items-start justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2">
             <span
               className="grid h-10 w-10 place-items-center rounded-full text-lg"
@@ -367,52 +437,74 @@ export default function AgentDetailDrawer({
           </button>
         </header>
 
+        {/* Freshness pill — what cycle did this data come from? */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className="agent-detail-freshness"
+            data-testid="agent-detail-freshness"
+            style={{
+              color: freshnessMeta.color,
+              borderColor: `${freshnessMeta.color}66`,
+              backgroundColor: "#0a1228",
+            }}
+          >
+            ⌚ {freshnessMeta.label}
+          </span>
+          <span className="text-[10px] tracking-widest text-slate-500">
+            phase: {phase}
+            {workingAgentId && ` · 현재 stage owner: ${workingAgentId.toUpperCase()}`}
+          </span>
+        </div>
+
         {/* 현재 역할 */}
-        <Section title="현재 역할">
+        <Section title="현재 역할" source="role_map">
           <div className="rounded-lg px-3 py-2 text-[12px]" style={{
             backgroundColor: "#0a1228",
-            border: `1px solid ${role.accent}55`,
+            border: `1.5px solid ${role.accent}66`,
           }}>
-            {role.role} · <span className="text-slate-400">{role.label}</span>
+            {role.role} · <span className="text-slate-300">{role.label}</span>
           </div>
         </Section>
 
         {/* 현재 작업 */}
-        <Section title="현재 작업">
+        <Section title="현재 작업" source={currentTask?.source}>
           <div className="rounded-lg px-3 py-2 text-[12px]" style={{
             backgroundColor: "#0a1228",
-            border: "1px solid #1e293b",
+            border: "1.5px solid #1e293b",
           }}>
-            {currentTask}
+            {currentTask?.text || "—"}
           </div>
         </Section>
 
         {/* 마지막 명령 */}
-        <Section title="마지막 명령">
+        <Section title="마지막 명령" source={lastCommand ? "system_log" : null}>
           {lastCommand ? (
             <div
               className="rounded-lg px-3 py-2 text-[11.5px]"
               style={{
                 backgroundColor: "#0a1228",
-                border: "1px solid #1e293b",
+                border: "1.5px solid #1e293b",
               }}
             >
-              <div className="text-[9.5px] tracking-widest text-slate-500">
+              <div className="text-[10px] tracking-widest text-slate-400">
                 {fmtTime(lastCommand.ev?.created_at)} · {lastCommand.category}
               </div>
-              <div className="mt-1 text-slate-200">
+              <div className="mt-1 text-slate-100">
                 {lastCommand.ev?.message || "(no message)"}
               </div>
             </div>
           ) : (
-            <div className="text-[11.5px] text-slate-500">아직 명령 없음</div>
+            <div className="text-[11.5px] text-slate-300">아직 명령 없음</div>
           )}
         </Section>
 
         {/* 최근 로그 5개 */}
-        <Section title="최근 로그">
+        <Section
+          title="최근 로그"
+          source={recentLogs.length > 0 ? "system_log" : null}
+        >
           {recentLogs.length === 0 ? (
-            <div className="text-[11.5px] text-slate-500">관련 로그 없음</div>
+            <div className="text-[11.5px] text-slate-300">관련 로그 없음</div>
           ) : (
             <ul className="flex flex-col gap-1.5">
               {recentLogs.map((entry) => (
@@ -422,48 +514,75 @@ export default function AgentDetailDrawer({
           )}
         </Section>
 
-        {/* 실패 원인 */}
-        <Section title="실패 원인">
+        {/* 실패 원인 — fresh failures only. Stale failures bubble up
+            in the "previous issue" collapsible below so they don't
+            mislead the operator. */}
+        <Section title="실패 원인" source={failureReason?.source}>
           <div
             className="rounded-lg px-3 py-2 text-[12px]"
             style={{
               backgroundColor: failureReason ? "#1c0d12" : "#0a1228",
-              border: `1px solid ${failureReason ? "#f8717155" : "#1e293b"}`,
-              color: failureReason ? "#fecaca" : "#94a3b8",
+              border: `1.5px solid ${failureReason ? "#f8717166" : "#1e293b"}`,
+              color: failureReason ? "#fecaca" : "#cbd5e1",
             }}
           >
-            {failureReason || "현재 실패 없음"}
+            {failureReason
+              ? failureReason.text
+              : isRunningPhase(phase)
+                ? "현재 cycle 기준 실패 없음"
+                : "현재 실행 없음"}
           </div>
         </Section>
 
+        {/* 이전 cycle 미해결 — collapsible, never red. */}
+        {previousIssue && (
+          <Section
+            title="이전 cycle 미해결"
+            source={previousIssue.source}
+          >
+            <details className="agent-detail-previous-issue">
+              <summary className="cursor-pointer text-[11px] tracking-widest text-slate-400">
+                이전 기록 보기
+              </summary>
+              <div className="mt-2 text-[11.5px] text-slate-300">
+                {previousIssue.text}
+              </div>
+            </details>
+          </Section>
+        )}
+
         {/* 다음 액션 */}
-        <Section title="다음 액션">
+        <Section title="다음 액션" source={nextAction?.source}>
           <div
             className="rounded-lg px-3 py-2 text-[12px]"
             style={{
               backgroundColor: "#0a1228",
-              border: "1px solid #d4a84355",
+              border: "1.5px solid #d4a84366",
               color: "#fde68a",
             }}
           >
-            ▶ {nextAction || "다음 cycle 대기"}
+            ▶ {nextAction?.text || "다음 cycle 대기"}
           </div>
         </Section>
 
         {/* 관련 파일 변경 목록 */}
-        <Section title="관련 파일 변경">
+        <Section
+          title="관련 파일 변경"
+          source={changedFiles.length > 0 ? "factory_state.claude_apply_changed_files" : null}
+        >
           {changedFiles.length === 0 ? (
-            <div className="text-[11.5px] text-slate-500">변경 파일 없음</div>
+            <div className="text-[11.5px] text-slate-300">변경 파일 없음</div>
           ) : (
             <ul className="flex flex-col gap-1">
               {changedFiles.map((f) => (
                 <li
                   key={f}
-                  className="rounded px-2 py-1 text-[11px] font-mono text-slate-200"
+                  className="rounded px-2 py-1 text-[11px] font-mono text-slate-100 autopilot-stat-ellipsis-wide"
                   style={{
                     backgroundColor: "#0a1228",
-                    border: "1px solid #1e293b",
+                    border: "1.5px solid #1e293b",
                   }}
+                  title={f}
                 >
                   {f}
                 </li>

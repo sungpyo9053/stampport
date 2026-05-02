@@ -181,9 +181,17 @@ body {
   padding: 12px;
   border-radius: 16px;
   border: 1.5px solid #0e4a3a;
+  /* Lifted ~12% over the previous near-black gradient. The office now
+     reads under bright office lighting and 80% laptop zoom — every
+     character / nameplate / desk has a real silhouette against the
+     floor instead of melting into the background. */
   background:
-    radial-gradient(ellipse at top, #15264a 0%, #0a1228 70%, #050912 100%);
+    radial-gradient(ellipse at top, #1c2c5c 0%, #14213d 50%, #0a1428 100%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+.pixel-office-scene.is-running {
+  border-color: #fbbf2455;
+  box-shadow: 0 0 24px rgba(251, 191, 36, 0.18);
 }
 
 .pixel-office-header {
@@ -225,13 +233,20 @@ body {
   /* Aspect ratio holds the layout proportional whether viewport is
      1440 desktop or 390 mobile. */
   aspect-ratio: 16 / 9;
-  min-height: 320px;
+  min-height: 360px;
   border-radius: 12px;
-  border: 1px solid #1e293b;
+  border: 1.5px solid #2a3a5a;
   overflow: hidden;
   background:
-    linear-gradient(180deg, #0d1730 0%, #0a1228 60%, #06101e 100%);
+    linear-gradient(180deg, #1a2a4d 0%, #11203c 55%, #0a1530 100%);
   isolation: isolate;
+}
+.pixel-office-floor-vignette {
+  /* Subtle radial vignette focuses the eye toward the active build
+     bench in the middle of the office. Pure CSS, no extra DOM cost. */
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 60%, transparent 35%, rgba(5, 9, 18, 0.55) 100%);
 }
 
 .pixel-office-floor-tiles {
@@ -495,17 +510,37 @@ body {
   transform-origin: top center;
 }
 
-/* Nameplate */
+/* Nameplate — bumped to readable size + thicker border + tighter
+   tracking. The earlier 9px / 0.18em was unreadable at 80% zoom on
+   1440 laptops. */
 .pixel-agent-nameplate {
-  margin-top: 4px;
-  padding: 1px 6px;
-  font-size: 9px;
+  margin-top: 5px;
+  padding: 2px 8px;
+  font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.18em;
-  border: 1px solid currentColor;
+  letter-spacing: 0.08em;
+  border: 1.5px solid currentColor;
   border-radius: 9999px;
-  background: rgba(5, 9, 18, 0.85);
+  background: rgba(5, 9, 18, 0.92);
   white-space: nowrap;
+  box-shadow: 0 0 8px currentColor;
+}
+
+/* Soft local light under each character so they pop off the floor
+   even in glossy / high-glare environments. */
+.pixel-agent::before {
+  content: "";
+  position: absolute;
+  bottom: -8px; left: 50%;
+  width: 56px; height: 14px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(ellipse, color-mix(in srgb, var(--agent-accent) 35%, transparent), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+.pixel-agent.is-active::before {
+  background: radial-gradient(ellipse, color-mix(in srgb, var(--agent-accent) 60%, transparent), transparent 60%);
 }
 
 /* Selection ring */
@@ -924,17 +959,421 @@ body {
   }
 }
 
+/* ---------- Per-agent prop animations (role-specific) ---------- */
+
+/* PM clipboard — page nodding when the agent is active, plus a stamp
+   that pops in on a "passed" decision. */
+@keyframes pm-prop-nod {
+  0%, 100% { transform: rotate(0deg);   }
+  50%      { transform: rotate(8deg);   }
+}
+.pixel-agent.pixel-agent-pm.is-active .pm-prop {
+  animation: pm-prop-nod 1.2s ease-in-out infinite;
+  transform-origin: top right;
+}
+.pixel-agent-tool-clipboard-stamp {
+  position: absolute;
+  inset: 25% 20% 25% 20%;
+  border: 1.5px solid #f87171;
+  border-radius: 1px;
+  opacity: 0;
+  transform: rotate(-12deg) scale(0.8);
+  pointer-events: none;
+  font-size: 0;
+  color: #f87171;
+}
+.pixel-agent.is-passed .pixel-agent-tool-clipboard-stamp {
+  animation: pm-prop-stamp 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+@keyframes pm-prop-stamp {
+  0%   { opacity: 0; transform: rotate(-30deg) scale(2);   }
+  60%  { opacity: 1; transform: rotate(-8deg)  scale(1.1); }
+  100% { opacity: 1; transform: rotate(-12deg) scale(1);   }
+}
+
+/* Planner candidate cards — three small rectangles stacked behind the
+   ruler that pop in sequence while the planner is active. */
+.pixel-agent-tool-cards {
+  position: absolute;
+  bottom: -6px; left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 1px;
+}
+.pixel-agent-tool-cards > span {
+  width: 4px;
+  height: 6px;
+  background: #f5e9d3;
+  border: 1px solid #1f2937;
+  border-radius: 1px;
+  transform: scale(0);
+  opacity: 0;
+}
+.pixel-agent.pixel-agent-planner.is-active .pixel-agent-tool-cards > span {
+  animation: planner-prop-cards 1.6s ease-in-out infinite;
+}
+.pixel-agent.pixel-agent-planner.is-active .pixel-agent-tool-cards > span:nth-child(2) {
+  animation-delay: 0.25s;
+}
+.pixel-agent.pixel-agent-planner.is-active .pixel-agent-tool-cards > span:nth-child(3) {
+  animation-delay: 0.5s;
+}
+@keyframes planner-prop-cards {
+  0%, 75%, 100% { transform: scale(0);   opacity: 0; }
+  20%, 65%      { transform: scale(1);   opacity: 1; }
+}
+
+/* Designer palette sparkle — a tiny gold dot that pulses near the
+   palette while the designer is active and pops on pass. */
+.pixel-agent-tool-palette-sparkle {
+  position: absolute;
+  top: -3px; right: -3px;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: #facc15;
+  opacity: 0;
+}
+.pixel-agent.pixel-agent-designer.is-active .pixel-agent-tool-palette-sparkle {
+  animation: designer-prop-sparkle 1.4s ease-in-out infinite;
+}
+@keyframes designer-prop-sparkle {
+  0%, 100% { opacity: 0; transform: scale(0.6); }
+  50%      { opacity: 1; transform: scale(1.4); box-shadow: 0 0 8px #facc15; }
+}
+
+/* Frontend monitor — three short code-line bars that blink in sequence
+   like a typing terminal. */
+.pixel-agent-tool-monitor-line {
+  position: absolute;
+  left: 12%;
+  height: 1px;
+  background: #38bdf8;
+  border-radius: 1px;
+  opacity: 0;
+}
+.pixel-agent-tool-monitor-line:nth-child(2) { top: 25%; width: 50%; }
+.pixel-agent-tool-monitor-line:nth-child(3) { top: 50%; width: 65%; }
+.pixel-agent-tool-monitor-line:nth-child(4) { top: 75%; width: 40%; }
+.pixel-agent.pixel-agent-frontend.is-active .pixel-agent-tool-monitor-line {
+  animation: frontend-prop-codeblink 1.2s ease-in-out infinite;
+}
+.pixel-agent.pixel-agent-frontend.is-active .pixel-agent-tool-monitor-line:nth-child(3) {
+  animation-delay: 0.2s;
+}
+.pixel-agent.pixel-agent-frontend.is-active .pixel-agent-tool-monitor-line:nth-child(4) {
+  animation-delay: 0.4s;
+}
+@keyframes frontend-prop-codeblink {
+  0%, 100% { opacity: 0.2; }
+  50%      { opacity: 1;   }
+}
+
+/* Backend rack pulse — three little server bars that breathe under
+   the wrench while the backend agent is active. */
+.pixel-agent-tool-rack {
+  position: absolute;
+  top: 100%; left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: 1px;
+  margin-top: 2px;
+}
+.pixel-agent-tool-rack > span {
+  width: 3px; height: 2px;
+  background: #34d399;
+  border-radius: 1px;
+  opacity: 0.4;
+}
+.pixel-agent.pixel-agent-backend.is-active .pixel-agent-tool-rack > span {
+  animation: backend-prop-rack 1.4s ease-in-out infinite;
+}
+.pixel-agent.pixel-agent-backend.is-active .pixel-agent-tool-rack > span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.pixel-agent.pixel-agent-backend.is-active .pixel-agent-tool-rack > span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes backend-prop-rack {
+  0%, 100% { opacity: 0.3; transform: scaleY(1);   }
+  50%      { opacity: 1;   transform: scaleY(1.6); box-shadow: 0 0 4px #34d399; }
+}
+
+/* AI brain glow — a halo around the chip that pulses while AI is
+   active. */
+.pixel-agent-tool-chip-glow {
+  position: absolute;
+  inset: -3px;
+  border-radius: 4px;
+  border: 1px solid #a78bfa;
+  opacity: 0;
+}
+.pixel-agent.pixel-agent-ai.is-active .pixel-agent-tool-chip-glow {
+  animation: ai-prop-glow 1.4s ease-in-out infinite;
+}
+@keyframes ai-prop-glow {
+  0%, 100% { opacity: 0; box-shadow: 0 0 0 #a78bfa;   }
+  50%      { opacity: 0.9; box-shadow: 0 0 8px #a78bfa; }
+}
+
+/* QA magnifier sweep — a rotating gradient inside the lens while the
+   agent is active; a checkmark pop on pass. */
+.pixel-agent-tool-magnifier-sweep {
+  position: absolute;
+  left: 0; top: 0;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0deg, rgba(251, 146, 60, 0.5) 60deg, transparent 120deg);
+  opacity: 0;
+}
+.pixel-agent.pixel-agent-qa.is-active .pixel-agent-tool-magnifier-sweep {
+  animation: qa-prop-sweep 1.5s linear infinite;
+  opacity: 1;
+}
+@keyframes qa-prop-sweep {
+  to { transform: rotate(360deg); }
+}
+
+/* Deploy launch trail — a thin gold line that grows behind the rocket
+   on push success. */
+.pixel-agent-tool-rocket-trail {
+  position: absolute;
+  bottom: -8px; left: 50%;
+  transform: translateX(-50%);
+  width: 2px; height: 0;
+  background: linear-gradient(180deg, #facc15, transparent);
+  opacity: 0;
+}
+.pixel-agent.pixel-agent-deploy.is-active .pixel-agent-tool-rocket-trail {
+  animation: deploy-prop-trail 1.2s ease-out infinite;
+}
+.pixel-agent.pixel-agent-deploy.is-passed .pixel-agent-tool-rocket-trail {
+  animation: deploy-prop-launch 0.8s ease-out forwards;
+}
+@keyframes deploy-prop-trail {
+  0%   { opacity: 0;   height: 0;   }
+  60%  { opacity: 0.8; height: 8px; }
+  100% { opacity: 0;   height: 12px; }
+}
+@keyframes deploy-prop-launch {
+  0%   { opacity: 0;   height: 0;    }
+  100% { opacity: 0.9; height: 18px; }
+}
+
+/* Reduced motion gate for all the new prop animations. */
+@media (prefers-reduced-motion: reduce) {
+  .pixel-agent.pixel-agent-pm.is-active .pm-prop,
+  .pixel-agent .pixel-agent-tool-clipboard-stamp,
+  .pixel-agent.pixel-agent-planner.is-active .pixel-agent-tool-cards > span,
+  .pixel-agent.pixel-agent-designer.is-active .pixel-agent-tool-palette-sparkle,
+  .pixel-agent.pixel-agent-frontend.is-active .pixel-agent-tool-monitor-line,
+  .pixel-agent.pixel-agent-backend.is-active .pixel-agent-tool-rack > span,
+  .pixel-agent.pixel-agent-ai.is-active .pixel-agent-tool-chip-glow,
+  .pixel-agent.pixel-agent-qa.is-active .pixel-agent-tool-magnifier-sweep,
+  .pixel-agent.pixel-agent-deploy.is-active .pixel-agent-tool-rocket-trail,
+  .pixel-agent.pixel-agent-deploy.is-passed .pixel-agent-tool-rocket-trail {
+    animation: none !important;
+  }
+}
+
+/* ---------- Auto Pilot panel — phase + debug structure ---------- */
+
+.autopilot-panel-section {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(10, 18, 40, 0.7);
+  border: 1px solid #1e293b;
+}
+.autopilot-panel-section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  color: #94a3b8;
+  text-transform: uppercase;
+}
+
+.autopilot-phase-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  border: 1.5px solid;
+  white-space: nowrap;
+}
+.autopilot-phase-pill.is-active {
+  color: #fbbf24; border-color: #fbbf2466; background: #1c1408;
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.4);
+}
+.autopilot-phase-pill.is-warn {
+  color: #fbbf24; border-color: #fbbf2466; background: #1c1408;
+}
+.autopilot-phase-pill.is-error {
+  color: #fecaca; border-color: #f8717166; background: #1c0d12;
+}
+.autopilot-phase-pill.is-neutral {
+  color: #cbd5e1; border-color: #1e293b; background: #0a1228;
+}
+.autopilot-phase-pill.is-muted {
+  color: #94a3b8; border-color: #1e293b; background: #0a1228;
+}
+
+.autopilot-mode-badge-warn {
+  /* Used when running mode=safe_run — the "배포 안 함" warning. */
+  color: #fcd34d;
+  border-color: #fcd34d66;
+  background: #1c1408;
+}
+
+/* Restart staged progress — three step pills filled in sequence. */
+.autopilot-restart-progress {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  font-size: 10px; letter-spacing: 0.18em;
+}
+.autopilot-restart-progress-step {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: 1px solid #1e293b;
+  background: #0a1228;
+  color: #475569;
+}
+.autopilot-restart-progress-step.is-done {
+  color: #34d399; border-color: #34d39966; background: #0c1f1a;
+}
+.autopilot-restart-progress-step.is-active {
+  color: #fbbf24; border-color: #fbbf2466; background: #1c1408;
+  animation: autopilot-restart-active 1s ease-in-out infinite;
+}
+@keyframes autopilot-restart-active {
+  0%, 100% { box-shadow: 0 0 0 rgba(251, 191, 36, 0.4); }
+  50%      { box-shadow: 0 0 12px rgba(251, 191, 36, 0.6); }
+}
+
+.autopilot-debug-toggle {
+  align-self: flex-start;
+  padding: 3px 10px;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  border: 1px dashed #1e293b;
+  border-radius: 9999px;
+  background: #0a1228;
+  color: #64748b;
+  cursor: pointer;
+}
+.autopilot-debug-toggle:hover { color: #cbd5e1; border-color: #d4a84366; }
+
+.autopilot-payload-preview {
+  /* Now lives INSIDE the collapsible debug section — the dashed
+     border is kept but the bright amber background is gone so the
+     debug panel doesn't blast the operator on first view. */
+  background: #050912;
+  border: 1px dashed #d4a84355;
+  color: #fde68a;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  word-break: break-word;
+}
+
+/* Long file paths / report links — ellipsis instead of layout-killing
+   wrap. Used in the AutoPilot StatRow for `report_path`. */
+.autopilot-stat-ellipsis {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.autopilot-stat-ellipsis-wide {
+  max-width: 320px;
+}
+
+/* ---------- Drawer freshness / source / layout ---------- */
+
+.agent-detail-freshness {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.agent-detail-source {
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: #64748b;
+  border: 1px dashed #1e293b;
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.agent-detail-previous-issue {
+  border: 1px dashed #94a3b833;
+  background: #0a1228;
+  color: #94a3b8;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+/* When the drawer is open, slim the office stage on desktop so both
+   are readable without overlap. */
+@media (min-width: 1024px) {
+  .pixel-office-scene.is-drawer-open {
+    width: 60%;
+    flex-shrink: 0;
+  }
+}
+
+/* Mobile: the drawer becomes a bottom sheet so it doesn't slide off
+   the right edge of a 390px screen. */
+@media (max-width: 720px) {
+  .agent-detail-drawer {
+    align-items: flex-end !important;
+    justify-content: stretch !important;
+  }
+  .agent-detail-drawer-panel {
+    max-width: 100% !important;
+    height: auto !important;
+    max-height: 86vh !important;
+    border-left: 0 !important;
+    border-top: 1.5px solid var(--agent-accent, #1e293b) !important;
+    border-radius: 18px 18px 0 0 !important;
+    animation: agent-detail-sheet-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) !important;
+  }
+}
+@keyframes agent-detail-sheet-in {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0);    }
+}
+
 /* ---------- 390px mobile guards ---------- */
 
 @media (max-width: 420px) {
-  .pixel-office-floor { aspect-ratio: 5 / 6; min-height: 420px; }
+  .pixel-office-floor { aspect-ratio: 5 / 6; min-height: 460px; }
   .pixel-office-window { display: none; }
-  .pixel-agent { width: 44px; }
-  .pixel-agent-figure { width: 30px; height: 46px; }
-  .pixel-agent-head { width: 18px; height: 18px; }
-  .pixel-agent-body { width: 22px; height: 18px; }
-  .pixel-agent-leg { width: 7px; height: 10px; }
-  .pixel-agent-nameplate { font-size: 8px; padding: 1px 4px; }
+  .pixel-agent { width: 48px; }
+  .pixel-agent-figure { width: 32px; height: 50px; }
+  .pixel-agent-head { width: 20px; height: 20px; }
+  .pixel-agent-body { width: 24px; height: 20px; }
+  .pixel-agent-leg { width: 7px; height: 11px; }
+  .pixel-agent-nameplate { font-size: 10px; padding: 1px 5px; }
   .pixel-agent-speech { max-width: 130px; font-size: 10px; padding: 4px 8px; }
   .office-monitor { width: 9%; }
+  .autopilot-stat-ellipsis,
+  .autopilot-stat-ellipsis-wide { max-width: 160px; }
+}
+
+/* ---------- Laptop (1280-1440) right-rail min-width ---------- */
+/* Default 360px right rail was unreadable. Bump to 380px and let the
+   stage stretch — the right rail becomes a proper info column rather
+   than a pinch zone for tiny stat rows. */
+@media (min-width: 1024px) and (max-width: 1599px) {
+  .control-tower-right-rail {
+    min-width: 380px;
+  }
 }

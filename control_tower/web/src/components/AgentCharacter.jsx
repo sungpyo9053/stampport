@@ -111,54 +111,80 @@ const ROLE_PRESETS = {
   },
 };
 
-function Tool({ kind, color }) {
+function Tool({ kind, color, agentId }) {
+  // Each tool gets the canonical `<role>-prop` class so the verifier
+  // (and the role-specific keyframes in styles/index.css) can target
+  // role-specific motion: PM clipboard nod, Planner candidate cards,
+  // Designer sparkle, FE code-line blink, BE rack pulse, AI brain
+  // glow, QA magnifier sweep, Deploy rocket launch.
+  const propClass = `${agentId}-prop pixel-agent-prop pixel-agent-${agentId}-prop`;
   switch (kind) {
     case "clipboard":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-clipboard" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-clipboard ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-paper">
             <span className="pixel-agent-tool-line" />
             <span className="pixel-agent-tool-line" />
             <span className="pixel-agent-tool-line" />
           </span>
           <span className="pixel-agent-tool-clip" style={{ backgroundColor: color }} />
+          {/* PM-only stamp that pops in on decision */}
+          <span className="pixel-agent-tool-clipboard-stamp" aria-hidden />
         </span>
       );
     case "ruler":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-ruler" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-ruler ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-triangle" style={{ borderColor: color }} />
+          {/* Planner candidate cards — three small rectangles that
+              pop in sequence under the ruler. */}
+          <span className="pixel-agent-tool-cards">
+            <span />
+            <span />
+            <span />
+          </span>
         </span>
       );
     case "palette":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-palette" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-palette ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-palette-base" />
           <span className="pixel-agent-tool-palette-dot" style={{ backgroundColor: "#f87171" }} />
           <span className="pixel-agent-tool-palette-dot" style={{ backgroundColor: "#34d399" }} />
           <span className="pixel-agent-tool-palette-dot" style={{ backgroundColor: "#7dd3fc" }} />
           <span className="pixel-agent-tool-palette-dot" style={{ backgroundColor: "#facc15" }} />
+          <span className="pixel-agent-tool-palette-sparkle" aria-hidden />
         </span>
       );
     case "monitor":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-monitor" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-monitor ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-monitor-frame" style={{ borderColor: color }}>
             <span className="pixel-agent-tool-monitor-screen" />
+            {/* Code-line blinks for Frontend */}
+            <span className="pixel-agent-tool-monitor-line" />
+            <span className="pixel-agent-tool-monitor-line" />
+            <span className="pixel-agent-tool-monitor-line" />
           </span>
           <span className="pixel-agent-tool-monitor-stand" style={{ backgroundColor: color }} />
         </span>
       );
     case "wrench":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-wrench" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-wrench ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-wrench-handle" style={{ backgroundColor: color }} />
           <span className="pixel-agent-tool-wrench-head" style={{ borderColor: color }} />
+          {/* Backend server rack pulse */}
+          <span className="pixel-agent-tool-rack">
+            <span />
+            <span />
+            <span />
+          </span>
         </span>
       );
     case "chip":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-chip" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-chip ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-chip-body" style={{ backgroundColor: color }}>
             <span className="pixel-agent-tool-chip-core" />
           </span>
@@ -166,21 +192,27 @@ function Tool({ kind, color }) {
           <span className="pixel-agent-tool-chip-pin" />
           <span className="pixel-agent-tool-chip-pin" />
           <span className="pixel-agent-tool-chip-pin" />
+          {/* AI brain/circuit glow ring */}
+          <span className="pixel-agent-tool-chip-glow" />
         </span>
       );
     case "magnifier":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-magnifier" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-magnifier ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-magnifier-ring" style={{ borderColor: color }} />
           <span className="pixel-agent-tool-magnifier-handle" style={{ backgroundColor: color }} />
+          {/* Sweep arc — animates a 90° wedge across the lens */}
+          <span className="pixel-agent-tool-magnifier-sweep" />
         </span>
       );
     case "rocket":
       return (
-        <span className="pixel-agent-tool pixel-agent-tool-rocket" aria-hidden>
+        <span className={`pixel-agent-tool pixel-agent-tool-rocket ${propClass}`} aria-hidden>
           <span className="pixel-agent-tool-rocket-body" style={{ backgroundColor: color }} />
           <span className="pixel-agent-tool-rocket-fin" />
           <span className="pixel-agent-tool-rocket-flame" />
+          {/* Launch trail — appears under the rocket on push success */}
+          <span className="pixel-agent-tool-rocket-trail" />
         </span>
       );
     default:
@@ -254,7 +286,7 @@ function AgentCharacter({
         <span className="pixel-agent-body">
           <span className="pixel-agent-arm pixel-agent-arm-l" />
           <span className="pixel-agent-arm pixel-agent-arm-r" />
-          <Tool kind={preset.tool} color={preset.accent} />
+          <Tool kind={preset.tool} color={preset.accent} agentId={agentId} />
         </span>
         <span className="pixel-agent-legs">
           <span className="pixel-agent-leg pixel-agent-leg-l" />

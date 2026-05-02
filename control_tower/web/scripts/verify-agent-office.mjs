@@ -76,6 +76,26 @@ const REQUIRED_KEYFRAMES = [
   "@keyframes pixel-agent-talk",
   "@keyframes pixel-speech-pop",
   "@keyframes pixel-office-monitor-blink",
+  // Per-agent prop animations
+  "@keyframes pm-prop-nod",
+  "@keyframes planner-prop-cards",
+  "@keyframes designer-prop-sparkle",
+  "@keyframes frontend-prop-codeblink",
+  "@keyframes backend-prop-rack",
+  "@keyframes ai-prop-glow",
+  "@keyframes qa-prop-sweep",
+  "@keyframes deploy-prop-trail",
+];
+
+const REQUIRED_PROP_CLASSES = [
+  "pm-prop",
+  "planner-prop",
+  "designer-prop",
+  "frontend-prop",
+  "backend-prop",
+  "ai-prop",
+  "qa-prop",
+  "deploy-prop",
 ];
 
 const REQUIRED_BEHAVIORS = [
@@ -134,7 +154,91 @@ const REQUIRED_BEHAVIORS = [
   }],
   ["prefers-reduced-motion guard exists", () =>
     searchAny("prefers-reduced-motion: reduce").length > 0],
+  // Phase machine + freshness helpers
+  ["autopilotPhase helper present", () =>
+    docs.some((d) => d.path.endsWith("autopilotPhase.js"))],
+  ["derivePhase exported", () =>
+    searchAny("export function derivePhase").length > 0],
+  ["stageToWorkingAgent exported", () =>
+    searchAny("export function stageToWorkingAgent").length > 0],
+  ["freshnessOf exported", () =>
+    searchAny("export function freshnessOf").length > 0],
+  ["FRESHNESS_LABEL CURRENT CYCLE", () =>
+    searchAny("CURRENT CYCLE").length > 0],
+  ["STALE ARTIFACT label present", () =>
+    searchAny("STALE ARTIFACT").length > 0],
+  ["AutoPilotPanel debug-collapsible", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    return panel && panel.body.includes("autopilot-debug-collapsible");
+  }],
+  ["START PAYLOAD lives inside debug body", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    if (!panel) return false;
+    // The payload preview must only render when `debugOpen` is true.
+    return /debugOpen\s*&&[\s\S]{0,200}START PAYLOAD/.test(panel.body)
+        || /debugOpen[\s\S]*autopilot-payload-preview/.test(panel.body);
+  }],
+  ["restart progress 1/3 → 3/3 labels", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    return panel
+      && panel.body.includes("1/3 stopping")
+      && panel.body.includes("2/3 waiting")
+      && panel.body.includes("3/3 starting");
+  }],
+  ["safe_run warning badge", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    return panel && panel.body.includes("배포 안 함");
+  }],
+  ["AgentDetailDrawer freshness pill", () => {
+    const drawer = docs.find((d) => d.path.endsWith("AgentDetailDrawer.jsx"));
+    return drawer && drawer.body.includes("agent-detail-freshness");
+  }],
+  ["AgentDetailDrawer per-section source", () => {
+    const drawer = docs.find((d) => d.path.endsWith("AgentDetailDrawer.jsx"));
+    return drawer && drawer.body.includes("agent-detail-source");
+  }],
+  ["AgentDetailDrawer previous issue collapsible", () => {
+    const drawer = docs.find((d) => d.path.endsWith("AgentDetailDrawer.jsx"));
+    return drawer && drawer.body.includes("이전 cycle 미해결");
+  }],
+  ["AgentOfficeScene reads phase + workingAgentId", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    return scene
+      && scene.body.includes("derivePhase")
+      && scene.body.includes("stageToWorkingAgent");
+  }],
+  ["AgentOfficeScene blocks stale blocking_agent", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    if (!scene) return false;
+    // Must check freshness === current_run/current_cycle before
+    // painting fresh failed/rework state. We bake that as a required
+    // textual fragment.
+    return scene.body.includes("isFresh") && scene.body.includes("blocking_agent === agentId");
+  }],
+  ["pixel-office stage label data-testid", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    return scene && scene.body.includes("pixel-office-stage-label");
+  }],
+  ["autopilot-stat-ellipsis class for long paths", () => {
+    return searchAny("autopilot-stat-ellipsis").length > 0;
+  }],
+  ["control-tower-right-rail min-width", () => {
+    return searchAny("control-tower-right-rail").length >= 2; // CSS + JSX
+  }],
 ];
+
+for (const propClass of REQUIRED_PROP_CLASSES) {
+  REQUIRED_BEHAVIORS.push([
+    `${propClass} class wired`,
+    () => {
+      const inJsx = searchAny(`${propClass} pixel-agent-prop`).length > 0
+        || searchAny(`${propClass}`).length > 0;
+      const inCss = searchAny(`.${propClass}`).length > 0
+        || searchAny(`pixel-agent-${propClass.replace("-prop", "")}.is-active`).length > 0;
+      return inJsx && inCss;
+    },
+  ]);
+}
 
 const failures = [];
 const passes = [];
