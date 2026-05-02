@@ -104,6 +104,10 @@ def _claude_rework_path() -> Path:
     return _runtime_dir() / "claude_rework_prompt.md"
 
 
+def _smoke_history_path() -> Path:
+    return _runtime_dir() / "factory_smoke_history.jsonl"
+
+
 def _pm_decision_path() -> Path:
     return _runtime_dir() / "pm_decision.md"
 
@@ -205,6 +209,13 @@ class SmokeRun:
     ticket_status: str | None = None
     pm_decision_ship_ready: bool | None = None
     publish_executed: bool = False
+    # design_spec / spec-mode signals captured from factory_state.json
+    # at finalize time. Surfaced in factory_smoke_state.json so the
+    # dashboard / observer don't have to re-parse the cycle's state.
+    pm_hold_spec_keywords: list[str] = field(default_factory=list)
+    design_spec_status: str | None = None
+    design_spec_acceptance_passed: bool | None = None
+    design_spec_target_files_count: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -766,6 +777,17 @@ def _finalize_run(
         run.pm_decision_ship_ready = bool(
             factory_state.get("pm_decision_ship_ready")
         )
+    spec_kw = factory_state.get("pm_hold_spec_keywords") or []
+    if isinstance(spec_kw, list):
+        run.pm_hold_spec_keywords = list(spec_kw)
+    run.design_spec_status = factory_state.get("design_spec_status")
+    if factory_state.get("design_spec_acceptance_passed") is not None:
+        run.design_spec_acceptance_passed = bool(
+            factory_state.get("design_spec_acceptance_passed")
+        )
+    target_files = factory_state.get("design_spec_target_files") or []
+    if isinstance(target_files, list):
+        run.design_spec_target_files_count = len(target_files)
 
     # last successful stage / failed stage
     for obs in run.stages:
@@ -783,8 +805,18 @@ def write_outputs(
     factory_state: dict,
     observer_classification: dict | None,
 ) -> None:
+    prior_history = _load_history()
+    entry = _build_history_entry(run, factory_state, prior_history)
+    _append_history_line(entry)
+    history = prior_history + [entry]
+    signal = compute_maturity_signal(history)
+    hold_progress = compute_hold_progress(history)
+
     _safe_write_json(_smoke_state_path(), _serialize_run(run))
-    _safe_write_text(_smoke_report_path(), _build_report(run, factory_state))
+    _safe_write_text(
+        _smoke_report_path(),
+        _build_report(run, factory_state, signal, hold_progress=hold_progress),
+    )
     if run.verdict == "FAIL":
         _safe_write_text(
             _failure_report_path(),
@@ -825,6 +857,10 @@ def _serialize_run(run: SmokeRun) -> dict:
         "ticket_status": run.ticket_status,
         "pm_decision_ship_ready": run.pm_decision_ship_ready,
         "publish_executed": run.publish_executed,
+        "pm_hold_spec_keywords": list(run.pm_hold_spec_keywords),
+        "design_spec_status": run.design_spec_status,
+        "design_spec_acceptance_passed": run.design_spec_acceptance_passed,
+        "design_spec_target_files_count": run.design_spec_target_files_count,
         "stages": [_serialize_stage(s) for s in run.stages],
         "notes": list(run.notes),
     }
@@ -842,7 +878,13 @@ def _serialize_stage(s: StageObservation) -> dict:
     }
 
 
-def _build_report(run: SmokeRun, factory_state: dict) -> str:
+def _build_report(
+    run: SmokeRun,
+    factory_state: dict,
+    maturity_signal: dict | None = None,
+    *,
+    hold_progress: dict | None = None,
+) -> str:
     lines = [
         "# Stampport Factory Smoke Report",
         "",
@@ -895,12 +937,25 @@ def _build_report(run: SmokeRun, factory_state: dict) -> str:
     ]
     lines.extend(_recommend_next(run))
 
+    if hold_progress is None and run.verdict == "HOLD":
+        # Best-effort: load full history (current entry already
+        # appended by write_outputs) so the section reflects state on
+        # disk.
+        hold_progress = compute_hold_progress(_load_history())
+    if hold_progress and hold_progress.get("hold_repeat_count", 0) > 0:
+        lines.extend(_build_hold_progress_section(hold_progress))
+
+    if maturity_signal is None:
+        maturity_signal = compute_maturity_signal(_load_history())
+    lines.extend(_build_maturity_section(maturity_signal))
+
     lines += [
         "",
         "## Output files",
         f"- 상태: `.runtime/factory_smoke_state.json`",
         f"- 리포트: `.runtime/factory_smoke_report.md`",
         f"- 로그: `.runtime/factory_smoke.log`",
+        f"- 히스토리: `.runtime/factory_smoke_history.jsonl`",
     ]
     if run.verdict == "FAIL":
         lines += [
@@ -1141,6 +1196,21 @@ def _build_rework_prompt(run: SmokeRun, factory_state: dict) -> str:
     if qa_extra:
         lines += ["", "## QA 추가 점검 항목", qa_extra.strip()]
 
+    spec_keywords = list(run.pm_hold_spec_keywords or [])
+    if spec_keywords:
+        kw_str = ", ".join(f"`{k}`" for k in spec_keywords[:12])
+        lines += [
+            "",
+            "## ⚠️ design_spec 우선 모드",
+            "이번 HOLD 사유에 다음 spec-mode keyword 가 포함되었습니다:",
+            f"- {kw_str}",
+            "",
+            "다음 사이클의 designer 는 `.runtime/design_spec.md` 를 작성해야 합니다.",
+            "PM 은 design_spec acceptance (SVG 3종 숫자 좌표 / titleLabel ≥ 13 /"
+            " 수정 대상 파일 ≥ 3 / ShareCard 렌더 조건 / QA 기준) 가 통과하면",
+            "점수 미달이라도 SHIP 으로 넘어갑니다 — 추상 논의 루프 차단.",
+        ]
+
     lines += [
         "",
         "## 해결해야 할 항목",
@@ -1167,6 +1237,7 @@ def _build_rework_prompt(run: SmokeRun, factory_state: dict) -> str:
         "- `.runtime/designer_final_review.md`",
         "- `.runtime/desire_scorecard.json`",
         "- `.runtime/factory_smoke_report.md`",
+        "- `.runtime/design_spec.md` (작성 후)",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1199,6 +1270,511 @@ def filter_git_addable_paths(paths: list[str]) -> list[str]:
             continue
         out.append(p)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Factory Maturity Signal
+#
+# The smoke runner writes one JSONL line per run to
+# .runtime/factory_smoke_history.jsonl, then summarizes the last 5 runs
+# in factory_smoke_report.md and emits a single concrete recommendation
+# for the operator (keep_sequential_loop / improve_pm_rework_feedback /
+# add_parallel_designer_review / ...). Goal: replace gut-feel decisions
+# about whether to introduce parallel auxiliary loops with a measured
+# signal grounded in observed verdicts and stage durations.
+# ---------------------------------------------------------------------------
+
+
+_MATURITY_RECOMMENDATIONS: tuple[str, ...] = (
+    "keep_sequential_loop",
+    "improve_planner_contract",
+    "improve_pm_rework_feedback",
+    "add_parallel_designer_review",
+    "add_parallel_qa_review",
+    "add_diagnostic_repair_loop",
+    "split_product_and_control_tower_cycles",
+)
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    s = ts
+    if s.endswith("Z"):
+        s = s[:-1]
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _compute_duration_sec(started: str | None, ended: str | None) -> float:
+    s = _parse_iso(started)
+    e = _parse_iso(ended)
+    if not s or not e:
+        return 0.0
+    return max(0.0, (e - s).total_seconds())
+
+
+def _human_action_count_for(verdict: str) -> int:
+    """Translate a verdict into the number of distinct human actions the
+    operator must take afterwards. Used to compute "ops automation
+    maturity" — if average per run is > 1, the loop still costs the
+    operator more than one decision per cycle on average.
+    """
+    if verdict == "PASS":
+        return 0
+    if verdict in ("READY_TO_REVIEW", "READY_TO_PUBLISH"):
+        return 1
+    if verdict == "HOLD":
+        return 2
+    if verdict == "FAIL":
+        return 2
+    return 1
+
+
+def _load_history() -> list[dict]:
+    path = _smoke_history_path()
+    if not path.is_file():
+        return []
+    out: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return []
+    return out
+
+
+def _append_history_line(entry: dict) -> None:
+    path = _smoke_history_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        sys.stderr.write(f"[factory_smoke] history append failed: {exc}\n")
+
+
+def _build_history_entry(
+    run: SmokeRun,
+    factory_state: dict,
+    prior_history: list[dict],
+) -> dict:
+    duration_sec = _compute_duration_sec(run.started_at, run.finished_at)
+    current_stage = factory_state.get("current_stage") or None
+    last_stage = run.last_successful_stage or None
+    stage_durations: dict[str, float] = {}
+    for s in run.stages:
+        if s.duration_sec:
+            stage_durations[s.name] = round(float(s.duration_sec), 3)
+
+    failure_code = run.failure_code or None
+    repeated = 0
+    if failure_code:
+        # Count this run + matching codes in the prior 4 entries (so the
+        # value is "occurrences within the most recent 5 runs ending now").
+        repeated = 1 + sum(
+            1 for e in prior_history[-4:]
+            if e.get("failure_code") == failure_code
+        )
+
+    pm_decision_message = factory_state.get("pm_decision_message")
+    spec_keywords = factory_state.get("pm_hold_spec_keywords") or []
+    design_spec_status = factory_state.get("design_spec_status")
+    design_spec_acceptance_passed = factory_state.get(
+        "design_spec_acceptance_passed"
+    )
+    return {
+        "started_at": run.started_at,
+        "ended_at": run.finished_at,
+        "duration_sec": round(duration_sec, 3),
+        "verdict": run.verdict,
+        "failure_code": failure_code,
+        "current_stage": current_stage,
+        "last_stage": last_stage,
+        "stage_durations": stage_durations,
+        "changed_files_count": run.changed_files_count,
+        "qa_status": run.qa_status,
+        "pm_decision_ship_ready": run.pm_decision_ship_ready,
+        "implementation_ticket_status": run.ticket_status,
+        "human_action_required": _human_action_count_for(run.verdict),
+        "repeated_failure_count": repeated,
+        # HOLD-progress signals — let compute_hold_progress() reason
+        # about whether the same HOLD reason is repeating, getting more
+        # concrete, or close to the spec_bypass threshold.
+        "pm_decision_message": pm_decision_message,
+        "pm_hold_spec_keywords": list(spec_keywords) if spec_keywords else [],
+        "design_spec_status": design_spec_status,
+        "design_spec_acceptance_passed": bool(design_spec_acceptance_passed)
+        if design_spec_acceptance_passed is not None else None,
+    }
+
+
+def compute_hold_progress(
+    history: list[dict], current_entry: dict | None = None,
+) -> dict:
+    """Inspect recent HOLD verdicts in history (current_entry should be
+    appended already, or passed separately) and decide whether the
+    rework loop is making progress.
+
+    Returns:
+        hold_repeat_count: consecutive HOLD verdicts ending at the
+            most recent entry (1 if current is HOLD but previous was
+            not, 0 if current isn't HOLD).
+        same_reason_as_prev: True when the current HOLD's spec keyword
+            set matches the previous HOLD exactly.
+        more_concrete: True when the current HOLD has *more* spec
+            keywords than the previous, OR when design_spec_status
+            advanced toward generated/insufficient compared to prior.
+        next_action: one of
+            "design_spec 생성 필요"   — HOLD has spec keywords but no design_spec.
+            "design_spec 보완 필요"   — design_spec exists but acceptance failed.
+            "구현 진입 가능"          — design_spec acceptance passed; planner
+                                         should ship next cycle.
+            "PM 기준 완화 필요"       — repeated HOLDs with same reasons and a
+                                         passing design_spec already (rare loop).
+            "—"                       — current isn't HOLD.
+    """
+    series = list(history)
+    if current_entry is not None:
+        series = [*series, current_entry]
+    if not series:
+        return {
+            "hold_repeat_count": 0,
+            "same_reason_as_prev": False,
+            "more_concrete": False,
+            "next_action": "—",
+            "current_keywords": [],
+            "prev_keywords": [],
+        }
+    last = series[-1]
+    if (last.get("verdict") or "") != "HOLD":
+        return {
+            "hold_repeat_count": 0,
+            "same_reason_as_prev": False,
+            "more_concrete": False,
+            "next_action": "—",
+            "current_keywords": [],
+            "prev_keywords": [],
+        }
+
+    repeat = 0
+    for e in reversed(series):
+        if (e.get("verdict") or "") == "HOLD":
+            repeat += 1
+        else:
+            break
+
+    # The most recent prior HOLD (excluding current).
+    prev_hold: dict | None = None
+    for e in reversed(series[:-1]):
+        if (e.get("verdict") or "") == "HOLD":
+            prev_hold = e
+            break
+
+    cur_kw = list(last.get("pm_hold_spec_keywords") or [])
+    prev_kw = list((prev_hold or {}).get("pm_hold_spec_keywords") or [])
+    cur_set = set(cur_kw)
+    prev_set = set(prev_kw)
+    same_reason = bool(prev_hold) and cur_set == prev_set and cur_set != set()
+    more_concrete = False
+    if prev_hold:
+        if cur_set and prev_set and cur_set > prev_set:
+            more_concrete = True
+        # design_spec_status promotion ladder: skipped < failed <
+        # insufficient < generated. If we moved up, that's progress
+        # even if keyword sets are the same.
+        ladder = {"skipped": 0, "failed": 1, "insufficient": 2, "generated": 3}
+        cur_rank = ladder.get(str(last.get("design_spec_status") or ""), 0)
+        prev_rank = ladder.get(
+            str(prev_hold.get("design_spec_status") or ""), 0
+        )
+        if cur_rank > prev_rank:
+            more_concrete = True
+
+    cur_acc = last.get("design_spec_acceptance_passed")
+    cur_status = last.get("design_spec_status") or ""
+    if cur_acc is True and cur_status == "generated":
+        next_action = "구현 진입 가능"
+    elif cur_status == "insufficient":
+        next_action = "design_spec 보완 필요"
+    elif cur_kw and cur_status in {"skipped", "", "failed"}:
+        next_action = "design_spec 생성 필요"
+    elif repeat >= 3 and same_reason and cur_acc is True:
+        next_action = "PM 기준 완화 필요"
+    elif repeat >= 3 and same_reason:
+        next_action = "design_spec 보완 필요"
+    else:
+        next_action = "design_spec 생성 필요" if cur_kw else "—"
+
+    return {
+        "hold_repeat_count": repeat,
+        "same_reason_as_prev": same_reason,
+        "more_concrete": more_concrete,
+        "next_action": next_action,
+        "current_keywords": cur_kw,
+        "prev_keywords": prev_kw,
+    }
+
+
+def _build_hold_progress_section(progress: dict) -> list[str]:
+    """Markdown section appended to factory_smoke_report.md when the
+    current verdict is HOLD."""
+    if progress.get("hold_repeat_count", 0) <= 0:
+        return []
+    cur_kw = progress.get("current_keywords") or []
+    prev_kw = progress.get("prev_keywords") or []
+    return [
+        "",
+        "## HOLD progress",
+        f"- HOLD 반복 횟수: **{progress['hold_repeat_count']}**",
+        f"- 직전 HOLD 와 같은 사유: `{progress['same_reason_as_prev']}`",
+        f"- 이번 HOLD 가 더 구체화: `{progress['more_concrete']}`",
+        "- 직전 HOLD 키워드: " + (", ".join(f"`{k}`" for k in prev_kw) or "—"),
+        "- 이번 HOLD 키워드: " + (", ".join(f"`{k}`" for k in cur_kw) or "—"),
+        f"- 다음 행동: **{progress['next_action']}**",
+    ]
+
+
+def compute_maturity_signal(history: list[dict]) -> dict:
+    """Summarize the last 5 history entries and pick a single recommendation.
+
+    Returned keys:
+        recent_count, verdict_distribution,
+        ready_count, hold_count, fail_count, pass_count,
+        avg_duration_sec,
+        most_common_failure_code, most_common_failure_count,
+        longest_stage, longest_stage_avg_duration_sec,
+        avg_human_action_required,
+        signals (list of human-readable signal strings),
+        recommendation (one of _MATURITY_RECOMMENDATIONS),
+        operator_message (one paragraph the operator can read directly)
+    """
+    recent = history[-5:]
+    n = len(recent)
+    if n == 0:
+        return {
+            "recent_count": 0,
+            "verdict_distribution": {},
+            "ready_count": 0,
+            "hold_count": 0,
+            "fail_count": 0,
+            "pass_count": 0,
+            "avg_duration_sec": 0.0,
+            "most_common_failure_code": None,
+            "most_common_failure_count": 0,
+            "longest_stage": None,
+            "longest_stage_avg_duration_sec": 0.0,
+            "avg_human_action_required": 0.0,
+            "signals": [],
+            "recommendation": "keep_sequential_loop",
+            "operator_message": (
+                "아직 history 가 없습니다. smoke 를 몇 회 더 돌린 뒤 다시 보세요."
+            ),
+        }
+
+    verdict_dist: dict[str, int] = {}
+    for h in recent:
+        v = h.get("verdict") or "UNKNOWN"
+        verdict_dist[v] = verdict_dist.get(v, 0) + 1
+
+    ready_count = (
+        verdict_dist.get("READY_TO_REVIEW", 0)
+        + verdict_dist.get("READY_TO_PUBLISH", 0)
+    )
+    hold_count = verdict_dist.get("HOLD", 0)
+    fail_count = sum(
+        1 for h in recent
+        if h.get("verdict") == "FAIL"
+        or h.get("failure_code") == "smoke_timeout"
+    )
+    pass_count = verdict_dist.get("PASS", 0)
+
+    durations = [float(h.get("duration_sec") or 0) for h in recent]
+    avg_duration = sum(durations) / n
+
+    failure_counts: dict[str, int] = {}
+    for h in recent:
+        code = h.get("failure_code")
+        if code:
+            failure_counts[code] = failure_counts.get(code, 0) + 1
+    most_common_code: str | None = None
+    most_common_count = 0
+    if failure_counts:
+        most_common_code, most_common_count = max(
+            failure_counts.items(), key=lambda kv: (kv[1], kv[0])
+        )
+
+    # Longest stage: rank by AVERAGE duration across the recent runs that
+    # actually saw the stage.
+    stage_total: dict[str, float] = {}
+    stage_seen: dict[str, int] = {}
+    for h in recent:
+        for name, dur in (h.get("stage_durations") or {}).items():
+            try:
+                d = float(dur)
+            except (TypeError, ValueError):
+                continue
+            stage_total[name] = stage_total.get(name, 0.0) + d
+            stage_seen[name] = stage_seen.get(name, 0) + 1
+    longest_stage: str | None = None
+    longest_stage_avg = 0.0
+    for name, total in stage_total.items():
+        avg = total / stage_seen[name]
+        if avg > longest_stage_avg:
+            longest_stage_avg = avg
+            longest_stage = name
+
+    avg_human = sum(
+        int(h.get("human_action_required") or 0) for h in recent
+    ) / n
+
+    signals: list[str] = []
+    if ready_count >= 3:
+        signals.append("운영 가능")
+    if hold_count >= 3:
+        signals.append("rework feedback 개선 필요")
+    if most_common_count >= 3 and most_common_code:
+        signals.append(
+            f"진단별 자동 수리 루프 필요 ({most_common_code})"
+        )
+    if avg_duration > 1800:
+        signals.append("병렬 보조 평가 검토")
+    if avg_human > 1:
+        signals.append("운영 자동화 미성숙")
+    if ready_count >= 3 and avg_duration > 1800:
+        signals.append("부분 병렬화 후보")
+
+    # Recommendation — pick exactly one in priority order so the operator
+    # sees a single concrete next step rather than a checklist.
+    recommendation = "keep_sequential_loop"
+    operator_message = ""
+
+    if most_common_count >= 3 and most_common_code:
+        recommendation = "add_diagnostic_repair_loop"
+        operator_message = (
+            f"같은 failure_code(`{most_common_code}`) 가 최근 {n}회 중 "
+            f"{most_common_count}회 반복되었습니다. 병렬화 전에 진단별 "
+            f"자동 수리 루프를 먼저 도입하세요."
+        )
+    elif hold_count >= 3:
+        recommendation = "improve_pm_rework_feedback"
+        operator_message = (
+            f"아직 병렬화하지 마세요. 최근 {n}회 중 READY_TO_REVIEW가 "
+            f"{ready_count}회이고 HOLD가 {hold_count}회입니다. 먼저 PM HOLD "
+            f"피드백 주입을 안정화하세요."
+        )
+    elif ready_count >= 3 and avg_duration > 1800:
+        worst = (longest_stage or "").lower()
+        if "designer" in worst:
+            recommendation = "add_parallel_designer_review"
+        elif "qa" in worst:
+            recommendation = "add_parallel_qa_review"
+        else:
+            recommendation = "split_product_and_control_tower_cycles"
+        mins = avg_duration / 60.0
+        operator_message = (
+            f"부분 병렬화를 검토할 수 있습니다. 최근 {n}회 중 "
+            f"READY_TO_REVIEW {ready_count}회, 평균 소요 시간 {mins:.0f}분으로 "
+            f"병목은 {longest_stage or '미상'}입니다."
+        )
+    elif fail_count >= 3:
+        recommendation = "improve_planner_contract"
+        operator_message = (
+            f"최근 {n}회 중 FAIL/TIMEOUT 이 {fail_count}회입니다. 병렬화 전에 "
+            f"planner 계약과 cycle 진입 조건을 강화해 실패율을 낮추세요."
+        )
+    elif avg_human > 1:
+        recommendation = "improve_pm_rework_feedback"
+        operator_message = (
+            f"운영 자동화가 아직 미성숙합니다 (run당 평균 human_action "
+            f"{avg_human:.1f}). PM rework 피드백 주입과 자동 ship 정책을 "
+            f"먼저 다듬으세요."
+        )
+    else:
+        recommendation = "keep_sequential_loop"
+        operator_message = (
+            f"아직 병렬화 신호가 없습니다 (READY_TO_REVIEW {ready_count}회, "
+            f"HOLD {hold_count}회, FAIL/TIMEOUT {fail_count}회, 평균 "
+            f"{avg_duration:.0f}s). 순차 루프를 유지하세요."
+        )
+
+    return {
+        "recent_count": n,
+        "verdict_distribution": verdict_dist,
+        "ready_count": ready_count,
+        "hold_count": hold_count,
+        "fail_count": fail_count,
+        "pass_count": pass_count,
+        "avg_duration_sec": round(avg_duration, 3),
+        "most_common_failure_code": most_common_code,
+        "most_common_failure_count": most_common_count,
+        "longest_stage": longest_stage,
+        "longest_stage_avg_duration_sec": round(longest_stage_avg, 3),
+        "avg_human_action_required": round(avg_human, 3),
+        "signals": signals,
+        "recommendation": recommendation,
+        "operator_message": operator_message,
+    }
+
+
+def _build_maturity_section(signal: dict) -> list[str]:
+    lines = ["", "## Factory Maturity Signal"]
+    if signal["recent_count"] == 0:
+        lines += [
+            "- (history 없음 — smoke 를 더 돌리세요)",
+            "",
+            "### 운영자에게",
+            f"> {signal['operator_message']}",
+            "",
+            f"### 추천: `{signal['recommendation']}`",
+        ]
+        return lines
+
+    avg_min = signal["avg_duration_sec"] / 60.0
+    dist = signal["verdict_distribution"]
+    dist_str = ", ".join(f"{k}={v}" for k, v in sorted(dist.items())) or "—"
+    lines += [
+        f"- 표본: 최근 {signal['recent_count']}회",
+        f"- verdict 분포: {dist_str}",
+        f"- READY_TO_REVIEW (READY_TO_PUBLISH 포함): "
+        f"{signal['ready_count']}회",
+        f"- HOLD: {signal['hold_count']}회",
+        f"- FAIL/TIMEOUT: {signal['fail_count']}회",
+        f"- 평균 소요 시간: {signal['avg_duration_sec']:.1f}s "
+        f"({avg_min:.1f}분)",
+        f"- 가장 많이 반복된 failure_code: "
+        f"`{signal['most_common_failure_code'] or '—'}` "
+        f"({signal['most_common_failure_count']}회)",
+        f"- 가장 오래 걸린 stage: "
+        f"`{signal['longest_stage'] or '—'}` "
+        f"(avg {signal['longest_stage_avg_duration_sec']:.1f}s)",
+        f"- 평균 human_action_required: "
+        f"{signal['avg_human_action_required']:.2f}",
+        "",
+        "### 신호",
+    ]
+    if signal["signals"]:
+        lines.extend(f"- {s}" for s in signal["signals"])
+    else:
+        lines.append("- (해당 없음)")
+    lines += [
+        "",
+        "### 운영자에게",
+        f"> {signal['operator_message']}",
+        "",
+        f"### 추천: `{signal['recommendation']}`",
+    ]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1705,7 +2281,431 @@ def self_test() -> tuple[int, int, list[str]]:
             f"observer={cls['diagnostic_code']}/{cls['is_failure']}"
         )
 
+    # 16. Maturity signal — keep_sequential_loop fixture.
+    #     5 mostly-PASS cycles, modest duration, no recurring failures.
+    total += 1
+    fixture_keep = [
+        _maturity_fixture_entry(
+            verdict="PASS", duration_sec=540.0,
+            stage_durations={"product_planning": 80.0, "claude_apply": 200.0},
+        ),
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=720.0,
+            stage_durations={"product_planning": 100.0, "claude_apply": 240.0},
+        ),
+        _maturity_fixture_entry(
+            verdict="PASS", duration_sec=560.0,
+            stage_durations={"product_planning": 90.0, "claude_apply": 210.0},
+        ),
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=640.0,
+            stage_durations={"product_planning": 95.0, "claude_apply": 220.0},
+        ),
+        _maturity_fixture_entry(
+            verdict="PASS", duration_sec=600.0,
+            stage_durations={"product_planning": 88.0, "claude_apply": 215.0},
+        ),
+    ]
+    sig = compute_maturity_signal(fixture_keep)
+    if (
+        sig["recommendation"] == "keep_sequential_loop"
+        and sig["ready_count"] == 2
+        and sig["hold_count"] == 0
+        and sig["fail_count"] == 0
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"16: keep_sequential_loop fixture — got "
+            f"{sig['recommendation']} ready={sig['ready_count']} "
+            f"hold={sig['hold_count']} fail={sig['fail_count']}"
+        )
+
+    # 17. Maturity signal — improve_pm_rework_feedback fixture.
+    #     >= 3 HOLD verdicts in last 5.
+    total += 1
+    fixture_hold = [
+        _maturity_fixture_entry(verdict="HOLD", duration_sec=900.0),
+        _maturity_fixture_entry(verdict="PASS", duration_sec=600.0),
+        _maturity_fixture_entry(verdict="HOLD", duration_sec=860.0),
+        _maturity_fixture_entry(verdict="HOLD", duration_sec=920.0),
+        _maturity_fixture_entry(verdict="READY_TO_REVIEW", duration_sec=750.0),
+    ]
+    sig = compute_maturity_signal(fixture_hold)
+    if (
+        sig["recommendation"] == "improve_pm_rework_feedback"
+        and sig["hold_count"] == 3
+        and "rework feedback 개선 필요" in sig["signals"]
+        and "PM HOLD 피드백" in sig["operator_message"]
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"17: improve_pm_rework_feedback fixture — got "
+            f"{sig['recommendation']} hold={sig['hold_count']} "
+            f"signals={sig['signals']}"
+        )
+
+    # 18. Maturity signal — add_parallel_designer_review fixture.
+    #     >= 3 READY_TO_REVIEW verdicts AND avg duration > 1800 AND
+    #     designer_critique is the longest stage.
+    total += 1
+    fixture_designer = [
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=2400.0,
+            stage_durations={
+                "designer_critique": 1200.0, "claude_apply": 500.0,
+            },
+        ),
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=2300.0,
+            stage_durations={
+                "designer_critique": 1150.0, "claude_apply": 480.0,
+            },
+        ),
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=2500.0,
+            stage_durations={
+                "designer_critique": 1300.0, "claude_apply": 520.0,
+            },
+        ),
+        _maturity_fixture_entry(
+            verdict="READY_TO_REVIEW", duration_sec=2200.0,
+            stage_durations={
+                "designer_critique": 1100.0, "claude_apply": 460.0,
+            },
+        ),
+        _maturity_fixture_entry(
+            verdict="PASS", duration_sec=1900.0,
+            stage_durations={
+                "designer_critique": 1000.0, "claude_apply": 420.0,
+            },
+        ),
+    ]
+    sig = compute_maturity_signal(fixture_designer)
+    if (
+        sig["recommendation"] == "add_parallel_designer_review"
+        and sig["ready_count"] == 4
+        and sig["avg_duration_sec"] > 1800.0
+        and sig["longest_stage"] == "designer_critique"
+        and "부분 병렬화 후보" in sig["signals"]
+        and "designer_critique" in sig["operator_message"]
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"18: add_parallel_designer_review fixture — got "
+            f"{sig['recommendation']} ready={sig['ready_count']} "
+            f"avg={sig['avg_duration_sec']} longest={sig['longest_stage']} "
+            f"signals={sig['signals']}"
+        )
+
+    # 19. Smoke run end-to-end with maturity signal — write_outputs creates
+    #     factory_smoke_history.jsonl AND the report contains the
+    #     "Factory Maturity Signal" section.
+    total += 1
+    repo = os.environ.get("LOCAL_RUNNER_REPO")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            run = SmokeRun(mode="observer-only", timeout_sec=0)
+            run.started_at = "2026-05-01T00:00:00.000000Z"
+            run.finished_at = "2026-05-01T00:10:00.000000Z"
+            run.verdict = "PASS"
+            write_outputs(run, factory_state={}, observer_classification=None)
+            hp = Path(tmp) / ".runtime" / "factory_smoke_history.jsonl"
+            rp = Path(tmp) / ".runtime" / "factory_smoke_report.md"
+            ok = (
+                hp.is_file()
+                and rp.is_file()
+                and "Factory Maturity Signal" in rp.read_text(encoding="utf-8")
+                and "추천:" in rp.read_text(encoding="utf-8")
+            )
+            if ok:
+                first = hp.read_text(encoding="utf-8").splitlines()[0]
+                rec = json.loads(first)
+                ok = (
+                    rec["verdict"] == "PASS"
+                    and rec["duration_sec"] == 600.0
+                    and rec["human_action_required"] == 0
+                    and "stage_durations" in rec
+                )
+            if ok:
+                passed += 1
+            else:
+                failures.append(
+                    "19: maturity history/report — "
+                    f"history_exists={hp.is_file()} report_exists={rp.is_file()}"
+                )
+        finally:
+            if repo is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 20A. PM HOLD with "SVG path" in reasons → next planner prompt has
+    #      design_spec 우선 모드 + spec keyword list.
+    total += 1
+    if _cycle is not None:  # set in test 12
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".runtime").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / ".runtime" / "pm_decision.md").write_text(
+                _PM_DECISION_FIXTURE_SPEC, encoding="utf-8"
+            )
+            (Path(tmp) / ".runtime" / "designer_final_review.md").write_text(
+                _DESIGNER_FINAL_REVIEW_FIXTURE, encoding="utf-8"
+            )
+            saved_pm = _cycle.PM_DECISION_FILE
+            saved_dr = _cycle.DESIGNER_FINAL_REVIEW_FILE
+            _cycle.PM_DECISION_FILE = Path(tmp) / ".runtime" / "pm_decision.md"
+            _cycle.DESIGNER_FINAL_REVIEW_FILE = (
+                Path(tmp) / ".runtime" / "designer_final_review.md"
+            )
+            try:
+                prompt = _cycle._build_product_planner_prompt("test goal")
+                _, mode_active, kw = _cycle._load_pm_hold_rework_context(
+                    return_spec_mode=True,
+                )
+            finally:
+                _cycle.PM_DECISION_FILE = saved_pm
+                _cycle.DESIGNER_FINAL_REVIEW_FILE = saved_dr
+        if (
+            mode_active
+            and any("SVG" in k or "svg" in k for k in kw)
+            and "design_spec" in prompt
+            and "디자인 구현 명세 확정 모드" in prompt
+            and "구현 명세 확정 사이클" in prompt
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"20A: SVG path HOLD did not trigger spec-mode in planner prompt "
+                f"(mode={mode_active}, keywords={kw})"
+            )
+    else:
+        failures.append("20A: skipped — cycle import failed earlier")
+
+    # 20B. design_spec.md with Tier 2 / Tier 3 numeric paths + 13
+    #      titleLabels + 3 target files → _validate_design_spec returns
+    #      [] (PM SHIP-equivalent gate passes).
+    total += 1
+    if _cycle is not None:
+        fails_b = _cycle._validate_design_spec(_DESIGN_SPEC_FIXTURE_GOOD)
+        target_files_b = _cycle._extract_design_spec_target_files(
+            _DESIGN_SPEC_FIXTURE_GOOD
+        )
+        title_count_b = _cycle._extract_design_spec_titlelabel_count(
+            _DESIGN_SPEC_FIXTURE_GOOD
+        )
+        svg_b = _cycle._extract_design_spec_svg_paths(_DESIGN_SPEC_FIXTURE_GOOD)
+        if (
+            not fails_b
+            and len(target_files_b) >= 3
+            and title_count_b >= 13
+            and len(svg_b) >= 3
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"20B: good design_spec did not pass — fails={fails_b[:2]} "
+                f"files={len(target_files_b)} titles={title_count_b} svg={svg_b}"
+            )
+    else:
+        failures.append("20B: skipped — cycle import failed earlier")
+
+    # 20C. design_spec.md with fewer than 13 titleLabels → validator
+    #      returns the titleLabel-count failure (PM stays in HOLD).
+    total += 1
+    if _cycle is not None:
+        # Drop a titleLabel from the good fixture so the count is 12.
+        truncated = _DESIGN_SPEC_FIXTURE_GOOD.replace(
+            "- traveler_starter: 동네 탐험가\n", "", 1
+        )
+        fails_c = _cycle._validate_design_spec(truncated)
+        title_count_c = _cycle._extract_design_spec_titlelabel_count(truncated)
+        if (
+            title_count_c < 13
+            and any("titleLabel 13" in f for f in fails_c)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"20C: <13 titleLabel did not fail — count={title_count_c} "
+                f"fails={fails_c[:3]}"
+            )
+    else:
+        failures.append("20C: skipped — cycle import failed earlier")
+
+    # 20D. design_spec.md provides 3+ target files → ticket extractor
+    #      returns those exact files.
+    total += 1
+    if _cycle is not None:
+        files_d = _cycle._extract_design_spec_target_files(
+            _DESIGN_SPEC_FIXTURE_GOOD
+        )
+        expected_d = {
+            "app/web/src/data/badges.js",
+            "app/web/src/screens/Badges.jsx",
+            "app/web/src/screens/Share.jsx",
+        }
+        if expected_d.issubset(set(files_d)):
+            passed += 1
+        else:
+            failures.append(f"20D: ticket target_files extraction — got {files_d}")
+    else:
+        failures.append("20D: skipped — cycle import failed earlier")
+
+    # 20E. Repeated HOLD verdicts → factory_smoke_report shows
+    #      hold_repeat_count + same_reason_as_prev + next_action.
+    total += 1
+    history_e = [
+        {
+            "verdict": "HOLD", "pm_hold_spec_keywords": ["SVG path", "titleLabel"],
+            "design_spec_status": "skipped",
+            "design_spec_acceptance_passed": None,
+        },
+        {
+            "verdict": "HOLD",
+            "pm_hold_spec_keywords": ["SVG path", "titleLabel", "ShareCard"],
+            "design_spec_status": "insufficient",
+            "design_spec_acceptance_passed": False,
+        },
+    ]
+    progress_e = compute_hold_progress(history_e)
+    section_e = "\n".join(_build_hold_progress_section(progress_e))
+    if (
+        progress_e["hold_repeat_count"] == 2
+        and progress_e["more_concrete"] is True
+        and progress_e["same_reason_as_prev"] is False
+        and progress_e["next_action"] == "design_spec 보완 필요"
+        and "HOLD 반복 횟수" in section_e
+        and "다음 행동" in section_e
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"20E: hold_progress — repeat={progress_e['hold_repeat_count']} "
+            f"more_concrete={progress_e['more_concrete']} "
+            f"same_reason={progress_e['same_reason_as_prev']} "
+            f"next={progress_e['next_action']!r}"
+        )
+
+    # 20F. design_spec NOT YET written but PM HOLD → claude_rework_prompt.md
+    #      created and lists `design_spec.md` as the next deliverable;
+    #      claude_repair_prompt.md remains absent.
+    total += 1
+    repo = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            (runtime / "pm_decision.md").write_text(
+                _PM_DECISION_FIXTURE_SPEC, encoding="utf-8"
+            )
+            (runtime / "designer_final_review.md").write_text(
+                _DESIGNER_FINAL_REVIEW_FIXTURE, encoding="utf-8"
+            )
+            run = SmokeRun(mode="local-cycle", timeout_sec=1800)
+            run.started_at = _utc_now_iso()
+            run.finished_at = _utc_now_iso()
+            run.verdict = "HOLD"
+            run.factory_status = "hold_for_rework"
+            run.cycle_id = 1
+            run.ticket_status = "skipped_hold"
+            run.pm_decision_ship_ready = False
+            run.changed_files_count = 0
+            run.pm_hold_spec_keywords = ["SVG path", "titleLabel"]
+            run.design_spec_status = "skipped"
+            fs = {
+                "status": "hold_for_rework", "cycle": 1,
+                "pm_decision_status": "generated",
+                "pm_decision_ship_ready": False,
+                "implementation_ticket_status": "skipped_hold",
+                "pm_decision_message": "HOLD",
+                "pm_hold_spec_keywords": ["SVG path", "titleLabel"],
+                "design_spec_status": "skipped",
+                "design_spec_acceptance_passed": False,
+            }
+            write_outputs(run, factory_state=fs, observer_classification=None)
+            rework_text = (runtime / "claude_rework_prompt.md").read_text(
+                encoding="utf-8"
+            )
+            ok = (
+                (runtime / "claude_rework_prompt.md").is_file()
+                and not (runtime / "claude_repair_prompt.md").exists()
+                and "design_spec" in rework_text
+                and "design_spec 우선 모드" in rework_text
+            )
+            if ok:
+                passed += 1
+            else:
+                failures.append(
+                    "20F: rework prompt without design_spec — "
+                    "missing design_spec mention or wrong artifact set"
+                )
+        finally:
+            if repo is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 20G. design_spec acceptance passed + PM SHIP → ticket extractor
+    #      pulls target_files from design_spec; status would be
+    #      `generated` (we exercise the PURE extractor path so we don't
+    #      need to spawn claude).
+    total += 1
+    if _cycle is not None:
+        # Mock-write design_spec.md and call the same parsers cycle.py
+        # uses inside stage_implementation_ticket. We don't need to
+        # actually run the stage — we want to assert that target_files
+        # come from the design_spec body when acceptance passes.
+        files_g = _cycle._extract_design_spec_target_files(
+            _DESIGN_SPEC_FIXTURE_GOOD
+        )
+        valid_g = _cycle._validate_design_spec(_DESIGN_SPEC_FIXTURE_GOOD)
+        if not valid_g and len(files_g) >= 3:
+            passed += 1
+        else:
+            failures.append(
+                f"20G: PM-SHIP path with design_spec — files={files_g} "
+                f"valid_failures={valid_g[:2]}"
+            )
+    else:
+        failures.append("20G: skipped — cycle import failed earlier")
+
     return passed, total, failures
+
+
+def _maturity_fixture_entry(
+    *,
+    verdict: str,
+    duration_sec: float,
+    stage_durations: dict[str, float] | None = None,
+    failure_code: str | None = None,
+) -> dict:
+    """Build a synthetic history entry for the maturity self-tests.
+
+    Mirrors `_build_history_entry` so the same shape goes through
+    compute_maturity_signal as a real smoke run would produce.
+    """
+    return {
+        "started_at": "2026-05-01T00:00:00.000000Z",
+        "ended_at": "2026-05-01T00:00:00.000000Z",
+        "duration_sec": duration_sec,
+        "verdict": verdict,
+        "failure_code": failure_code,
+        "current_stage": None,
+        "last_stage": None,
+        "stage_durations": stage_durations or {},
+        "changed_files_count": 0,
+        "qa_status": None,
+        "pm_decision_ship_ready": None,
+        "implementation_ticket_status": None,
+        "human_action_required": _human_action_count_for(verdict),
+        "repeated_failure_count": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1898,6 +2898,109 @@ Local Visa 배지
 1. 동일 dong_code 도장 3회 누적 시 Visa 자동 발급
 2. MyPassport / ShareCard 두 화면에 Visa 시각적 노출
 3. ShareCard caption 에 Visa 라벨 포함
+"""
+
+
+# PM HOLD that explicitly cites SVG path / titleLabel / ShareCard / 좌표
+# / locked — every keyword we want spec-mode to detect. Used by tests
+# 20A / 20F.
+_PM_DECISION_FIXTURE_SPEC = """\
+# Stampport PM Decision
+
+## 출하 결정
+hold (재작업 후 다음 사이클)
+
+## 결정 이유
+디자이너가 제안한 SVG path 의 좌표가 비어 있고 (tier-2 방패 / tier-3 왕관 모두
+숫자 없음), titleLabel 13개 최종 목록이 확정되지 않았다. ShareCard 의
+\"영사까지 1곳 남음\" 보조 텍스트 조건도 미확정 — relatedBadge 가 null 일 때
+렌더 여부가 결정되지 않아 layout 이 깨질 수 있다. selectedTitle 이 string
+인 문제와 locked 슬롯의 progress === 0 충돌 문제가 그대로 남았다.
+
+## 출하 단위 (가장 작은)
+- badges.js 에 level / titleLabel 추가
+- ShareCard 보조 텍스트 렌더 조건 명시
+- SVG 3종 좌표 확정
+
+## 다음 단계 담당
+- 디자이너: design_spec.md 작성. SVG path 좌표 / titleLabel / ShareCard layout 모두 숫자/문자열로 확정.
+- 기획자: 위 design_spec 의 각 항목을 후보 MVP 구현 범위에 미리 적어 둘 것.
+- 프론트/백엔드: N/A
+
+## QA가 추가로 점검할 것
+- 390×560 카드 안에서 SVG 3종이 모두 의도한 위치/크기로 렌더되는가.
+- relatedBadge null 일 때 보조 텍스트가 렌더되지 않는가.
+"""
+
+
+# A "good" design_spec.md — every required section, numeric SVG paths
+# for tiers 2/3, 13+ titleLabels, 5 target_files.
+_DESIGN_SPEC_FIXTURE_GOOD = """\
+# Stampport Design Implementation Spec
+
+## 구현 대상 기능
+- 기능명: 칭호 진화 카드 (TitleSeal)
+- 관련 PM HOLD 사유: SVG path 좌표 부재, titleLabel 미확정, ShareCard layout 미결.
+
+## SVG Path 명세
+
+### Tier 1 원형
+- viewBox: 0 0 80 80
+- 정의: <circle cx=40 cy=40 r=30 stroke="#c9a23a" fill="#fff" stroke-width="2"/>
+- stroke / fill: gold / paper
+
+### Tier 2 방패
+- viewBox: 0 0 80 80
+- path: M10,8 L70,8 L70,48 C70,62 56,72 40,76 C24,72 10,62 10,48 Z
+- stroke / fill / stroke-width: gold / paper / 2
+
+### Tier 3 왕관
+- viewBox: 0 0 80 80
+- path: M12,58 L18,24 L32,42 L40,16 L48,42 L62,24 L68,58 Z
+- stroke / fill / stroke-width: gold / cream / 2
+
+## titleLabel 최종 목록
+- cafe_starter: 카페 입문자
+- cafe_lover: 카페 영사
+- cafe_master: 카페 대사
+- bakery_starter: 베이커리 견습관
+- bakery_lover: 베이커리 영사
+- bakery_master: 베이커리 대사
+- restaurant_starter: 미식 입문자
+- restaurant_lover: 미식 영사
+- restaurant_master: 미식 대사
+- dessert_starter: 디저트 입문자
+- dessert_lover: 디저트 영사
+- dessert_master: 디저트 대사
+- traveler_starter: 동네 탐험가
+
+## badges.js 스키마 변경
+- level: 1 / 2 / 3
+- tier: starter / lover / master
+- titleLabel: 위 목록의 한 항목
+- lockedUntilLevel: number
+- currentTitleLevel = max(unlocked.level)
+
+## ShareCard 레이아웃 명세
+- share-title-seal: share-note 블록 바로 아래 독립 블록
+- share-foot 의 기존 Lv 텍스트: 제거
+- "<title>까지 N곳 남음" 보조 텍스트:
+  - relatedBadge 가 있을 때만 렌더
+  - relatedBadge 가 null 이면 미렌더
+- share-canvas: max-width 390 / max-height 560 / overflow hidden / share-note line-clamp 3
+
+## 수정 대상 파일
+- app/web/src/data/badges.js
+- app/web/src/screens/Badges.jsx
+- app/web/src/screens/Share.jsx
+- app/web/src/components/TitleSeal.jsx
+- app/web/src/components/TitleEvolveModal.jsx
+
+## QA 기준
+- iOS Safari 390px 에서 Lv1 / Lv3 카드 육안 구분
+- share-note 100자 이상에서 share-canvas 가 560px 를 넘지 않는다
+- relatedBadge null 시 보조 텍스트 미렌더
+- Lv1 사용자가 tier-2 badge 선택 시 잠금 슬롯 스타일이 렌더된다
 """
 
 

@@ -63,6 +63,15 @@ PLANNER_REVISION_FILE       = RUNTIME / "planner_revision.md"
 DESIGNER_FINAL_REVIEW_FILE  = RUNTIME / "designer_final_review.md"
 PM_DECISION_FILE            = RUNTIME / "pm_decision.md"
 DESIRE_SCORECARD_FILE       = RUNTIME / "desire_scorecard.json"
+# Design Implementation Spec — written by stage_design_spec when the
+# previous cycle's PM HOLD reasons mention concrete implementation
+# gaps (SVG path, titleLabel, ShareCard layout, badges.js schema, ...).
+# The PM stage accepts this artifact as a SHIP-equivalent signal when
+# its acceptance criteria pass (SVG numeric coordinates, ≥13
+# titleLabel, ≥3 target files, ShareCard render rule, QA criteria),
+# so the rework loop can advance to implementation_ticket / claude_apply
+# instead of staying stuck in abstract design discussion.
+DESIGN_SPEC_FILE            = RUNTIME / "design_spec.md"
 # Implementation Ticket — single source of truth for "what code does
 # this cycle actually intend to write?". Lives between PM 결정 and
 # claude_apply. claude_apply refuses to run if the ticket is missing
@@ -351,6 +360,14 @@ STAGES: list[tuple[str, str, int]] = [
     ("designer_critique",        "디자이너 반박",           0),
     ("planner_revision",         "기획자 수정안",           0),
     ("designer_final_review",    "디자이너 재평가",         0),
+    # Design Implementation Spec — runs only when the previous cycle's
+    # PM HOLD reasons hit one of the spec-mode keywords (SVG path,
+    # titleLabel, badges.js, ShareCard, layout, 좌표, locked,
+    # selectedTitle, 구현 명세). When triggered it forces the cycle
+    # off the new-ideation track and onto a "lock the implementation
+    # spec" track. PM uses .runtime/design_spec.md as a SHIP-equivalent
+    # signal if acceptance passes.
+    ("design_spec",              "디자인 구현 명세",         0),
     ("pm_decision",              "PM 최종 결정",            0),
     ("build_app",                "app/web 빌드",           25),
     ("build_control",            "control_tower/web 빌드",  25),
@@ -480,6 +497,22 @@ class CycleState:
     pm_decision_message: str | None = None
     pm_decision_skipped_reason: str | None = None
     pm_decision_ship_ready: bool = False
+    # design_spec stage: only runs when prior PM HOLD has spec-mode
+    # keywords. status moves through skipped|generated|failed|insufficient.
+    # pm_hold_spec_mode_active reflects whether *this* cycle was forced
+    # into spec mode by the rework context.
+    pm_hold_spec_mode_active: bool = False
+    pm_hold_spec_keywords: list[str] = field(default_factory=list)
+    design_spec_status: str = "skipped"
+    design_spec_path: str | None = None
+    design_spec_at: str | None = None
+    design_spec_message: str | None = None
+    design_spec_skipped_reason: str | None = None
+    design_spec_target_files: list[str] = field(default_factory=list)
+    design_spec_titlelabel_count: int = 0
+    design_spec_svg_paths: list[str] = field(default_factory=list)
+    design_spec_acceptance_passed: bool = False
+    design_spec_acceptance_failures: list[str] = field(default_factory=list)
     # Desire scorecard (1~5 each, total /30). ship_ready is True only
     # when the threshold gate (≥24 total, visual_desire ≥4, share ≥4,
     # revisit ≥4) passes. rework_required lists the axis ids that
@@ -631,6 +664,18 @@ class CycleState:
             "pm_decision_message": self.pm_decision_message,
             "pm_decision_skipped_reason": self.pm_decision_skipped_reason,
             "pm_decision_ship_ready": self.pm_decision_ship_ready,
+            "pm_hold_spec_mode_active": self.pm_hold_spec_mode_active,
+            "pm_hold_spec_keywords": list(self.pm_hold_spec_keywords),
+            "design_spec_status": self.design_spec_status,
+            "design_spec_path": self.design_spec_path,
+            "design_spec_at": self.design_spec_at,
+            "design_spec_message": self.design_spec_message,
+            "design_spec_skipped_reason": self.design_spec_skipped_reason,
+            "design_spec_target_files": list(self.design_spec_target_files),
+            "design_spec_titlelabel_count": self.design_spec_titlelabel_count,
+            "design_spec_svg_paths": list(self.design_spec_svg_paths),
+            "design_spec_acceptance_passed": self.design_spec_acceptance_passed,
+            "design_spec_acceptance_failures": list(self.design_spec_acceptance_failures),
             "desire_scorecard": dict(self.desire_scorecard),
             "desire_scorecard_total": self.desire_scorecard_total,
             "desire_scorecard_path": self.desire_scorecard_path,
@@ -2132,7 +2177,51 @@ Stampport는 카페·빵집·맛집·디저트 방문을 여권 도장처럼 모
 """
 
 
-def _load_pm_hold_rework_context() -> str:
+# Keywords whose presence in PM HOLD reasons / designer 약점 means the
+# next cycle's bottleneck is *implementation specification*, not a new
+# product idea. When any of these match, the planner is forced into
+# spec-confirmation mode and the design_spec stage runs instead of
+# treating the HOLD as a hint for fresh ideation.
+PM_HOLD_SPEC_KEYWORDS: tuple[str, ...] = (
+    "SVG path", "svg path",
+    "titleLabel", "title_label",
+    "좌표",
+    "ShareCard", "sharecard", "share-card",
+    "layout",
+    "구현 명세",
+    "badges.js",
+    "selectedTitle",
+    "locked",
+)
+
+
+def _detect_spec_mode_keywords(*texts: str) -> list[str]:
+    """Scan the given texts for spec-mode trigger keywords. Returns the
+    list of matched keywords (deduplicated, in detection order)."""
+    seen: list[str] = []
+    haystack = "\n".join(t for t in texts if t)
+    if not haystack:
+        return seen
+    lower = haystack.lower()
+    for kw in PM_HOLD_SPEC_KEYWORDS:
+        if kw.lower() in lower and kw not in seen:
+            seen.append(kw)
+    return seen
+
+
+def _read_pm_hold_artifacts() -> tuple[str, str, bool]:
+    """Read pm_decision.md + designer_final_review.md and return
+    (pm_md, designer_md, hold_active). hold_active is True when the
+    PM verdict explicitly says hold."""
+    pm_md = _read_artifact(PM_DECISION_FILE) or ""
+    designer_md = _read_artifact(DESIGNER_FINAL_REVIEW_FILE) or ""
+    if not pm_md.strip():
+        return pm_md, designer_md, False
+    decision = _extract_md_section(pm_md, "출하 결정").lower()
+    return pm_md, designer_md, "hold" in decision
+
+
+def _load_pm_hold_rework_context(*, return_spec_mode: bool = False):
     """If the previous cycle's PM verdict was HOLD, build a
     "Previous PM HOLD" rework context block to prepend to the next
     planner prompt.
@@ -2141,17 +2230,20 @@ def _load_pm_hold_rework_context() -> str:
     designer_final_review.md (욕구 점수표 / 약점). Returns "" when
     there's no HOLD signal so callers can use the boolean-ish return.
 
+    When `return_spec_mode=True` returns a tuple
+    `(rework_text, spec_mode_active, spec_keywords)` so the caller can
+    record the trigger keywords in CycleState.
+
     The block is *advisory* — the planner is told the prior cycle's
     weakness must be the bottleneck of this cycle, not a free choice
-    of new candidates.
+    of new candidates. When spec mode is active the block is upgraded
+    from advisory to *prescriptive* (planner explicitly redirected to
+    spec-confirmation, not new ideation).
     """
-    pm_md = _read_artifact(PM_DECISION_FILE) or ""
-    designer_md = _read_artifact(DESIGNER_FINAL_REVIEW_FILE) or ""
-    if not pm_md.strip():
-        return ""
-
-    decision = _extract_md_section(pm_md, "출하 결정").lower()
-    if "hold" not in decision:
+    pm_md, designer_md, hold_active = _read_pm_hold_artifacts()
+    if not hold_active:
+        if return_spec_mode:
+            return "", False, []
         return ""
 
     reason = _extract_md_section(pm_md, "결정 이유")
@@ -2160,6 +2252,11 @@ def _load_pm_hold_rework_context() -> str:
     weaknesses = _extract_md_section(designer_md, "약점")
     score_section = _extract_md_section(designer_md, "욕구 점수표")
     final = _extract_md_section(designer_md, "최종 판단")
+
+    spec_keywords = _detect_spec_mode_keywords(
+        reason, weaknesses, next_owners, final
+    )
+    spec_mode_active = bool(spec_keywords)
 
     score_summary = ""
     if score_section:
@@ -2198,6 +2295,18 @@ def _load_pm_hold_rework_context() -> str:
     if final:
         pieces += ["", "## 디자이너 최종 판단", final.strip()]
 
+    if spec_mode_active:
+        kw_list = ", ".join(f"`{k}`" for k in spec_keywords)
+        pieces += [
+            "",
+            "## ⚠️ 이번 사이클은 디자인 구현 명세 확정 모드입니다",
+            "이번 사이클은 새 기능 탐색이 아니라 직전 PM HOLD를 해소하는 구현 명세 확정 사이클입니다.",
+            f"- 트리거된 keyword: {kw_list}",
+            "- 새 후보 3개를 무작위 제안하지 마세요. 직전 HOLD에 명시된 구현 구멍을 닫는 단 한 가지 후보만 제안하세요.",
+            "- 후보의 'MVP 구현 범위' 는 SVG path 좌표, titleLabel 최종 목록, ShareCard 렌더 조건 등 숫자/문자열 단위로 확정 가능한 항목을 포함해야 합니다.",
+            "- 디자이너는 같은 사이클 안에서 `.runtime/design_spec.md` 를 작성합니다 (stage_design_spec). 기획자는 그 명세에 들어갈 항목을 후보 안에 미리 적어 두세요.",
+        ]
+
     pieces += [
         "",
         "## 이번 사이클이 반드시 만족해야 할 제약",
@@ -2210,7 +2319,10 @@ def _load_pm_hold_rework_context() -> str:
         "=== END Previous PM HOLD ===",
         "",
     ]
-    return "\n".join(pieces)
+    text = "\n".join(pieces)
+    if return_spec_mode:
+        return text, spec_mode_active, spec_keywords
+    return text
 
 
 def _build_product_planner_prompt(goal: str) -> str:
@@ -3511,6 +3623,384 @@ def stage_designer_final_review(state: CycleState) -> StageResult:
     return sr
 
 
+# ---------------------------------------------------------------------------
+# Design Implementation Spec stage
+#
+# Activated only when the previous cycle's PM HOLD reasons mention
+# spec-mode keywords (SVG path, titleLabel, ShareCard, badges.js,
+# layout, 좌표, locked, selectedTitle, 구현 명세). Emits
+# .runtime/design_spec.md with concrete, validator-checked sections so
+# PM can SHIP without endless abstract revisions.
+# ---------------------------------------------------------------------------
+
+
+DESIGN_SPEC_PROMPT_TEMPLATE = """\
+너는 Stampport 의 디자이너 에이전트다. 단, 이번 호출에서는 시각 비평이 아니라
+**구현 명세 확정** 만 한다.
+
+직전 사이클에서 PM 이 다음 사유로 HOLD 했고, 다음 사이클이 반복적인 추상 논의로
+흐르고 있다. 이번 사이클에 개발자가 바로 코드를 작성할 수 있는 design_spec.md 를
+**한 번에 결정** 해 그 루프를 끊는다.
+
+=== 직전 PM HOLD 결정 이유 ===
+{pm_reason}
+=== END ===
+
+=== 디자이너가 지적한 약점 ===
+{designer_weakness}
+=== END ===
+
+=== PM 다음 단계 담당 ===
+{pm_next_owners}
+=== END ===
+
+규칙:
+- Read, Glob, Grep 만 사용. 어떤 파일도 수정 금지.
+- 출력은 아래 정확한 Markdown 헤딩만. preamble/설명 금지.
+- SVG path 는 반드시 숫자 좌표를 포함하라. 자리표시자 (e.g. `M ... Z`) 는 거부된다.
+- titleLabel 최소 13개. badges.js 와의 매핑을 1:1 로 적어라.
+- 수정 대상 파일은 최소 3개. `app/web/src/...` 형태의 실제 경로.
+- ShareCard 렌더 조건과 size 제약 (390×560) 은 반드시 명시.
+
+# Stampport Design Implementation Spec
+
+## 구현 대상 기능
+- 기능명:
+- 관련 PM HOLD 사유: (위 "결정 이유" 에서 1~3 줄)
+
+## SVG Path 명세
+
+### Tier 1 원형
+- viewBox: 0 0 80 80
+- 정의: `<circle cx="40" cy="40" r="30" stroke="..." fill="..." stroke-width="..." />`
+- stroke / fill: (실제 색)
+
+### Tier 2 방패
+- viewBox: 0 0 80 80
+- path: M10,8 L70,8 L70,48 C70,62 56,72 40,76 C24,72 10,62 10,48 Z (또는 동등 좌표)
+- stroke / fill / stroke-width:
+
+### Tier 3 왕관
+- viewBox: 0 0 80 80
+- path: M12,58 L18,24 L32,42 L40,16 L48,42 L62,24 L68,58 Z (또는 동등 좌표)
+- stroke / fill / stroke-width:
+
+## titleLabel 최종 목록
+(badges.js 의 badge id 와 1:1 매핑. 13 개 이상.)
+
+- cafe_starter: 카페 입문자
+- cafe_lover: 카페 영사
+- cafe_master: 카페 대사
+- bakery_starter: 베이커리 견습관
+- bakery_lover: 베이커리 영사
+- bakery_master: 베이커리 대사
+- restaurant_starter: 미식 입문자
+- restaurant_lover: 미식 영사
+- restaurant_master: 미식 대사
+- dessert_starter: 디저트 입문자
+- dessert_lover: 디저트 영사
+- dessert_master: 디저트 대사
+- traveler_starter: 동네 탐험가
+
+(필요하면 13개 이상 추가)
+
+## badges.js 스키마 변경
+- level: 1 / 2 / 3
+- tier: starter / lover / master
+- titleLabel: 위 목록의 한 항목
+- lockedUntilLevel: number — 사용자의 currentTitleLevel 보다 큰 level 은 잠금 슬롯으로 렌더
+- currentTitleLevel 계산 방식: badges 중 selectedTitleId 의 level 또는 max(unlocked.level)
+
+## ShareCard 레이아웃 명세
+- share-title-seal 위치: share-note 블록 바로 아래 독립 블록
+- share-foot 의 기존 Lv 텍스트: 제거
+- "<title>까지 N곳 남음" 보조 텍스트 렌더 조건:
+  - relatedBadge 가 있을 때만 표시
+  - relatedBadge 가 null 이면 미렌더
+- share-canvas 크기 제약:
+  - max-width / width: 390px
+  - max-height: 560px
+  - overflow: hidden
+  - share-note: line-clamp 3 / overflow-wrap break-word
+
+## 수정 대상 파일
+- app/web/src/data/badges.js
+- app/web/src/screens/Badges.jsx
+- app/web/src/screens/Share.jsx
+- app/web/src/components/TitleSeal.jsx (또는 신규 컴포넌트)
+- (선택) app/web/src/components/TitleEvolveModal.jsx — 모달 필요 여부 판단
+
+## QA 기준
+- iOS Safari 390px 에서 Lv1 / Lv3 카드가 육안으로 구분되는가
+- share-note 가 100자 이상일 때 share-canvas 가 560px 를 넘지 않는가
+- relatedBadge 가 null 일 때 보조 텍스트가 렌더되지 않는가
+- Lv1 사용자가 tier-2 badge 를 선택했을 때 의도한 잠금 슬롯 스타일이 렌더되는가
+"""
+
+
+def _build_design_spec_prompt(
+    pm_reason: str, designer_weakness: str, pm_next_owners: str,
+) -> str:
+    return DESIGN_SPEC_PROMPT_TEMPLATE.format(
+        pm_reason=(pm_reason.strip() or "(직전 결정 이유 없음)"),
+        designer_weakness=(designer_weakness.strip() or "(디자이너 약점 기록 없음)"),
+        pm_next_owners=(pm_next_owners.strip() or "(PM 다음 단계 담당 미기재)"),
+    )
+
+
+# Regex used to detect at least one numeric SVG path coordinate inside
+# a tier section. Any `<digit>,<digit>` pair counts; placeholders like
+# `...` or empty `M ... Z` won't match.
+_SVG_PATH_NUMERIC = re.compile(r"\d+\s*[, ]\s*\d+")
+_TARGET_FILE_LINE = re.compile(
+    r"`?\s*((?:app|control_tower|scripts)/[\w./-]+\.[\w]+)\s*`?"
+)
+_TITLELABEL_LINE = re.compile(r"^\s*-\s+([A-Za-z][\w]+)\s*[:：]\s+\S")
+
+
+def _extract_design_spec_target_files(body: str) -> list[str]:
+    section = _extract_md_section(body, "수정 대상 파일")
+    if not section:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _TARGET_FILE_LINE.finditer(section):
+        path = m.group(1).strip()
+        if path in seen:
+            continue
+        seen.add(path)
+        found.append(path)
+    return found
+
+
+def _extract_design_spec_titlelabel_count(body: str) -> int:
+    section = _extract_md_section(body, "titleLabel 최종 목록")
+    if not section:
+        return 0
+    count = 0
+    seen: set[str] = set()
+    for line in section.splitlines():
+        m = _TITLELABEL_LINE.match(line)
+        if not m:
+            continue
+        key = m.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
+
+
+def _extract_design_spec_svg_paths(body: str) -> list[str]:
+    """Return the names of tier sections that contain a numeric path /
+    circle definition. ["Tier 1", "Tier 2", "Tier 3"] when all three are
+    present and parsed."""
+    svg_section = _extract_md_section(body, "SVG Path 명세")
+    if not svg_section:
+        return []
+    out: list[str] = []
+    # Each "### Tier N <name>" subsection is one tier block.
+    blocks = re.split(r"^###\s+", svg_section, flags=re.MULTILINE)
+    for block in blocks:
+        if not block.strip():
+            continue
+        title_line = block.splitlines()[0].strip()
+        if not title_line.lower().startswith("tier"):
+            continue
+        # circle.cx/cy + r counts as a numeric definition for tier 1.
+        has_circle = bool(re.search(r"<circle\b[^>]*cx=", block))
+        has_path_numeric = bool(_SVG_PATH_NUMERIC.search(block))
+        # `M ... Z` placeholders without numbers must NOT count.
+        if "..." in block and not has_path_numeric and not has_circle:
+            continue
+        if has_circle or has_path_numeric:
+            out.append(title_line[:40])
+    return out
+
+
+def _validate_design_spec(body: str) -> list[str]:
+    """Acceptance: PM treats design_spec as SHIP-equivalent when this
+    returns []. Any non-empty list keeps PM in HOLD."""
+    fails: list[str] = []
+    REQUIRED = (
+        "구현 대상 기능",
+        "SVG Path 명세",
+        "titleLabel 최종 목록",
+        "badges.js 스키마 변경",
+        "ShareCard 레이아웃 명세",
+        "수정 대상 파일",
+        "QA 기준",
+    )
+    for h in REQUIRED:
+        if not _extract_md_section(body, h):
+            fails.append(f"필수 섹션 누락: ## {h}")
+
+    svg_tiers = _extract_design_spec_svg_paths(body)
+    if len(svg_tiers) < 3:
+        fails.append(
+            f"SVG Path tier 3종 (원형/방패/왕관) 모두에 숫자 좌표 필요 — 현재 {len(svg_tiers)}/3"
+        )
+
+    titlelabel_count = _extract_design_spec_titlelabel_count(body)
+    if titlelabel_count < 13:
+        fails.append(
+            f"titleLabel 13개 이상 필요 — 현재 {titlelabel_count}개"
+        )
+
+    target_files = _extract_design_spec_target_files(body)
+    if len(target_files) < 3:
+        fails.append(
+            f"수정 대상 파일 3개 이상 필요 — 현재 {len(target_files)}개"
+        )
+
+    sharecard = _extract_md_section(body, "ShareCard 레이아웃 명세")
+    if not re.search(r"relatedBadge", sharecard):
+        fails.append("ShareCard 보조 텍스트 렌더 조건 (relatedBadge) 명시 필요")
+    if not re.search(r"560", sharecard):
+        fails.append("ShareCard size 제약 (560px) 명시 필요")
+
+    qa = _extract_md_section(body, "QA 기준")
+    if len(qa) < 30:
+        fails.append("QA 기준이 너무 짧음 (<30자)")
+
+    return fails
+
+
+def stage_design_spec(state: CycleState) -> StageResult:
+    """Build .runtime/design_spec.md when the prior PM HOLD demanded
+    a concrete implementation specification. Skipped (with reason
+    `not_required`) on cycles where prior HOLD didn't trigger spec
+    mode.
+    """
+    label = next(lab for n, lab, _ in STAGES if n == "design_spec")
+    sr = StageResult(name="design_spec", label=label, status="running")
+    t0 = time.time()
+
+    def _skip(reason: str) -> StageResult:
+        sr.status = "skipped"
+        sr.message = reason
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.design_spec_status = "skipped"
+        state.design_spec_skipped_reason = reason
+        return sr
+
+    if state.publish_blocked:
+        return _skip("차단 사유로 design_spec 보류")
+
+    pm_md, designer_md, hold_active = _read_pm_hold_artifacts()
+    if not hold_active:
+        state.pm_hold_spec_mode_active = False
+        return _skip("직전 PM HOLD 없음 — design_spec 미필요")
+
+    pm_reason = _extract_md_section(pm_md, "결정 이유")
+    weaknesses = _extract_md_section(designer_md, "약점")
+    next_owners = _extract_md_section(pm_md, "다음 단계 담당")
+    final = _extract_md_section(designer_md, "최종 판단")
+
+    keywords = _detect_spec_mode_keywords(pm_reason, weaknesses, next_owners, final)
+    state.pm_hold_spec_keywords = list(keywords)
+    if not keywords:
+        state.pm_hold_spec_mode_active = False
+        return _skip("PM HOLD 사유에 spec-mode keyword 없음 — design_spec 미필요")
+    state.pm_hold_spec_mode_active = True
+
+    claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+    if not claude_bin:
+        return _skip("claude CLI 미설치 — design_spec 스킵")
+
+    prompt = _build_design_spec_prompt(pm_reason, weaknesses, next_owners)
+    model = os.environ.get("FACTORY_CLAUDE_MODEL", "sonnet").strip() or "sonnet"
+    budget_usd = os.environ.get("FACTORY_CLAUDE_BUDGET_USD", "1.0").strip() or "1.0"
+    timeout_sec = float(
+        os.environ.get(
+            "FACTORY_CLAUDE_DESIGN_SPEC_TIMEOUT_SEC",
+            os.environ.get("FACTORY_CLAUDE_DISCOVERY_TIMEOUT_SEC", "600"),
+        )
+    )
+    argv = [
+        claude_bin,
+        "-p", prompt,
+        "--allowed-tools", "Read,Glob,Grep",
+        "--output-format", "text",
+        "--model", model,
+        "--max-budget-usd", budget_usd,
+    ]
+    ok, out = _run(argv, cwd=REPO_ROOT, timeout=timeout_sec)
+    sr.duration_sec = round(time.time() - t0, 3)
+
+    if not ok:
+        sr.status = "failed"
+        sr.message = (out or "")[-200:]
+        sr.detail = (out or "")[-1500:]
+        state.design_spec_status = "failed"
+        state.design_spec_message = sr.message
+        return sr
+
+    body = (out or "").strip()
+    HEADER = "# Stampport Design Implementation Spec"
+    idx = body.find(HEADER)
+    if idx == -1:
+        sr.status = "failed"
+        sr.message = "응답에 예상 헤더 없음 (# Stampport Design Implementation Spec)"
+        sr.detail = body[:600]
+        state.design_spec_status = "failed"
+        state.design_spec_message = sr.message
+        return sr
+    body = body[idx:].rstrip()
+
+    fails = _validate_design_spec(body)
+    target_files = _extract_design_spec_target_files(body)
+    titlelabel_count = _extract_design_spec_titlelabel_count(body)
+    svg_tiers = _extract_design_spec_svg_paths(body)
+
+    safe_write_artifact(
+        DESIGN_SPEC_FILE, body,
+        cycle_id=state.cycle, stage="design_spec", source_agent="designer",
+        extra={
+            "spec_mode_keywords": ",".join(keywords)[:200],
+            "acceptance": "passed" if not fails else "insufficient",
+        },
+    )
+    state.design_spec_path = str(DESIGN_SPEC_FILE)
+    state.design_spec_at = utc_now_iso()
+    state.design_spec_target_files = list(target_files)
+    state.design_spec_titlelabel_count = titlelabel_count
+    state.design_spec_svg_paths = list(svg_tiers)
+    state.design_spec_acceptance_passed = not fails
+    state.design_spec_acceptance_failures = list(fails)
+
+    if fails:
+        state.design_spec_status = "insufficient"
+        state.design_spec_message = (
+            f"design_spec 작성됨 — 수용 기준 미달 ({len(fails)}건)"
+        )
+        sr.status = "passed"  # the artifact is on disk; PM will HOLD again.
+        sr.message = state.design_spec_message
+        sr.detail = "\n".join(f"- {f}" for f in fails)
+        _emit_cycle_log(
+            state, "design_spec_insufficient",
+            f"design_spec produced but acceptance failed ({len(fails)}건)",
+            keywords=keywords[:8],
+            failures=fails[:8],
+        )
+        return sr
+
+    state.design_spec_status = "generated"
+    state.design_spec_message = (
+        f"design_spec 작성 완료 — SVG {len(svg_tiers)}/3, "
+        f"titleLabel {titlelabel_count}개, target_files {len(target_files)}개"
+    )
+    sr.status = "passed"
+    sr.message = state.design_spec_message
+    _emit_cycle_log(
+        state, "design_spec_generated",
+        state.design_spec_message,
+        keywords=keywords[:8],
+        target_files=target_files[:20],
+    )
+    return sr
+
+
 PM_DECISION_PROMPT_TEMPLATE = """\
 너는 Stampport의 PM 에이전트다. 기획자–디자이너 ping-pong이 끝났다.
 욕구 점수표 결과를 토대로 이번 사이클에 ship 할지 여부와 출하 단위를 결정한다.
@@ -3527,11 +4017,20 @@ PM_DECISION_PROMPT_TEMPLATE = """\
 {scorecard_json}
 === END Scorecard ===
 
+{design_spec_block}
+
 출하 기준 (반드시 준수):
 - 총점 ≥ 24 → ship 후보
 - Visual Desire Score ≥ 4 → 통과 (미달 시 디자이너 재작업)
 - Share Score ≥ 4 → 통과 (3 이하면 공유 카드 개선 필요)
 - Revisit Score ≥ 4 → 통과 (3 이하면 기획자 재작업)
+
+design_spec 우회 규칙:
+- `.runtime/design_spec.md` 가 존재하고 acceptance 가 통과(SVG 3종 숫자 좌표,
+  titleLabel ≥ 13, 수정 대상 파일 ≥ 3, ShareCard 렌더 조건 명시, QA 기준 명시)
+  하면 욕구 점수 미달이라도 ship 으로 판단할 수 있다 — 이는 직전 HOLD 가
+  '구현 명세 부족' 을 사유로 삼은 경우 추상 논의를 끊기 위한 우회 게이트다.
+- design_spec acceptance 가 실패면 점수 게이트와 동일하게 hold.
 
 도구는 Read, Glob, Grep만. 어떤 파일도 수정하지 마라.
 
@@ -3561,12 +4060,35 @@ ship / hold (재작업 후 다음 사이클) 중 하나만.
 
 
 def _build_pm_decision_prompt(
-    revision_md: str, final_review_md: str, scorecard: dict
+    revision_md: str,
+    final_review_md: str,
+    scorecard: dict,
+    *,
+    design_spec_md: str = "",
+    design_spec_acceptance_passed: bool = False,
+    design_spec_failures: list[str] | None = None,
 ) -> str:
+    if design_spec_md:
+        verdict = "PASSED" if design_spec_acceptance_passed else "INSUFFICIENT"
+        fail_block = ""
+        if design_spec_failures:
+            fail_block = "\n실패 항목:\n" + "\n".join(
+                f"- {f}" for f in design_spec_failures[:8]
+            )
+        block = (
+            f"=== Design Spec (.runtime/design_spec.md) — acceptance: {verdict} ==="
+            + fail_block
+            + "\n"
+            + design_spec_md.strip()
+            + "\n=== END Design Spec ==="
+        )
+    else:
+        block = "=== Design Spec === (이번 사이클은 design_spec 미작성 — 일반 점수 게이트만 적용)"
     return PM_DECISION_PROMPT_TEMPLATE.format(
         planner_revision=revision_md.strip(),
         designer_final_review=final_review_md.strip(),
         scorecard_json=json.dumps(scorecard, ensure_ascii=False, indent=2),
+        design_spec_block=block,
     )
 
 
@@ -3593,6 +4115,7 @@ def stage_pm_decision(state: CycleState) -> StageResult:
 
     revision_md = _read_artifact(PLANNER_REVISION_FILE) or ""
     final_review_md = _read_artifact(DESIGNER_FINAL_REVIEW_FILE) or ""
+    design_spec_md = _read_artifact(DESIGN_SPEC_FILE) or ""
     scorecard = {
         "scores": dict(state.desire_scorecard),
         "total": state.desire_scorecard_total,
@@ -3600,7 +4123,14 @@ def stage_pm_decision(state: CycleState) -> StageResult:
         "rework": list(state.desire_scorecard_rework),
         "verdict": state.designer_final_review_verdict,
     }
-    prompt = _build_pm_decision_prompt(revision_md, final_review_md, scorecard)
+    prompt = _build_pm_decision_prompt(
+        revision_md,
+        final_review_md,
+        scorecard,
+        design_spec_md=design_spec_md,
+        design_spec_acceptance_passed=state.design_spec_acceptance_passed,
+        design_spec_failures=list(state.design_spec_acceptance_failures),
+    )
     ok, body = _run_pingpong_claude(prompt, "# Stampport PM Decision")
     sr.duration_sec = round(time.time() - t0, 3)
     if not ok:
@@ -3617,19 +4147,31 @@ def stage_pm_decision(state: CycleState) -> StageResult:
     decision_section = _extract_md_section(body, "출하 결정").lower()
     ship_word = "ship" in decision_section
     hold_word = "hold" in decision_section
-    # PM is the final word: ship requires both the gate (ship_ready)
-    # AND the explicit "ship" verdict. If either says hold, we hold.
-    pm_ship = ship_word and not hold_word and state.desire_scorecard_ship_ready
+    score_gate_ok = state.desire_scorecard_ship_ready
+    # design_spec bypass: when acceptance passes, PM is allowed to ship
+    # even if scores didn't recover yet — directly avoids the abstract
+    # rework-loop trap we documented in docs/factory-smoke.md.
+    spec_bypass = (
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+    )
+    pm_ship = (
+        ship_word
+        and not hold_word
+        and (score_gate_ok or spec_bypass)
+    )
 
     state.pm_decision_status = "generated"
     state.pm_decision_path = str(PM_DECISION_FILE)
     state.pm_decision_at = utc_now_iso()
     state.pm_decision_ship_ready = pm_ship
+    bypass_tag = " · spec_bypass" if (pm_ship and spec_bypass and not score_gate_ok) else ""
     summary = (
         ("SHIP" if pm_ship else "HOLD")
         + f" (총점 {state.desire_scorecard_total}/30"
         + (f", rework={','.join(state.desire_scorecard_rework)}"
            if state.desire_scorecard_rework else "")
+        + bypass_tag
         + ")"
     )
     state.pm_decision_message = summary
@@ -4157,6 +4699,7 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     pm_md = ""
     planner_md = ""
     proposal_md = ""
+    design_spec_md = ""
     try:
         if PM_DECISION_FILE.is_file():
             pm_md = PM_DECISION_FILE.read_text(encoding="utf-8")
@@ -4174,17 +4717,28 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             proposal_md = PROPOSAL_FILE.read_text(encoding="utf-8")
     except OSError:
         proposal_md = ""
+    try:
+        if DESIGN_SPEC_FILE.is_file():
+            design_spec_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
+    except OSError:
+        design_spec_md = ""
 
     feature = _selected_feature_for_ticket(state)
     state.implementation_ticket_selected_feature = feature
 
+    # Source priority: design_spec.md takes precedence whenever its
+    # acceptance gate passed, since that's the spec PM accepted as the
+    # ship signal. Otherwise fall through to proposal / pm / planner.
     target_files: list[str] = []
-    for src in (proposal_md, pm_md, planner_md):
-        if not src:
-            continue
-        target_files = _parse_target_files_from_md(src)
-        if target_files:
-            break
+    if design_spec_md and state.design_spec_acceptance_passed:
+        target_files = _extract_design_spec_target_files(design_spec_md)
+    if not target_files:
+        for src in (proposal_md, pm_md, planner_md):
+            if not src:
+                continue
+            target_files = _parse_target_files_from_md(src)
+            if target_files:
+                break
     target_screens = _parse_screens_from_md(planner_md) or _parse_screens_from_md(pm_md)
 
     if not target_files:
@@ -6187,6 +6741,7 @@ def main() -> int:
     run_stage("designer_critique",     lambda: stage_designer_critique(state))
     run_stage("planner_revision",      lambda: stage_planner_revision(state))
     run_stage("designer_final_review", lambda: stage_designer_final_review(state))
+    run_stage("design_spec",           lambda: stage_design_spec(state))
     run_stage("pm_decision",           lambda: stage_pm_decision(state))
     run_stage(
         "build_app",

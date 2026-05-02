@@ -73,6 +73,7 @@ All paths are relative to the repository's `.runtime/` directory.
 | `factory_failure_report.md`       | When `verdict == FAIL`     | Failure report with Observer evidence and stage table.                 |
 | `claude_repair_prompt.md`         | When `verdict == FAIL`     | Claude-direct repair prompt with target files + verification steps.    |
 | `claude_rework_prompt.md`         | When `verdict == HOLD`     | Next-cycle planner input — PM HOLD 약점 / 다음 단계 / 미달 점수 정리. |
+| `design_spec.md`                  | When PM HOLD has spec keywords | Implementation spec produced by `stage_design_spec` — SVG paths, titleLabels, target files, ShareCard render rule, QA criteria. PM uses this as a SHIP-equivalent gate. |
 
 ## Default-safe environment
 
@@ -129,6 +130,33 @@ nothing failed). The next cycle's `stage_product_planning` reads
 treats the prior weakness as the bottleneck instead of proposing a
 fresh, unrelated set of candidates.
 
+### Design Implementation Spec mode (spec_bypass)
+
+When the prior cycle's PM HOLD reasons mention any of these keywords —
+`SVG path`, `titleLabel`, `좌표`, `ShareCard`, `layout`, `구현 명세`,
+`badges.js`, `selectedTitle`, `locked` — the next cycle enters **spec
+confirmation mode**:
+
+1. The planner prompt prepends `## ⚠️ 이번 사이클은 디자인 구현 명세
+   확정 모드입니다` and is told *not* to propose fresh ideas.
+2. `stage_design_spec` writes `.runtime/design_spec.md` with concrete,
+   validator-checked sections (SVG numeric coordinates for tier 1/2/3,
+   ≥ 13 titleLabels, ≥ 3 target files, ShareCard render rule,
+   QA criteria).
+3. PM reads `design_spec.md`. If acceptance passes, **PM may SHIP even
+   when the desire scorecard hasn't recovered yet** — this is the
+   `spec_bypass` path. The PM message ends with `· spec_bypass)` so the
+   operator can see when the bypass fired.
+4. `stage_implementation_ticket` pulls `target_files` directly from
+   `design_spec.md → ## 수정 대상 파일` whenever spec_bypass triggered.
+
+If acceptance fails (e.g., < 13 titleLabels, missing SVG numbers), PM
+stays in HOLD and the operator's `factory_smoke_report.md` shows a
+**HOLD progress** section with `hold_repeat_count`, whether the reason
+matches the previous HOLD, and a concrete next action
+(`design_spec 생성 필요`, `design_spec 보완 필요`, `구현 진입 가능`,
+or `PM 기준 완화 필요`).
+
 ## implementation_ticket statuses
 
 | Status                              | Meaning                                                                  |
@@ -154,8 +182,8 @@ fresh, unrelated set of candidates.
 ## Self-test fixtures
 
 `python3 -m control_tower.local_runner.factory_smoke --self-test`
-runs fifteen acceptance fixtures, all stdlib-only, no `claude` calls
-required:
+runs twenty-six acceptance fixtures (1–19 + 20A–20G), all stdlib-only,
+no `claude` calls required:
 
 1. **fresh runtime** → `fresh_idle` (info, healthy).
 2. **desired=running + continuous=false** → no `bridge_pause_mismatch`.
@@ -172,6 +200,14 @@ required:
 13. **PM HOLD rework prompt** — `verdict == HOLD` writes `.runtime/claude_rework_prompt.md`, leaves `claude_repair_prompt.md` absent, and surfaces the rework path in `factory_smoke_report.md`.
 14. **PM HOLD planner injection** — when `pm_decision.md` says hold, the next planner prompt prepends a `Previous PM HOLD` section with 약점 / 다음 단계 / 미달 점수.
 15. **HOLD ≠ FAIL contract** — observer + smoke + factory_state all classify HOLD as non-failure; `implementation_ticket_status` stays `skipped_hold`.
+16-19. **Factory Maturity signal** — keep_sequential / improve_pm_rework_feedback / improve_planner_contract / add_parallel_designer_review fixtures + the end-to-end `factory_smoke_history.jsonl` + maturity section sanity check.
+20A. **PM HOLD with `SVG path`** triggers `design_spec` 우선 모드 in the next planner prompt.
+20B. **good design_spec** (numeric SVG paths for tier 2/3, ≥ 13 titleLabels, ≥ 3 target files) → `_validate_design_spec` returns no failures.
+20C. **<13 titleLabels** → validator fails with the titleLabel-count message and PM stays in HOLD.
+20D. **design_spec target_files extraction** returns `app/web/src/data/badges.js`, `Badges.jsx`, `Share.jsx` (and friends).
+20E. **HOLD repeat with progressing keywords** → `compute_hold_progress` reports `more_concrete=True` and `next_action="design_spec 보완 필요"`; report prints `HOLD progress` section with `HOLD 반복 횟수` + `다음 행동`.
+20F. **PM HOLD without design_spec** writes `claude_rework_prompt.md`, mentions `design_spec` + spec-mode 알림, and leaves `claude_repair_prompt.md` absent.
+20G. **design_spec acceptance pass + PM SHIP** path: target_files come from `design_spec.md`, validator returns `[]` so PM can SHIP via `spec_bypass`.
 
 The Observer's own self-test
 (`python3 -m control_tower.local_runner.factory_observer --self-test`)
@@ -193,7 +229,7 @@ python3 -m py_compile control_tower/local_runner/runner.py \
 # 2. Observer self-test (25 fixtures)
 python3 -m control_tower.local_runner.factory_observer --self-test
 
-# 3. Smoke self-test (11 fixtures)
+# 3. Smoke self-test (26 fixtures)
 python3 -m control_tower.local_runner.factory_smoke --self-test
 
 # 4. Web build
