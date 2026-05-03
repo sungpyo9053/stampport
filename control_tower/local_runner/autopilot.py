@@ -298,6 +298,23 @@ class AutopilotState:
     active_cycle_index: int | None = None
     current_stage: str | None = None
     live_report_path: str | None = None
+    # Claude Executor Contract — mirrored from
+    # .runtime/claude_executor_state.json after every cycle so the UI
+    # / report doesn't have to grep stderr files. claude_apply_retry_pending
+    # is set when the previous cycle's CLI failure is retryable AND the
+    # ticket+proposal artifacts are intact; the next _run_smoke_cycle
+    # call exports FACTORY_APPLY_RETRY_ONLY=true so cycle.py skips
+    # planning stages and re-runs claude_apply only.
+    claude_executor_status: str | None = None
+    claude_executor_failure_code: str | None = None
+    claude_executor_failure_reason: str | None = None
+    claude_executor_retryable: bool = False
+    claude_executor_retry_count: int = 0
+    claude_executor_stdout_path: str | None = None
+    claude_executor_stderr_path: str | None = None
+    claude_executor_command: str | None = None
+    claude_executor_duration_sec: float | None = None
+    claude_apply_retry_pending: bool = False
     # current_run_id — unique identifier for the autopilot run that
     # owns this state. Generated at run_loop start, propagated via the
     # FACTORY_RUN_ID env var to every cycle.py / factory_smoke spawn,
@@ -452,6 +469,20 @@ def _run_smoke_cycle(timeout_sec: int) -> dict:
     rid = (_STATE.current_run_id or "").strip() if _STATE else ""
     if rid:
         env["FACTORY_RUN_ID"] = rid
+    # Apply-only retry path. When the previous cycle hit a retryable
+    # claude_apply CLI failure AND the ticket+proposal artifacts are
+    # intact, run the next cycle in apply_retry_only mode so cycle.py
+    # skips every planner/designer stage and re-runs claude_apply only.
+    # The flag is cleared after the spawn so a subsequent unrelated
+    # cycle is a normal full run.
+    retry_pending = False
+    with _LOCK:
+        retry_pending = bool(_STATE.claude_apply_retry_pending)
+        if retry_pending:
+            _STATE.claude_apply_retry_pending = False
+    if retry_pending:
+        env["FACTORY_APPLY_RETRY_ONLY"] = "true"
+        _log("smoke spawn — apply_retry_only=true (claude executor retry path)")
     _log(f"smoke spawn timeout={timeout_sec}s run_id={env.get('FACTORY_RUN_ID') or '—'} cmd={' '.join(cmd)}")
     try:
         # Wall-clock cap = smoke timeout + 5min buffer. The smoke runner
@@ -700,6 +731,70 @@ def _scan_changed_files_for_risk(paths: list[str]) -> list[str]:
         if any(pat in low for pat in RISKY_PATTERNS):
             hits.append(p)
     return hits
+
+
+def _claude_executor_state_path() -> Path:
+    return _runtime_dir() / "claude_executor_state.json"
+
+
+def _resolve_claude_executor_state(factory_state: dict) -> dict:
+    """Return the latest Claude Executor verdict.
+
+    Prefers .runtime/claude_executor_state.json (the kernel artifact
+    cycle.py / stage_claude_preflight write directly) so the autopilot
+    retry policy is reading the same bytes the dashboard renders.
+    Falls back to the claude_executor_* fields on factory_state.json if
+    the dedicated file is missing.
+    """
+    payload = _read_json(_claude_executor_state_path())
+    if payload:
+        return payload
+    fs = factory_state or {}
+    if not fs.get("claude_executor_status"):
+        return {}
+    return {
+        "status": fs.get("claude_executor_status"),
+        "stage": fs.get("claude_executor_stage"),
+        "command": fs.get("claude_executor_command"),
+        "exit_code": fs.get("claude_executor_exit_code"),
+        "timed_out": fs.get("claude_executor_timed_out"),
+        "duration_sec": fs.get("claude_executor_duration_sec"),
+        "failure_code": fs.get("claude_executor_failure_code"),
+        "failure_reason": fs.get("claude_executor_failure_reason"),
+        "stdout_path": fs.get("claude_executor_stdout_path"),
+        "stderr_path": fs.get("claude_executor_stderr_path"),
+        "retryable": fs.get("claude_executor_retryable"),
+        "retry_count": fs.get("claude_executor_retry_count"),
+    }
+
+
+def _mirror_executor_into_state(executor: dict) -> None:
+    """Mirror the executor verdict onto AutopilotState. The Control
+    Tower UI reads autopilot_state.json directly for the executor
+    panel — without this mirror the dashboard would have to load a
+    second file."""
+    if not executor:
+        return
+    with _LOCK:
+        _STATE.claude_executor_status = executor.get("status") or _STATE.claude_executor_status
+        _STATE.claude_executor_failure_code = executor.get("failure_code")
+        _STATE.claude_executor_failure_reason = executor.get("failure_reason")
+        _STATE.claude_executor_retryable = bool(executor.get("retryable"))
+        try:
+            _STATE.claude_executor_retry_count = int(executor.get("retry_count") or 0)
+        except (TypeError, ValueError):
+            _STATE.claude_executor_retry_count = 0
+        _STATE.claude_executor_stdout_path = executor.get("stdout_path")
+        _STATE.claude_executor_stderr_path = executor.get("stderr_path")
+        _STATE.claude_executor_command = executor.get("command")
+        _STATE.claude_executor_duration_sec = executor.get("duration_sec")
+
+
+def _is_executor_failure_code(code: str | None) -> bool:
+    if not code:
+        return False
+    code = str(code).strip()
+    return code.startswith("claude_cli_") or code.startswith("claude_apply_")
 
 
 def _resolve_pipeline_decision(factory_state: dict) -> dict:
@@ -1315,6 +1410,43 @@ def _format_report(state: AutopilotState) -> str:
         ):
             if name in checks:
                 lines.append(f"| {name} | `{checks[name]}` |")
+    # Claude Executor section — what we know about CLI health, the
+    # last failure classification, retry status, and where the forensic
+    # logs live. Surfaces stdout/stderr paths so the operator can grep
+    # them without hunting around .runtime/.
+    executor = _resolve_claude_executor_state(fs)
+    next_action = "—"
+    exec_status = (executor.get("status") or "").strip()
+    exec_code = (executor.get("failure_code") or "").strip()
+    if exec_status == "passed":
+        next_action = "정상 — claude_apply 정상 실행"
+    elif _is_executor_failure_code(exec_code):
+        if executor.get("retryable"):
+            next_action = (
+                "retryable 실패 — autopilot이 apply_retry_only 1회 재시도를 자동 수행"
+            )
+        elif exec_code in {"claude_cli_missing", "claude_cli_auth_failed"}:
+            next_action = "수동 조치 필요 — claude CLI 설치/재로그인 후 autopilot 재시작"
+        else:
+            next_action = "재시도 한도 초과 — operator가 stderr 확인 후 재시작"
+    lines += [
+        "",
+        "## Claude Executor",
+        "",
+        f"- status: `{exec_status or '—'}`",
+        f"- command: `{(executor.get('command') or '—')[:200]}`",
+        f"- failure_code: `{exec_code or '—'}`",
+        f"- retryable: `{bool(executor.get('retryable'))}`",
+        f"- retry_count: `{executor.get('retry_count') or 0}`",
+        f"- duration_sec: `{executor.get('duration_sec') or '—'}`",
+        f"- exit_code: `{executor.get('exit_code')}`",
+        f"- timed_out: `{bool(executor.get('timed_out'))}`",
+        f"- stdout_path: `{executor.get('stdout_path') or '—'}`",
+        f"- stderr_path: `{executor.get('stderr_path') or '—'}`",
+        f"- failure_reason: {(executor.get('failure_reason') or '—')[:300]}",
+        f"- next_action: {next_action}",
+    ]
+
     lines += [
         "",
         "## Cycle log",
@@ -1577,21 +1709,83 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
             factory_state = _read_json(_factory_state_path())
             _populate_cycle_record_from_state(rec, smoke, factory_state)
 
-            # FAIL / TIMEOUT / scope_mismatch — immediate stop.
+            # Mirror the Claude Executor verdict immediately so the UI
+            # sees the latest CLI status even if the autopilot stops on
+            # a non-executor reason.
+            executor = _resolve_claude_executor_state(factory_state)
+            _mirror_executor_into_state(executor)
+
+            # FAIL / TIMEOUT / scope_mismatch — immediate stop UNLESS
+            # the failure is a retryable Claude executor error AND the
+            # implementation_ticket / claude_proposal artifacts are
+            # still intact. In that case, schedule one apply-only retry
+            # so we don't burn a fresh planner+designer pass on a
+            # transient CLI hiccup.
             failure_norm = _classify_failure(verdict, smoke)
             if (
                 verdict in FAIL_VERDICTS
                 or failure_norm in {"TIMEOUT", "scope_mismatch"}
             ):
+                exec_code = (executor.get("failure_code") or "").strip()
+                exec_retryable = bool(executor.get("retryable"))
+                try:
+                    exec_retry_count = int(executor.get("retry_count") or 0)
+                except (TypeError, ValueError):
+                    exec_retry_count = 0
+                ticket_ready = (
+                    factory_state.get("implementation_ticket_status")
+                    == "generated"
+                )
+                proposal_ready = (
+                    factory_state.get("claude_proposal_status") == "generated"
+                )
+                cli_failed = (
+                    factory_state.get("claude_apply_status") == "cli_failed"
+                ) or _is_executor_failure_code(exec_code)
+                can_retry = (
+                    cli_failed
+                    and exec_retryable
+                    and exec_retry_count < 1
+                    and ticket_ready
+                    and proposal_ready
+                    and cycle < config.max_cycles
+                )
+                if can_retry:
+                    rec.finished_at = _utc_now()
+                    rec.publish_action = "skip"
+                    rec.note = (
+                        f"claude executor retryable failure ({exec_code}) — "
+                        f"scheduling apply-only retry"
+                    )
+                    _record_cycle(rec)
+                    with _LOCK:
+                        _STATE.claude_apply_retry_pending = True
+                    _log(
+                        f"executor retry scheduled — code={exec_code} "
+                        f"retry_count={exec_retry_count} "
+                        f"ticket_ready={ticket_ready} "
+                        f"proposal_ready={proposal_ready}"
+                    )
+                    _save_state()
+                    continue
                 rec.finished_at = _utc_now()
                 rec.publish_action = "skip"
                 rec.note = f"halt on {failure_norm}"
                 _record_cycle(rec)
-                _stop(
+                stop_reason = (
                     f"{failure_norm}: "
-                    f"{(smoke.get('failure_reason') or failure_norm)[:200]}",
-                    status="failed",
+                    f"{(smoke.get('failure_reason') or failure_norm)[:200]}"
                 )
+                # Surface the precise executor code so the dashboard
+                # / report shows e.g. claude_cli_auth_failed instead of
+                # the generic FAIL/build_failed.
+                if _is_executor_failure_code(exec_code):
+                    _STATE.last_failure_code = exec_code
+                    stop_reason = (
+                        f"{exec_code}: "
+                        f"{(executor.get('failure_reason') or exec_code)[:200]}"
+                    )
+                _stop(stop_reason, status="failed")
                 return
 
             # HOLD path.

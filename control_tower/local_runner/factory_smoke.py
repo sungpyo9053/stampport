@@ -5948,6 +5948,212 @@ def self_test() -> tuple[int, int, list[str]]:
             f"37J: Local Visa / PassportInkGrid regression raised: {exc}"
         )
 
+    # ----------------------------------------------------------------
+    # Claude Executor Contract regression tests (A–H from the spec).
+    # These cover the new Claude CLI execution layer: preflight,
+    # failure classification, retry policy, pipeline_decision wiring,
+    # and apply-only retry path. Each test is self-contained and uses
+    # the cycle module's pure helpers — no subprocess spawning.
+    # ----------------------------------------------------------------
+    from . import cycle as _cycle
+
+    # A. classify_claude_failure → claude_cli_missing when the binary
+    # can't be resolved (no PATH match, no env var). Mirrors the
+    # preflight short-circuit: product_planning must NOT run.
+    total += 1
+    code = _cycle.classify_claude_failure(
+        exit_code=None, timed_out=False, missing_bin=True,
+        stdout="", stderr="",
+    )
+    if code == "claude_cli_missing":
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-A: missing binary must classify claude_cli_missing — got {code!r}"
+        )
+
+    # B. classify_claude_failure → claude_cli_timeout when the smoke
+    # command exceeds the preflight deadline. retryable per the policy
+    # in _is_retryable_claude_failure.
+    total += 1
+    code = _cycle.classify_claude_failure(
+        exit_code=None, timed_out=True, missing_bin=False,
+        stdout="", stderr="timed out after 30s",
+    )
+    if code == "claude_cli_timeout" and _cycle._is_retryable_claude_failure(code):
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-B: timeout must classify claude_cli_timeout & be retryable — got {code!r}"
+        )
+
+    # C. _run_claude_capture writes stdout/stderr to the requested
+    # paths and returns exit_code/timed_out faithfully on a non-zero
+    # exit. Verifies the executor state contract that claude_apply now
+    # depends on.
+    total += 1
+    try:
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as _td:
+            from pathlib import Path as _Path
+            stdout_p = _Path(_td) / "stdout.log"
+            stderr_p = _Path(_td) / "stderr.log"
+            # `false` always exits non-zero on POSIX; mirrors a
+            # claude CLI "exit 1 with no output" condition.
+            cap = _cycle._run_claude_capture(
+                ["false"],
+                cwd=None, timeout=10.0,
+                stdout_path=stdout_p, stderr_path=stderr_p,
+            )
+            if (
+                cap["ok"] is False
+                and cap["exit_code"] == 1
+                and cap["timed_out"] is False
+                and cap["missing_bin"] is False
+                and stdout_p.is_file()
+                and stderr_p.is_file()
+            ):
+                passed += 1
+            else:
+                failures.append(
+                    f"Claude-C: _run_claude_capture must capture exit_code/files "
+                    f"— got ok={cap['ok']} exit={cap['exit_code']} "
+                    f"timed_out={cap['timed_out']} stdout_exists="
+                    f"{stdout_p.is_file()} stderr_exists={stderr_p.is_file()}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"Claude-C: _run_claude_capture raised: {exc}")
+
+    # D. retryable codes (timeout / exit_nonzero / unknown) must
+    # report retryable=True; auth/missing must NOT.
+    total += 1
+    rt_codes = ["claude_cli_timeout", "claude_cli_exit_nonzero", "claude_cli_unknown_failure"]
+    nrt_codes = ["claude_cli_missing", "claude_cli_auth_failed"]
+    rt_ok = all(_cycle._is_retryable_claude_failure(c) for c in rt_codes)
+    nrt_ok = all(not _cycle._is_retryable_claude_failure(c) for c in nrt_codes)
+    if rt_ok and nrt_ok:
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-D: retryable policy mismatch — rt_ok={rt_ok} nrt_ok={nrt_ok}"
+        )
+
+    # E. Auth-failure pattern in stderr must classify as
+    # claude_cli_auth_failed and the policy must mark it
+    # retryable=False. This is the "stop and ask the operator" path.
+    total += 1
+    code = _cycle.classify_claude_failure(
+        exit_code=1, timed_out=False, missing_bin=False,
+        stdout="",
+        stderr="error: not authenticated. Please run `claude login`.",
+    )
+    retryable = _cycle._is_retryable_claude_failure(code)
+    if code == "claude_cli_auth_failed" and retryable is False:
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-E: auth failure pattern — code={code!r} retryable={retryable}"
+        )
+
+    # F. pipeline_decision: claude_apply CLI failure must produce
+    # can_publish=false, blocking_code=<executor failure_code>, and
+    # checks.apply=failed. The decision contract is the source of
+    # truth for autopilot publish gating.
+    total += 1
+    decision = _cycle.build_pipeline_decision({
+        "status": "failed",
+        "implementation_ticket_status": "generated",
+        "claude_apply_status": "cli_failed",
+        "qa_status": "skipped",
+        "apply_preflight_status": "passed",
+        "claude_apply_changed_files": [],
+        "claude_executor_status": "retryable_failed",
+        "claude_executor_failure_code": "claude_cli_timeout",
+        "claude_executor_failure_reason": "timeout after 900s",
+        "claude_executor_retryable": True,
+    })
+    if (
+        decision.get("can_publish") is False
+        and decision.get("blocking_code") == "claude_cli_timeout"
+        and (decision.get("checks") or {}).get("apply") == "failed"
+        and decision.get("pipeline_status") == "blocked"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-F: cli_failed must yield blocking_code=claude_cli_timeout "
+            f"+ checks.apply=failed + pipeline_status=blocked — got {decision}"
+        )
+
+    # G. Apply-only retry route eligibility: prior factory_state has
+    # ticket+proposal generated and claude_apply_status=cli_failed →
+    # the autopilot helper that reads claude_executor_state must report
+    # retryable=True so run_loop schedules the retry.
+    total += 1
+    try:
+        from . import autopilot as _autopilot
+        executor_view = _autopilot._resolve_claude_executor_state({
+            "claude_executor_status": "retryable_failed",
+            "claude_executor_failure_code": "claude_cli_exit_nonzero",
+            "claude_executor_failure_reason": "exit 1: editor crash",
+            "claude_executor_retryable": True,
+            "claude_executor_retry_count": 0,
+        })
+        prior_factory = {
+            "implementation_ticket_status": "generated",
+            "claude_proposal_status": "generated",
+            "claude_apply_status": "cli_failed",
+        }
+        cli_failed = (
+            prior_factory["claude_apply_status"] == "cli_failed"
+            or _autopilot._is_executor_failure_code(
+                executor_view.get("failure_code")
+            )
+        )
+        is_retryable = bool(executor_view.get("retryable"))
+        retries_under_cap = int(executor_view.get("retry_count") or 0) < 1
+        ticket_ready = prior_factory["implementation_ticket_status"] == "generated"
+        proposal_ready = prior_factory["claude_proposal_status"] == "generated"
+        if cli_failed and is_retryable and retries_under_cap and ticket_ready and proposal_ready:
+            passed += 1
+        else:
+            failures.append(
+                f"Claude-G: apply-only retry eligibility — cli_failed={cli_failed} "
+                f"retryable={is_retryable} under_cap={retries_under_cap} "
+                f"ticket={ticket_ready} proposal={proposal_ready}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"Claude-G: autopilot helper raised: {exc}")
+
+    # H. Preflight success path leaves the existing pipeline contract
+    # unchanged — claude_executor_status=passed and no failure_code
+    # must NOT block can_publish, and the checks/blocking_code stay
+    # exactly what the legacy pipeline produced.
+    total += 1
+    decision = _cycle.build_pipeline_decision({
+        "status": "succeeded",
+        "implementation_ticket_status": "generated",
+        "claude_apply_status": "applied",
+        "qa_status": "passed",
+        "apply_preflight_status": "passed",
+        "claude_apply_changed_files": ["app/web/src/screens/Foo.jsx"],
+        "claude_executor_status": "passed",
+        "claude_executor_failure_code": None,
+        "claude_executor_retryable": False,
+        "claude_executor_retry_count": 0,
+    })
+    if (
+        decision.get("can_publish") is True
+        and decision.get("blocking_code") is None
+        and decision.get("pipeline_status") == "ready_to_publish"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"Claude-H: passed executor + applied must remain "
+            f"ready_to_publish — got {decision}"
+        )
+
     return passed, total, failures
 
 

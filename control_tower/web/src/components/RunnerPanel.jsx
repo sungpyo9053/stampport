@@ -657,6 +657,74 @@ function ProductPlannerRow({ factory }) {
   );
 }
 
+function ClaudeExecutorRow({ factory }) {
+  // Claude Executor Contract surface — only renders when a status is
+  // present so untouched cycles stay visually clean. Failure rows are
+  // colored by retryability so the operator can tell at a glance
+  // whether autopilot will retry on its own or needs a hand.
+  const status = factory?.claude_executor_status;
+  if (!status || status === "not_run") return null;
+  const code = factory?.claude_executor_failure_code;
+  const reason = factory?.claude_executor_failure_reason;
+  const retryable = !!factory?.claude_executor_retryable;
+  const retryCount = factory?.claude_executor_retry_count ?? 0;
+  const stdoutPath = factory?.claude_executor_stdout_path;
+  const stderrPath = factory?.claude_executor_stderr_path;
+
+  let label = status;
+  let chipColor = "text-slate-500";
+  if (status === "passed") {
+    label = "✓ 정상";
+    chipColor = "text-emerald-400";
+  } else if (status === "timeout") {
+    label = `타임아웃${code ? ` (${code})` : ""}`;
+    chipColor = "text-amber-400";
+  } else if (status === "retryable_failed") {
+    label = `재시도 가능 실패${code ? ` (${code})` : ""}`;
+    chipColor = "text-amber-400";
+  } else if (status === "failed") {
+    label = `실패${code ? ` (${code})` : ""}`;
+    chipColor = "text-rose-400";
+  }
+
+  return (
+    <div className="text-slate-500">
+      Claude Executor · <span className={chipColor}>{label}</span>
+      {retryCount > 0 && (
+        <>
+          {" · "}
+          <span className="text-slate-400">retry={retryCount}</span>
+        </>
+      )}
+      {status !== "passed" && (
+        <>
+          {" · "}
+          <span className="text-slate-400">
+            {retryable ? "auto-retry 예정" : "수동 조치 필요"}
+          </span>
+        </>
+      )}
+      {reason && status !== "passed" && (
+        <div className="mt-0.5 text-rose-300/80">{reason}</div>
+      )}
+      {(stdoutPath || stderrPath) && status !== "passed" && (
+        <div className="mt-0.5 text-slate-500">
+          {stdoutPath && (
+            <code className="mr-1 rounded bg-slate-800 px-1 text-slate-300">
+              {stdoutPath}
+            </code>
+          )}
+          {stderrPath && (
+            <code className="rounded bg-slate-800 px-1 text-slate-300">
+              {stderrPath}
+            </code>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ClaudeApplyRow({ factory }) {
   const status = factory?.claude_apply_status;
   if (!status) return null;
@@ -667,6 +735,7 @@ function ClaudeApplyRow({ factory }) {
   const message = factory?.claude_apply_message;
   const diffPath = factory?.claude_apply_diff_path;
   const diffExists = !!factory?.claude_apply_diff_exists;
+  const executorCode = factory?.claude_executor_failure_code;
 
   let label = "스킵";
   let chipColor = "text-slate-500";
@@ -676,6 +745,9 @@ function ClaudeApplyRow({ factory }) {
   } else if (status === "rolled_back") {
     label = "롤백";
     chipColor = "text-amber-400";
+  } else if (status === "cli_failed") {
+    label = `CLI 실패${executorCode ? ` (${executorCode})` : ""}`;
+    chipColor = "text-rose-400";
   } else if (status === "failed") {
     label = "실패";
     chipColor = "text-rose-400";
@@ -1239,6 +1311,7 @@ function FactoryDetail({ factory }) {
           </div>
         )}
         <PublishBlockerRow factory={factory} />
+        <ClaudeExecutorRow factory={factory} />
         <ProductPlannerRow factory={factory} />
         <ClaudeProposalRow factory={factory} />
         <ClaudeApplyRow factory={factory} />

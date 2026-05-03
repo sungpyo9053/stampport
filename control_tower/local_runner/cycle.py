@@ -45,6 +45,16 @@ GOAL_FILE = RUNTIME / "factory_goal.txt"
 PAUSE_FILE = RUNTIME / "factory.paused"
 PROPOSAL_FILE = RUNTIME / "claude_proposal.md"
 APPLY_DIFF_FILE = RUNTIME / "claude_apply.diff"
+# Claude Executor Contract artifacts. These persist independently of
+# CycleState so the autopilot retry policy + dashboard can reason about
+# CLI health without re-deriving the verdict from the (very wide)
+# factory_state.json. The contract is: claude_executor_state.json is
+# rewritten at every claude_apply / claude_preflight call; the
+# stdout/stderr/command logs are forensic-only and never re-applied.
+CLAUDE_EXECUTOR_STATE_FILE = RUNTIME / "claude_executor_state.json"
+CLAUDE_APPLY_STDOUT_FILE = RUNTIME / "claude_apply_stdout.log"
+CLAUDE_APPLY_STDERR_FILE = RUNTIME / "claude_apply_stderr.log"
+CLAUDE_APPLY_COMMAND_FILE = RUNTIME / "claude_apply_command.json"
 # Forensic artifacts for claude_apply revalidation rollback. When the
 # post-apply build/syntax/risky scan fails, we save:
 #   - the diff that was about to be rolled back, so the operator (or
@@ -363,6 +373,14 @@ STAGES: list[tuple[str, str, int]] = [
     # claude_apply) into "skipped — blocked".
     ("publish_blocker_check",    "배포 차단 검사",         0),
     ("publish_blocker_resolve",  "배포 차단 정리",         0),
+    # Claude Executor preflight — runs BEFORE any planning stage so a
+    # missing / broken / unauthenticated `claude` CLI fails the cycle in
+    # under 30 seconds instead of after 20+ minutes of planner +
+    # designer + design_spec spending. Sets state.claude_executor_*
+    # fields and writes claude_executor_state.json. On failure the cycle
+    # short-circuits past every Claude-consuming stage so we never burn
+    # planner budget on top of a broken executor.
+    ("claude_preflight",         "Claude CLI 점검",         0),
     # Product Planner sits BEFORE the build/syntax gates: a planning
     # tick produces a report file that the later claude_propose stage
     # consumes verbatim. Runs only when FACTORY_PRODUCT_PLANNER_MODE is
@@ -457,6 +475,30 @@ class CycleState:
     goal: str = ""
     risky_files: list[str] = field(default_factory=list)
     stages: list[StageResult] = field(default_factory=list)
+    # Claude Executor Contract — written by stage_claude_preflight at
+    # cycle start AND refreshed by stage_claude_apply when claude_apply
+    # spawns a subprocess. Surfaces CLI health, last failure
+    # classification, retryability, and forensic log paths so the
+    # autopilot retry policy + dashboard never have to grep stderr
+    # themselves. claude_executor_status is one of:
+    #   passed | failed | timeout | retryable_failed | not_run
+    # claude_executor_failure_code is the kernel classification (one of
+    # the codes documented in classify_claude_failure). retryable=True
+    # means the autopilot may attempt one immediate retry without
+    # rebuilding planner/design_spec; retryable=False means stop.
+    claude_executor_status: str = "not_run"
+    claude_executor_stage: str | None = None
+    claude_executor_command: str | None = None
+    claude_executor_exit_code: int | None = None
+    claude_executor_timed_out: bool = False
+    claude_executor_duration_sec: float | None = None
+    claude_executor_failure_code: str | None = None
+    claude_executor_failure_reason: str | None = None
+    claude_executor_stdout_path: str | None = None
+    claude_executor_stderr_path: str | None = None
+    claude_executor_retryable: bool = False
+    claude_executor_retry_count: int = 0
+    claude_executor_last_run_at: str | None = None
     # Claude proposal status (so the dashboard knows whether the
     # claude_propose stage actually wrote a file or just skipped).
     claude_proposal_status: str = "skipped"   # generated | skipped | failed
@@ -778,6 +820,19 @@ class CycleState:
             "desire_scorecard_path": self.desire_scorecard_path,
             "desire_scorecard_ship_ready": self.desire_scorecard_ship_ready,
             "desire_scorecard_rework": list(self.desire_scorecard_rework),
+            "claude_executor_status": self.claude_executor_status,
+            "claude_executor_stage": self.claude_executor_stage,
+            "claude_executor_command": self.claude_executor_command,
+            "claude_executor_exit_code": self.claude_executor_exit_code,
+            "claude_executor_timed_out": self.claude_executor_timed_out,
+            "claude_executor_duration_sec": self.claude_executor_duration_sec,
+            "claude_executor_failure_code": self.claude_executor_failure_code,
+            "claude_executor_failure_reason": self.claude_executor_failure_reason,
+            "claude_executor_stdout_path": self.claude_executor_stdout_path,
+            "claude_executor_stderr_path": self.claude_executor_stderr_path,
+            "claude_executor_retryable": self.claude_executor_retryable,
+            "claude_executor_retry_count": self.claude_executor_retry_count,
+            "claude_executor_last_run_at": self.claude_executor_last_run_at,
             "claude_proposal_status": self.claude_proposal_status,
             "claude_proposal_path": self.claude_proposal_path,
             "claude_proposal_at": self.claude_proposal_at,
@@ -6271,6 +6326,12 @@ def build_pipeline_decision(state) -> dict:
     qa_failed_reason = _norm(s.get("qa_failed_reason"))
     planner_status = _norm(s.get("product_planner_status"))
     planner_revision_status = _norm(s.get("planner_revision_status"))
+    # Claude Executor Contract — surfaced into pipeline_decision so a
+    # CLI-level failure produces a precise blocking_code (e.g.
+    # claude_cli_timeout) rather than the generic stage_failed.
+    executor_status = _norm(s.get("claude_executor_status"))
+    executor_failure_code = _norm(s.get("claude_executor_failure_code"))
+    executor_failure_reason = _norm(s.get("claude_executor_failure_reason"))
 
     changed_files = list(s.get("claude_apply_changed_files") or [])
     raw_count = s.get("changed_files_count")
@@ -6328,7 +6389,25 @@ def build_pipeline_decision(state) -> dict:
     blocking_code: str | None = None
     blocking_reason: str | None = None
 
-    if failed_stage:
+    # Claude Executor failure beats every other classification — if the
+    # CLI itself is missing / unauthenticated / timed out, downstream
+    # checks (ticket / apply / qa) are meaningless, so we surface the
+    # specific executor code as the blocking reason.
+    executor_failed = (
+        executor_status in {"failed", "timeout", "retryable_failed"}
+        or (executor_failure_code and executor_failure_code != "")
+    )
+    if executor_failed:
+        blocking_code = executor_failure_code or "claude_cli_failed"
+        blocking_reason = (
+            executor_failure_reason
+            or f"claude executor status={executor_status or 'unknown'}"
+        )
+        checks["apply"] = "failed"
+
+    if blocking_code:
+        pass  # executor short-circuited; skip the cascading detection
+    elif failed_stage:
         blocking_code = "stage_failed"
         blocking_reason = (
             f"failed_stage={failed_stage}"
@@ -6381,8 +6460,16 @@ def build_pipeline_decision(state) -> dict:
     )
     can_push = can_commit and qa_status == "passed"
 
+    executor_blocked = bool(
+        executor_failed
+        or (blocking_code or "").startswith("claude_cli_")
+        or (blocking_code or "").startswith("claude_apply_")
+    )
+
     if can_publish:
         pipeline_status = "ready_to_publish"
+    elif executor_blocked:
+        pipeline_status = "blocked"
     elif blocking_code in {"stage_failed", "qa_failed", "apply_preflight_failed"}:
         pipeline_status = "blocked"
     elif blocking_code in {
@@ -6405,6 +6492,13 @@ def build_pipeline_decision(state) -> dict:
         "scope_consistency_status": s.get("scope_consistency_status"),
         "changed_files_count": changed_files_count,
         "changed_files_sample": changed_files[:6],
+        "claude_executor_status": executor_status or None,
+        "claude_executor_failure_code": executor_failure_code or None,
+        "claude_executor_failure_reason": executor_failure_reason or None,
+        "claude_executor_retryable": s.get("claude_executor_retryable"),
+        "claude_executor_retry_count": s.get("claude_executor_retry_count"),
+        "claude_executor_stdout_path": s.get("claude_executor_stdout_path"),
+        "claude_executor_stderr_path": s.get("claude_executor_stderr_path"),
     }
 
     return {
@@ -6888,6 +6982,431 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     sr.message = state.implementation_ticket_message
     sr.duration_sec = round(time.time() - t0, 3)
     return sr
+
+
+# ---------------------------------------------------------------------------
+# Claude Executor Contract — independent CLI execution layer
+#
+# The executor isolates `claude` CLI failures from the rest of the cycle
+# so that:
+#   * a missing / unauthenticated / rate-limited CLI is detected BEFORE
+#     planner/designer/spec stages spend tokens (preflight),
+#   * every claude_apply subprocess call lands in a structured state
+#     file with stdout/stderr/exit_code/timed_out, and
+#   * each failure has a kernel classification code that the autopilot
+#     retry policy can consult without re-grepping stderr itself.
+#
+# CLAUDE_FAILURE_CODES is the canonical enum. The order matters: the
+# classifier walks them top-to-bottom and returns the first match.
+# ---------------------------------------------------------------------------
+
+
+CLAUDE_FAILURE_CODES = (
+    "claude_cli_missing",
+    "claude_cli_unavailable",
+    "claude_cli_timeout",
+    "claude_cli_auth_failed",
+    "claude_cli_rate_limited",
+    "claude_cli_no_output",
+    "claude_cli_exit_nonzero",
+    "claude_apply_no_diff",
+    "claude_apply_invalid_patch",
+    "claude_cli_unknown_failure",
+)
+
+# Codes that should NOT trigger an immediate retry — fixing them
+# requires operator action (install the binary, re-authenticate, etc.).
+CLAUDE_NON_RETRYABLE_CODES = frozenset({
+    "claude_cli_missing",
+    "claude_cli_auth_failed",
+})
+
+
+def classify_claude_failure(
+    *,
+    exit_code: int | None,
+    timed_out: bool,
+    missing_bin: bool,
+    stdout: str,
+    stderr: str,
+    invalid_patch: bool = False,
+    no_diff: bool = False,
+) -> str:
+    """Return the kernel failure code for a claude CLI invocation.
+
+    Pure function so the smoke / autopilot self-tests can exercise the
+    classifier without spawning a subprocess. The patterns are
+    deliberately broad — claude CLI's error wording shifts release to
+    release, so we look for substrings rather than exact matches.
+    """
+    if missing_bin:
+        return "claude_cli_missing"
+    if timed_out:
+        return "claude_cli_timeout"
+    blob = ((stderr or "") + "\n" + (stdout or "")).lower()
+    auth_signals = (
+        "not authenticated",
+        "unauthorized",
+        "401",
+        "auth failed",
+        "auth_failed",
+        "invalid api key",
+        "no api key",
+        "log in",
+        "claude login",
+        "missing credentials",
+    )
+    if any(sig in blob for sig in auth_signals):
+        return "claude_cli_auth_failed"
+    rate_signals = (
+        "rate limit",
+        "rate-limited",
+        "too many requests",
+        "429",
+        "quota",
+        "budget exceeded",
+        "max-budget",
+    )
+    if any(sig in blob for sig in rate_signals):
+        return "claude_cli_rate_limited"
+    if invalid_patch:
+        return "claude_apply_invalid_patch"
+    if no_diff:
+        return "claude_apply_no_diff"
+    if exit_code is not None and exit_code != 0:
+        if not (stdout or "").strip() and not (stderr or "").strip():
+            return "claude_cli_no_output"
+        return "claude_cli_exit_nonzero"
+    if exit_code is None:
+        return "claude_cli_unavailable"
+    return "claude_cli_unknown_failure"
+
+
+def _is_retryable_claude_failure(code: str | None) -> bool:
+    if not code:
+        return False
+    return code not in CLAUDE_NON_RETRYABLE_CODES
+
+
+def _write_claude_executor_state(
+    *,
+    status: str,
+    stage: str,
+    command: list[str] | str | None,
+    exit_code: int | None,
+    timed_out: bool,
+    duration_sec: float,
+    failure_code: str | None,
+    failure_reason: str | None,
+    stdout_path: str | None,
+    stderr_path: str | None,
+    retryable: bool,
+    retry_count: int,
+) -> dict:
+    """Persist the executor verdict to claude_executor_state.json and
+    claude_apply_command.json. Returns the dict that was written so
+    callers can mirror it onto CycleState in a single place."""
+    if isinstance(command, list):
+        cmd_str = " ".join(shlex.quote(str(a)) for a in command)
+    elif isinstance(command, str):
+        cmd_str = command
+    else:
+        cmd_str = ""
+    payload = {
+        "status": status,
+        "stage": stage,
+        "command": cmd_str,
+        "exit_code": exit_code,
+        "timed_out": bool(timed_out),
+        "duration_sec": round(float(duration_sec or 0.0), 3),
+        "failure_code": failure_code,
+        "failure_reason": (failure_reason or "")[-1500:] or None,
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "retryable": bool(retryable),
+        "retry_count": int(retry_count or 0),
+        "updated_at": utc_now_iso(),
+    }
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        CLAUDE_EXECUTOR_STATE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        CLAUDE_APPLY_COMMAND_FILE.write_text(
+            json.dumps(
+                {"stage": stage, "command": cmd_str, "argv": command if isinstance(command, list) else None},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return payload
+
+
+def _apply_executor_state_to_cycle_state(state: "CycleState", payload: dict) -> None:
+    """Mirror a written executor payload onto CycleState. Keeps the
+    fields surfaced in factory_state.json in lockstep with the standalone
+    claude_executor_state.json."""
+    state.claude_executor_status = payload.get("status") or "not_run"
+    state.claude_executor_stage = payload.get("stage")
+    state.claude_executor_command = payload.get("command")
+    state.claude_executor_exit_code = payload.get("exit_code")
+    state.claude_executor_timed_out = bool(payload.get("timed_out"))
+    state.claude_executor_duration_sec = payload.get("duration_sec")
+    state.claude_executor_failure_code = payload.get("failure_code")
+    state.claude_executor_failure_reason = payload.get("failure_reason")
+    state.claude_executor_stdout_path = payload.get("stdout_path")
+    state.claude_executor_stderr_path = payload.get("stderr_path")
+    state.claude_executor_retryable = bool(payload.get("retryable"))
+    state.claude_executor_retry_count = int(payload.get("retry_count") or 0)
+    state.claude_executor_last_run_at = payload.get("updated_at")
+
+
+def _run_claude_capture(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float = 180.0,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+) -> dict:
+    """Run a claude subprocess with stdout/stderr captured to separate
+    files. Returns a structured result dict consumed by the executor
+    layer:
+
+        {
+          "ok": bool,
+          "exit_code": int | None,
+          "timed_out": bool,
+          "missing_bin": bool,
+          "stdout": str,
+          "stderr": str,
+          "stdout_path": str | None,
+          "stderr_path": str | None,
+          "duration_sec": float,
+        }
+    """
+    t0 = time.time()
+    out_text = ""
+    err_text = ""
+    exit_code: int | None = None
+    timed_out = False
+    missing_bin = False
+    try:
+        r = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        out_text = r.stdout or ""
+        err_text = r.stderr or ""
+        exit_code = r.returncode
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        err_text = (
+            f"timeout after {timeout}s: "
+            f"{' '.join(shlex.quote(a) for a in argv)}\n"
+            f"{(exc.stderr or b'').decode('utf-8', 'replace') if isinstance(exc.stderr, bytes) else (exc.stderr or '')}"
+        )
+        out_text = (
+            (exc.stdout or b"").decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+    except FileNotFoundError as exc:
+        missing_bin = True
+        err_text = f"missing tool: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        err_text = f"error: {exc}"
+
+    duration = time.time() - t0
+    saved_stdout: str | None = None
+    saved_stderr: str | None = None
+    try:
+        if stdout_path is not None:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stdout_path.write_text(out_text or "", encoding="utf-8")
+            saved_stdout = str(stdout_path)
+        if stderr_path is not None:
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.write_text(err_text or "", encoding="utf-8")
+            saved_stderr = str(stderr_path)
+    except OSError:
+        pass
+
+    ok = (exit_code == 0) and not timed_out and not missing_bin
+    return {
+        "ok": bool(ok),
+        "exit_code": exit_code,
+        "timed_out": bool(timed_out),
+        "missing_bin": bool(missing_bin),
+        "stdout": out_text or "",
+        "stderr": err_text or "",
+        "stdout_path": saved_stdout,
+        "stderr_path": saved_stderr,
+        "duration_sec": float(duration),
+    }
+
+
+def stage_claude_preflight(state: CycleState) -> StageResult:
+    """Verify the `claude` CLI is reachable, authenticated, and able to
+    answer a tiny smoke prompt within 30s. Runs BEFORE product_planning
+    so a broken executor does not waste planner/designer budget. On
+    failure the cycle is short-circuited via state.cycle_log + main()'s
+    early-exit branch — no downstream Claude stage runs.
+    """
+    label = next(lab for n, lab, _ in STAGES if n == "claude_preflight")
+    sr = StageResult(name="claude_preflight", label=label, status="running")
+    t0 = time.time()
+
+    def _record(payload: dict, *, sr_status: str, message: str, detail: str = "") -> StageResult:
+        _apply_executor_state_to_cycle_state(state, payload)
+        sr.status = sr_status
+        sr.message = message
+        if detail:
+            sr.detail = detail[-1500:]
+        sr.duration_sec = round(time.time() - t0, 3)
+        return sr
+
+    timeout_sec = float(os.environ.get("FACTORY_CLAUDE_PREFLIGHT_TIMEOUT_SEC", "30"))
+    claude_bin = (
+        os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND", "").strip()
+        or os.environ.get("CLAUDE_BIN", "").strip()
+        or shutil.which("claude")
+    )
+    if not claude_bin:
+        payload = _write_claude_executor_state(
+            status="failed",
+            stage="claude_preflight",
+            command="claude",
+            exit_code=None,
+            timed_out=False,
+            duration_sec=time.time() - t0,
+            failure_code="claude_cli_missing",
+            failure_reason=(
+                "claude CLI not found on PATH and neither "
+                "LOCAL_RUNNER_CLAUDE_COMMAND nor CLAUDE_BIN is set."
+            ),
+            stdout_path=None,
+            stderr_path=None,
+            retryable=False,
+            retry_count=0,
+        )
+        state.failed_stage = "claude_preflight"
+        state.failed_reason = payload["failure_reason"]
+        return _record(payload, sr_status="failed", message="claude CLI 미설치 — preflight 실패")
+
+    # Step 1: `claude --version` (or equivalent). Fast sanity check that
+    # the binary at least exits cleanly. Some packages don't have
+    # --version; we accept any zero exit.
+    version_argv = [claude_bin, "--version"]
+    version_result = _run_claude_capture(
+        version_argv,
+        cwd=REPO_ROOT,
+        timeout=min(15.0, timeout_sec),
+        stdout_path=None,
+        stderr_path=None,
+    )
+    if version_result["missing_bin"]:
+        payload = _write_claude_executor_state(
+            status="failed",
+            stage="claude_preflight",
+            command=version_argv,
+            exit_code=version_result["exit_code"],
+            timed_out=version_result["timed_out"],
+            duration_sec=time.time() - t0,
+            failure_code="claude_cli_missing",
+            failure_reason=(version_result["stderr"] or "claude binary not found"),
+            stdout_path=None,
+            stderr_path=None,
+            retryable=False,
+            retry_count=0,
+        )
+        state.failed_stage = "claude_preflight"
+        state.failed_reason = payload["failure_reason"]
+        return _record(payload, sr_status="failed", message="claude CLI 미설치 — preflight 실패")
+
+    # Step 2: Smoke prompt. We ask claude to print a single token so a
+    # broken auth / rate-limit / hung process is caught fast.
+    smoke_argv = [
+        claude_bin,
+        "-p", "Reply with exactly: STAMPPORT_OK",
+        "--output-format", "text",
+        "--max-budget-usd", "0.05",
+    ]
+    smoke_result = _run_claude_capture(
+        smoke_argv,
+        cwd=REPO_ROOT,
+        timeout=max(5.0, timeout_sec - (time.time() - t0)),
+        stdout_path=None,
+        stderr_path=None,
+    )
+    duration = time.time() - t0
+    if smoke_result["ok"]:
+        payload = _write_claude_executor_state(
+            status="passed",
+            stage="claude_preflight",
+            command=smoke_argv,
+            exit_code=smoke_result["exit_code"],
+            timed_out=False,
+            duration_sec=duration,
+            failure_code=None,
+            failure_reason=None,
+            stdout_path=None,
+            stderr_path=None,
+            retryable=False,
+            retry_count=0,
+        )
+        return _record(
+            payload,
+            sr_status="passed",
+            message=f"claude CLI 사용 가능 ({duration:.1f}s)",
+        )
+
+    # Failure path — classify, surface, write repair prompt.
+    code = classify_claude_failure(
+        exit_code=smoke_result["exit_code"],
+        timed_out=smoke_result["timed_out"],
+        missing_bin=smoke_result["missing_bin"],
+        stdout=smoke_result["stdout"],
+        stderr=smoke_result["stderr"],
+    )
+    reason_tail = (smoke_result["stderr"] or smoke_result["stdout"] or "(no output)").strip()
+    retryable = _is_retryable_claude_failure(code)
+    payload = _write_claude_executor_state(
+        status="timeout" if smoke_result["timed_out"] else "failed",
+        stage="claude_preflight",
+        command=smoke_argv,
+        exit_code=smoke_result["exit_code"],
+        timed_out=smoke_result["timed_out"],
+        duration_sec=duration,
+        failure_code=code,
+        failure_reason=reason_tail,
+        stdout_path=None,
+        stderr_path=None,
+        retryable=retryable,
+        retry_count=0,
+    )
+    state.failed_stage = "claude_preflight"
+    state.failed_reason = (
+        f"claude_preflight failed ({code}): {reason_tail[:300]}"
+    )
+    _emit_cycle_log(
+        state, "claude_preflight_failed",
+        f"claude_preflight failed — {code}: {reason_tail[:200]}",
+        failure_code=code,
+        retryable=retryable,
+    )
+    return _record(
+        payload,
+        sr_status="failed",
+        message=f"claude CLI preflight 실패 — {code}",
+        detail=reason_tail,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -7420,9 +7939,43 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         return sr
 
     # Pre-condition 5: tools + input source.
-    claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+    claude_bin = (
+        os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND", "").strip()
+        or os.environ.get("CLAUDE_BIN", "").strip()
+        or shutil.which("claude")
+    )
     if not claude_bin:
-        return _skip("claude CLI 미설치 — 스킵")
+        # Treat a missing CLI at apply time as a hard executor failure
+        # (not a skip) so the autopilot retry / pipeline_decision layer
+        # can see it. The stage status stays `failed` so the cycle is
+        # not silently shipped as planning_only.
+        payload = _write_claude_executor_state(
+            status="failed",
+            stage="claude_apply",
+            command="claude",
+            exit_code=None,
+            timed_out=False,
+            duration_sec=time.time() - t0,
+            failure_code="claude_cli_missing",
+            failure_reason=(
+                "claude CLI not found at apply time — "
+                "neither CLAUDE_BIN/LOCAL_RUNNER_CLAUDE_COMMAND nor PATH resolved."
+            ),
+            stdout_path=None,
+            stderr_path=None,
+            retryable=False,
+            retry_count=int(state.claude_executor_retry_count or 0),
+        )
+        _apply_executor_state_to_cycle_state(state, payload)
+        sr.status = "failed"
+        sr.message = "claude CLI 미설치 — claude_apply 실패"
+        state.claude_apply_status = "cli_failed"
+        state.claude_apply_changed_files = []
+        state.claude_apply_message = sr.message
+        state.failed_stage = "claude_apply"
+        state.failed_reason = payload["failure_reason"]
+        sr.duration_sec = round(time.time() - t0, 3)
+        return sr
     if apply_spec_bypass:
         try:
             design_spec_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
@@ -7460,7 +8013,17 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         "--model", model,
         "--max-budget-usd", budget_usd,
     ]
-    apply_ok, apply_out = _run(argv, cwd=REPO_ROOT, timeout=timeout_sec)
+    capture = _run_claude_capture(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=timeout_sec,
+        stdout_path=CLAUDE_APPLY_STDOUT_FILE,
+        stderr_path=CLAUDE_APPLY_STDERR_FILE,
+    )
+    apply_ok = bool(capture["ok"])
+    apply_out = (capture["stdout"] or "") + (
+        ("\n--stderr--\n" + capture["stderr"]) if capture["stderr"] else ""
+    )
 
     # Whether or not the CLI succeeded, snapshot the diff: Claude may
     # have written partial changes before erroring out.
@@ -7493,12 +8056,54 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         if changed_tracked or new_untracked:
             _rollback_apply(changed_tracked, new_untracked)
             state.claude_apply_rollback = True
+        failure_code = classify_claude_failure(
+            exit_code=capture["exit_code"],
+            timed_out=capture["timed_out"],
+            missing_bin=capture["missing_bin"],
+            stdout=capture["stdout"],
+            stderr=capture["stderr"],
+        )
+        retryable = _is_retryable_claude_failure(failure_code)
+        reason_tail = (
+            (capture["stderr"] or capture["stdout"] or "(no output)")
+        ).strip()
+        executor_status = (
+            "timeout" if capture["timed_out"]
+            else ("retryable_failed" if retryable else "failed")
+        )
+        payload = _write_claude_executor_state(
+            status=executor_status,
+            stage="claude_apply",
+            command=argv,
+            exit_code=capture["exit_code"],
+            timed_out=capture["timed_out"],
+            duration_sec=capture["duration_sec"],
+            failure_code=failure_code,
+            failure_reason=reason_tail,
+            stdout_path=capture["stdout_path"],
+            stderr_path=capture["stderr_path"],
+            retryable=retryable,
+            retry_count=int(state.claude_executor_retry_count or 0),
+        )
+        _apply_executor_state_to_cycle_state(state, payload)
         sr.status = "failed"
-        sr.message = "claude CLI 실행 실패"
+        sr.message = f"claude CLI 실행 실패 — {failure_code}"
         sr.detail = (apply_out or "")[-1500:]
-        state.claude_apply_status = "failed"
+        state.claude_apply_status = "cli_failed"
         state.claude_apply_changed_files = []
         state.claude_apply_message = sr.message
+        state.failed_stage = "claude_apply"
+        state.failed_reason = (
+            f"claude_apply CLI failure ({failure_code}): {reason_tail[:300]}"
+        )
+        _emit_cycle_log(
+            state, "claude_apply_cli_failed",
+            f"claude_apply CLI failed — {failure_code} (retryable={retryable})",
+            failure_code=failure_code,
+            retryable=retryable,
+            exit_code=capture["exit_code"],
+            timed_out=capture["timed_out"],
+        )
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
 
@@ -7685,6 +8290,24 @@ def stage_claude_apply(state: CycleState) -> StageResult:
             if apply_spec_bypass else ""
         )
     )
+    # Mirror the successful CLI run onto the executor contract so the
+    # autopilot retry policy + dashboard see status=passed (clearing any
+    # prior retryable_failed verdict from an earlier cycle).
+    success_payload = _write_claude_executor_state(
+        status="passed",
+        stage="claude_apply",
+        command=argv,
+        exit_code=capture["exit_code"],
+        timed_out=False,
+        duration_sec=capture["duration_sec"],
+        failure_code=None,
+        failure_reason=None,
+        stdout_path=capture["stdout_path"],
+        stderr_path=capture["stderr_path"],
+        retryable=False,
+        retry_count=int(state.claude_executor_retry_count or 0),
+    )
+    _apply_executor_state_to_cycle_state(state, success_payload)
 
     _emit_cycle_log(
         state, "validation_passed",
@@ -8994,17 +9617,176 @@ def main() -> int:
     run_stage("git_check", lambda: stage_git_check(state))
     run_stage("publish_blocker_check", lambda: stage_publish_blocker_check(state))
     run_stage("publish_blocker_resolve", lambda: stage_publish_blocker_resolve(state))
-    run_stage("product_planning", lambda: stage_product_planning(state))
-    # Planner ↔ Designer ping-pong. Each stage no-ops (skipped) when
-    # FACTORY_PLANNER_DESIGNER_PINGPONG is unset, so existing flows
-    # are unaffected. When enabled, the four stages produce the
-    # designer_critique / planner_revision / designer_final_review /
-    # pm_decision artifacts and populate the desire scorecard.
-    run_stage("designer_critique",     lambda: stage_designer_critique(state))
-    run_stage("planner_revision",      lambda: stage_planner_revision(state))
-    run_stage("designer_final_review", lambda: stage_designer_final_review(state))
-    run_stage("design_spec",           lambda: stage_design_spec(state))
-    run_stage("pm_decision",           lambda: stage_pm_decision(state))
+
+    # Claude Executor preflight — refuse to enter the planning track at
+    # all if the CLI is missing / unauthenticated / hung. Allow operators
+    # to disable for diagnostic cycles via FACTORY_CLAUDE_PREFLIGHT=false.
+    preflight_enabled = _factory_flag_enabled(
+        "FACTORY_CLAUDE_PREFLIGHT", default_on=True,
+    )
+    if preflight_enabled:
+        preflight_sr = run_stage(
+            "claude_preflight", lambda: stage_claude_preflight(state),
+        )
+    else:
+        preflight_sr = StageResult(
+            name="claude_preflight",
+            label=next(lab for n, lab, _ in STAGES if n == "claude_preflight"),
+            status="skipped",
+            message="FACTORY_CLAUDE_PREFLIGHT=false — preflight 명시적 비활성",
+        )
+        state.stages.append(preflight_sr)
+
+    # Short-circuit: if preflight failed, every downstream Claude stage
+    # is unsafe (planner / designer / spec / propose / apply all spawn
+    # claude). Mark them skipped with a precise reason and route the
+    # cycle to report so the operator gets a normal summary instead of
+    # a half-finished log. The publish-blocker chain stays untouched —
+    # it does not call claude.
+    if preflight_enabled and preflight_sr.status == "failed":
+        skip_reason = (
+            f"claude_preflight failed ({state.claude_executor_failure_code}) — "
+            "downstream Claude stages skipped"
+        )
+        for skip_name in (
+            "product_planning", "designer_critique", "planner_revision",
+            "designer_final_review", "design_spec", "pm_decision",
+            "build_app", "build_control", "syntax_check",
+            "claude_propose", "implementation_ticket", "claude_apply",
+            "qa_gate", "qa_feedback", "qa_fix_propose", "qa_fix_apply",
+            "qa_recheck",
+        ):
+            sr_skip = StageResult(
+                name=skip_name,
+                label=next(lab for n, lab, _ in STAGES if n == skip_name),
+                status="skipped",
+                message=skip_reason,
+            )
+            state.stages.append(sr_skip)
+        # Cycle is FAILED, not "planning_only" — autopilot retry policy
+        # depends on failed_stage being claude_preflight to take the
+        # apply-only retry path on the NEXT cycle (after operator fixes
+        # the CLI).
+        state.status = "failed"
+        state.failed_stage = state.failed_stage or "claude_preflight"
+        state.failed_reason = (
+            state.failed_reason
+            or f"claude_preflight failed: {state.claude_executor_failure_code}"
+        )
+        state.last_message = (
+            f"Claude CLI preflight 실패 — {state.claude_executor_failure_code}"
+        )
+        state.finished_at = utc_now_iso()
+        state.current_stage = "report"
+        state.progress = 100
+        _write_state(state)
+        return 1
+
+    # Apply-only retry path. Triggered by autopilot when the previous
+    # cycle's claude_apply hit a retryable CLI failure but the planner /
+    # design_spec / implementation_ticket / claude_proposal artifacts
+    # are intact. We hydrate state from the prior factory_state.json and
+    # mark every planner/design stage as skipped so the retry doesn't
+    # burn another 20+ minutes rebuilding the same plan. The remainder
+    # of main() — build_app / build_control / syntax_check / claude_apply /
+    # qa_gate / finalization — runs unchanged.
+    apply_retry_only_active = False
+    if _factory_flag_enabled("FACTORY_APPLY_RETRY_ONLY", default_on=False):
+        prior = {}
+        try:
+            if STATE_FILE.is_file():
+                prior = json.loads(STATE_FILE.read_text(encoding="utf-8")) or {}
+        except (json.JSONDecodeError, OSError):
+            prior = {}
+        eligible = (
+            (prior.get("implementation_ticket_status") == "generated")
+            and (prior.get("claude_proposal_status") == "generated")
+            and IMPLEMENTATION_TICKET_FILE.is_file()
+            and PROPOSAL_FILE.is_file()
+        )
+        if eligible:
+            apply_retry_only_active = True
+            state.implementation_ticket_status = "generated"
+            state.implementation_ticket_path = prior.get(
+                "implementation_ticket_path"
+            ) or str(IMPLEMENTATION_TICKET_FILE)
+            state.implementation_ticket_target_files = list(
+                prior.get("implementation_ticket_target_files") or []
+            )
+            state.implementation_ticket_target_screens = list(
+                prior.get("implementation_ticket_target_screens") or []
+            )
+            state.implementation_ticket_selected_feature = prior.get(
+                "implementation_ticket_selected_feature"
+            )
+            state.implementation_ticket_feature_id = prior.get(
+                "implementation_ticket_feature_id"
+            )
+            state.implementation_ticket_source = prior.get(
+                "implementation_ticket_source"
+            )
+            state.claude_proposal_status = "generated"
+            state.claude_proposal_path = prior.get(
+                "claude_proposal_path"
+            ) or str(PROPOSAL_FILE)
+            state.claude_proposal_at = prior.get("claude_proposal_at")
+            state.design_spec_status = (
+                prior.get("design_spec_status") or "skipped"
+            )
+            state.design_spec_acceptance_passed = bool(
+                prior.get("design_spec_acceptance_passed")
+            )
+            state.design_spec_feature = prior.get("design_spec_feature")
+            state.design_spec_feature_id = prior.get("design_spec_feature_id")
+            state.design_spec_target_files = list(
+                prior.get("design_spec_target_files") or []
+            )
+            state.product_planner_status = (
+                prior.get("product_planner_status") or "skipped"
+            )
+            state.product_planner_selected_feature = prior.get(
+                "product_planner_selected_feature"
+            )
+            state.selected_feature = prior.get("selected_feature")
+            state.selected_feature_id = prior.get("selected_feature_id")
+            state.selected_feature_source = prior.get("selected_feature_source")
+            try:
+                state.claude_executor_retry_count = int(
+                    prior.get("claude_executor_retry_count") or 0
+                ) + 1
+            except (TypeError, ValueError):
+                state.claude_executor_retry_count = 1
+
+            for skip_name in (
+                "product_planning", "designer_critique", "planner_revision",
+                "designer_final_review", "design_spec", "pm_decision",
+                "claude_propose", "implementation_ticket",
+            ):
+                sr_skip = StageResult(
+                    name=skip_name,
+                    label=next(lab for n, lab, _ in STAGES if n == skip_name),
+                    status="skipped",
+                    message="apply_retry_only — 기존 산출물 재사용",
+                )
+                state.stages.append(sr_skip)
+            _emit_cycle_log(
+                state, "apply_retry_only_active",
+                "apply_retry_only — planning 단계 모두 skip, claude_apply 재시도 경로",
+                retry_count=state.claude_executor_retry_count,
+            )
+
+    if not apply_retry_only_active:
+        run_stage("product_planning", lambda: stage_product_planning(state))
+        # Planner ↔ Designer ping-pong. Each stage no-ops (skipped) when
+        # FACTORY_PLANNER_DESIGNER_PINGPONG is unset, so existing flows
+        # are unaffected. When enabled, the four stages produce the
+        # designer_critique / planner_revision / designer_final_review /
+        # pm_decision artifacts and populate the desire scorecard.
+        run_stage("designer_critique",     lambda: stage_designer_critique(state))
+        run_stage("planner_revision",      lambda: stage_planner_revision(state))
+        run_stage("designer_final_review", lambda: stage_designer_final_review(state))
+        run_stage("design_spec",           lambda: stage_design_spec(state))
+        run_stage("pm_decision",           lambda: stage_pm_decision(state))
     run_stage(
         "build_app",
         lambda: stage_web_build(state, web_dir=REPO_ROOT / "app" / "web", name="build_app"),
@@ -9016,14 +9798,15 @@ def main() -> int:
         ),
     )
     run_stage("syntax_check", lambda: stage_syntax_check(state))
-    run_stage("claude_propose", lambda: stage_claude_propose(state))
-    # Implementation Ticket — composed deterministically from PM 결정 +
-    # planner revision + claude proposal. claude_apply gates on this:
-    # missing ticket means the cycle stays planning_only.
-    run_stage(
-        "implementation_ticket",
-        lambda: stage_implementation_ticket(state),
-    )
+    if not apply_retry_only_active:
+        run_stage("claude_propose", lambda: stage_claude_propose(state))
+        # Implementation Ticket — composed deterministically from PM 결정 +
+        # planner revision + claude proposal. claude_apply gates on this:
+        # missing ticket means the cycle stays planning_only.
+        run_stage(
+            "implementation_ticket",
+            lambda: stage_implementation_ticket(state),
+        )
     run_stage("claude_apply", lambda: stage_claude_apply(state))
 
     # QA Gate — final verification that what we built is shippable.

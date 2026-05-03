@@ -720,6 +720,21 @@ PIPELINE_BLOCKING_CODE_TO_DIAGNOSTIC: dict[str, str] = {
     "no_meaningful_change": "claude_apply_failed_no_code_change",
     "qa_failed": "qa_gate_failed",
     "stage_failed": "pipeline_stage_failed",
+    # Claude Executor Contract — every CLI failure code maps to a
+    # dedicated diagnostic so the observer report distinguishes
+    # "operator must install / re-auth" (missing/auth) from
+    # "transient — autopilot will retry" (timeout/exit_nonzero).
+    "claude_cli_missing": "claude_cli_missing",
+    "claude_cli_unavailable": "claude_cli_unavailable",
+    "claude_cli_timeout": "claude_cli_timeout",
+    "claude_cli_auth_failed": "claude_cli_auth_failed",
+    "claude_cli_rate_limited": "claude_cli_rate_limited",
+    "claude_cli_exit_nonzero": "claude_cli_exit_nonzero",
+    "claude_cli_no_output": "claude_cli_no_output",
+    "claude_cli_unknown_failure": "claude_cli_unknown_failure",
+    "claude_apply_no_diff": "claude_apply_no_diff",
+    "claude_apply_invalid_patch": "claude_apply_invalid_patch",
+    "claude_cli_failed": "claude_cli_failed",
 }
 
 
