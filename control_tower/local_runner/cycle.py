@@ -6084,14 +6084,21 @@ def validate_apply_preflight(state: "CycleState") -> dict:
       * non-stale design_spec / ticket artifacts (run_id check on disk)
     """
     # 1. Ticket present + has files.
+    #
+    # validate_implementation_ticket_contract returns (ok=True,
+    # code="skipped") when the ticket stage hasn't run, which would
+    # otherwise let the `not ok` branch swallow the skipped case
+    # silently. We treat the skipped code as a hard preflight failure
+    # explicitly — apply must NEVER spend Claude budget without a
+    # generated ticket on disk.
     ticket_check = validate_implementation_ticket_contract(state)
+    if ticket_check["code"] == "skipped":
+        return _validator_result(
+            "apply_preflight", False, "missing_ticket_contract",
+            "implementation_ticket not generated — apply blocked",
+            {"ticket_status": state.implementation_ticket_status},
+        )
     if not ticket_check["ok"]:
-        if ticket_check["code"] == "skipped":
-            return _validator_result(
-                "apply_preflight", False, "missing_ticket_contract",
-                "implementation_ticket not generated — apply blocked",
-                {"ticket_status": state.implementation_ticket_status},
-            )
         return _validator_result(
             "apply_preflight", False, ticket_check["code"],
             ticket_check["message"], ticket_check["evidence"],
@@ -6114,21 +6121,25 @@ def validate_apply_preflight(state: "CycleState") -> dict:
             scope_check["message"], scope_check["evidence"],
         )
 
-    # 4. Active rework feature lock cannot lock the cycle to a
-    # different feature_id when design_spec has already been accepted.
+    # 4. Active rework feature lock reconciliation. A lock from a
+    # different run is stale by definition — the autopilot mints a
+    # fresh run_id every loop start — so we clear it here and let the
+    # preflight continue. Returning feature_lock_conflict here would
+    # block legitimate rework cycles whose only crime is finding a
+    # leftover lock file on disk.
     lock = _load_active_rework_feature()
     lock_feature = (lock.get("feature") or "").strip()
     lock_fid = (lock.get("feature_id") or _to_feature_id(lock_feature) or "").strip()
     lock_run = (lock.get("run_id") or "").strip()
     cur_run = state.run_id or _resolve_run_id()
+    stale_lock_cleared = False
     if lock_run and cur_run and lock_run != cur_run:
-        return _validator_result(
-            "apply_preflight", False, "feature_lock_conflict",
-            "active rework feature lock belongs to a previous run "
-            f"(lock_run_id={lock_run}, current={cur_run})",
-            {"lock_run_id": lock_run, "current_run_id": cur_run,
-             "lock_feature": lock_feature},
-        )
+        stale_lock_cleared = bool(_clear_active_rework_feature())
+        # Reset locals so downstream feature-id check sees an empty lock.
+        lock = {}
+        lock_feature = ""
+        lock_fid = ""
+        lock_run = ""
     spec_ok = (
         state.design_spec_status == "generated"
         and state.design_spec_acceptance_passed
@@ -6179,6 +6190,7 @@ def validate_apply_preflight(state: "CycleState") -> dict:
                 state.implementation_ticket_feature_id
                 or _to_feature_id(state.implementation_ticket_selected_feature),
             "current_run_id": cur_run,
+            "stale_lock_cleared": stale_lock_cleared,
         },
     )
 

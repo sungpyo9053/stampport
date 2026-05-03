@@ -5506,8 +5506,13 @@ def self_test() -> tuple[int, int, list[str]]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"37C: aligned validator test raised: {exc}")
 
-    # 37D. validate_apply_preflight refuses when the active rework
-    # feature lock belongs to a different run_id (cross-run lock leak).
+    # 37D. validate_apply_preflight reconciles a stale-run rework lock
+    # by clearing it and continuing. A lock from a previous run_id is
+    # stale by definition (autopilot mints a fresh run_id at every
+    # start), so blocking the preflight on it would only repeat the
+    # bug the kernel contract is meant to fix. evidence must record
+    # `stale_lock_cleared=True` so the report can show the cleanup
+    # happened.
     total += 1
     try:
         repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
@@ -5524,6 +5529,7 @@ def self_test() -> tuple[int, int, list[str]]:
                     hold_count=1, hold_type="soft",
                     run_id="r-old-run",
                 )
+                lock_pre_exists = _cycle.ACTIVE_REWORK_FEATURE_FILE.is_file()
                 st = _cycle.CycleState(cycle=1, goal="x")
                 st.run_id = "r-current-run"
                 st.product_planner_status = "generated"
@@ -5540,20 +5546,31 @@ def self_test() -> tuple[int, int, list[str]]:
                 ]
                 st.selected_feature_id = "passportinkgrid"
                 pf = _cycle.validate_apply_preflight(st)
+                lock_post_exists = (
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE.is_file()
+                )
             finally:
                 _cycle.ACTIVE_REWORK_FEATURE_FILE = saved
                 if repo_prev is not None:
                     os.environ["LOCAL_RUNNER_REPO"] = repo_prev
                 else:
                     os.environ.pop("LOCAL_RUNNER_REPO", None)
-        if not pf["ok"] and pf["code"] == "feature_lock_conflict":
+        if (
+            lock_pre_exists is True
+            and pf["ok"] is True
+            and pf["code"] == "passed"
+            and lock_post_exists is False
+            and bool(pf.get("evidence", {}).get("stale_lock_cleared")) is True
+        ):
             passed += 1
         else:
             failures.append(
-                f"37D: cross-run lock must fail apply preflight — pf={pf}"
+                f"37D: stale-run lock must auto-clear and let preflight "
+                f"pass — pre={lock_pre_exists} pf={pf} "
+                f"post={lock_post_exists}"
             )
     except Exception as exc:  # noqa: BLE001
-        failures.append(f"37D: cross-run lock test raised: {exc}")
+        failures.append(f"37D: stale-run lock auto-clear test raised: {exc}")
 
     # 37E. classify_freshness_by_run_id — same run_id (cycle match) is
     # current_run; different run_id is stale_run; absent run_id falls
@@ -5763,6 +5780,102 @@ def self_test() -> tuple[int, int, list[str]]:
             )
     except Exception as exc:  # noqa: BLE001
         failures.append(f"37H: planner contract test raised: {exc}")
+
+    # 37I. validate_apply_preflight returns missing_ticket_contract
+    # when implementation_ticket_status is anything other than
+    # "generated" (skipped, skipped_hold, pm_scope_missing_target_files,
+    # failed). Without this the preflight skipped-branch was
+    # unreachable because the ticket validator returned ok=True for
+    # the skipped code.
+    total += 1
+    try:
+        statuses = (
+            "skipped", "skipped_hold",
+            "pm_scope_missing_target_files", "failed",
+        )
+        observed: list[tuple[str, str, bool]] = []
+        for status in statuses:
+            st = _cycle.CycleState(cycle=1, goal="x")
+            st.run_id = "r-current"
+            st.implementation_ticket_status = status
+            # Even with a planner+design_spec aligned underneath, the
+            # missing/skipped ticket must short-circuit the preflight.
+            st.product_planner_status = "generated"
+            st.product_planner_selected_feature = "PassportInkGrid"
+            st.design_spec_status = "generated"
+            st.design_spec_acceptance_passed = True
+            st.design_spec_feature = "PassportInkGrid"
+            st.design_spec_feature_id = "passportinkgrid"
+            pf = _cycle.validate_apply_preflight(st)
+            observed.append((status, pf["code"], pf["ok"]))
+        if all(
+            ok is False and code == "missing_ticket_contract"
+            for _, code, ok in observed
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37I: missing_ticket_contract gate — observed={observed}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37I: missing_ticket_contract test raised: {exc}")
+
+    # 37J. Regression: design_spec accepted ('PassportInkGrid (잉크 도장
+    # 그리드) + Share.jsx 접합부 설계') with planner fallback feature
+    # 'Local Visa 배지' must NOT produce scope_mismatch when the ticket
+    # adopts the design_spec feature_id. This is the exact production
+    # failure the kernel-contract layer is meant to fix; previously the
+    # planner-fallback name leaked into the ticket and caused
+    # scope_mismatch rollback after Claude apply spent budget.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.run_id = "r-current"
+        # Planner kept the legacy fallback selection.
+        st.product_planner_status = "generated"
+        st.product_planner_selected_feature = "Local Visa 배지"
+        # Design_spec accepted on the new feature.
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.stale_design_spec_detected = False
+        st.design_spec_feature = (
+            "PassportInkGrid (잉크 도장 그리드) + Share.jsx 접합부 설계"
+        )
+        st.design_spec_feature_id = _cycle._to_feature_id(
+            st.design_spec_feature
+        )
+        # Ticket has adopted the design_spec feature_id (the kernel
+        # contract enforced this in stage_implementation_ticket).
+        st.implementation_ticket_status = "generated"
+        st.implementation_ticket_selected_feature = st.design_spec_feature
+        st.implementation_ticket_feature_id = st.design_spec_feature_id
+        st.implementation_ticket_target_files = [
+            "app/web/src/screens/Share.jsx",
+        ]
+        st.selected_feature = st.design_spec_feature
+        st.selected_feature_id = st.design_spec_feature_id
+        scope = _cycle.validate_scope_contract(st)
+        ticket = _cycle.validate_implementation_ticket_contract(st)
+        spec = _cycle.validate_design_spec_contract(st)
+        pf = _cycle.validate_apply_preflight(st)
+        if (
+            scope["ok"] and scope["code"] == "passed"
+            and ticket["ok"] and ticket["code"] == "passed"
+            and spec["ok"] and spec["code"] == "passed"
+            and pf["ok"] and pf["code"] == "passed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37J: planner fallback Local Visa vs design_spec "
+                f"PassportInkGrid regression — scope={scope['code']} "
+                f"ticket={ticket['code']} spec={spec['code']} "
+                f"pf={pf['code']}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(
+            f"37J: Local Visa / PassportInkGrid regression raised: {exc}"
+        )
 
     return passed, total, failures
 
