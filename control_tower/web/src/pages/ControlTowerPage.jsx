@@ -317,23 +317,16 @@ export default function ControlTowerPage() {
           first so a control_state-missing message never shows above it. */}
       <AutoPilotHero runners={runners} />
 
-      {/* AGENT OFFICE SCENE — 8 characters, click-through to drawer.
-          The desktop drawer narrows the stage to 60% via the
-          .is-drawer-open CSS class so the office and detail panel
-          read side-by-side without overlap. */}
-      <div
-        className={
-          "agent-office-stage-wrapper flex gap-3 " +
-          (selectedAgentId ? "agent-office-stage-with-drawer" : "")
-        }
-      >
-        <AgentOfficeScene
-          runners={runners}
-          selectedAgentId={selectedAgentId}
-          onAgentClick={(id) => setSelectedAgentId(id)}
-          drawerOpen={!!selectedAgentId}
-        />
-      </div>
+      {/* AGENT OFFICE SCENE — 3 zones (PLAN / BUILD / SHIP) with 8
+          agent slots. Drawer is a fixed overlay so we no longer need
+          to split the office side-by-side; just let the scene span
+          full width. */}
+      <AgentOfficeScene
+        runners={runners}
+        selectedAgentId={selectedAgentId}
+        onAgentClick={(id) => setSelectedAgentId(id)}
+        drawerOpen={!!selectedAgentId}
+      />
 
       {/* Operations row: SystemLog (left) + OperatorCommandPanel (right) */}
       <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(380px,400px)] control-tower-right-rail">

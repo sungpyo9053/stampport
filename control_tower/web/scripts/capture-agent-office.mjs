@@ -76,24 +76,41 @@ async function captureViewport(browser, baseUrl, viewport, label, outPath) {
   const assertions = await page.evaluate(() => {
     const $ = (sel) => document.querySelectorAll(sel).length;
     const text = document.body.innerText || "";
+    // No-overflow guard: every agent slot must fit inside the
+    // viewport's clientWidth. The scene as a whole must not
+    // produce a horizontal scrollbar.
+    const docWidth = document.documentElement.clientWidth;
+    const docScrollW = document.documentElement.scrollWidth;
+    const horizontalOverflow = docScrollW - docWidth; // >0 means overflow
     return {
       pixel_office_scene: $('.pixel-office-scene'),
-      pixel_office_floor: $('.pixel-office-floor'),
-      office_desk: $('.office-desk'),
-      office_monitor: $('.office-monitor'),
+      agent_office_zone: $('.agent-office-zone'),
+      agent_office_zone_plan:  $('.agent-office-zone-plan'),
+      agent_office_zone_build: $('.agent-office-zone-build'),
+      agent_office_zone_ship:  $('.agent-office-zone-ship'),
+      agent_slot: $('.agent-slot'),
+      agent_speech_bubble: $('.agent-speech-bubble'),
       pixel_agent: $('.pixel-agent'),
       pixel_agent_head: $('.pixel-agent-head'),
       pixel_agent_body: $('.pixel-agent-body'),
       pixel_agent_arm: $('.pixel-agent-arm'),
       pixel_agent_leg: $('.pixel-agent-leg'),
-      pixel_agent_speech: $('.pixel-agent-speech'),
       pixel_agent_nameplate: $('.pixel-agent-nameplate'),
-      pixel_agent_anchor: $('.pixel-agent-anchor'),
+      agent_character: $('.agent-character'),
+      agent_character_face: $('.agent-character-face'),
+      agent_character_desk: $('.agent-character-desk'),
       autopilot_hero: $('[data-testid="autopilot-hero"]'),
       autopilot_payload_preview: $('[data-testid="autopilot-payload-preview"]'),
       autopilot_restart_button: $('[data-testid="autopilot-restart"]'),
+      office_headline: $('[data-testid="office-headline"]'),
       hero_text_present: text.includes("AUTO PILOT"),
       office_text_present: text.includes("AGENT OFFICE"),
+      plan_zone_label: text.includes("PLAN ZONE"),
+      build_zone_label: text.includes("BUILD ZONE"),
+      ship_zone_label: text.includes("SHIP ZONE"),
+      doc_client_width: docWidth,
+      doc_scroll_width: docScrollW,
+      horizontal_overflow: horizontalOverflow,
     };
   });
 
@@ -161,18 +178,20 @@ async function main() {
     );
 
     // Acceptance — every count must be > 0, drawer sections must all
-    // be present.
+    // be present, no horizontal overflow, ≤3 bubbles, 3 zones each.
     const requirePositive = [
       "pixel_office_scene",
-      "pixel_office_floor",
-      "office_desk",
-      "office_monitor",
+      "agent_office_zone",
+      "agent_slot",
       "pixel_agent",
       "pixel_agent_head",
       "pixel_agent_body",
       "pixel_agent_arm",
       "pixel_agent_leg",
-      "pixel_agent_nameplate",
+      "agent_character",
+      "agent_character_face",
+      "agent_character_desk",
+      "office_headline",
     ];
     const failures = [];
     for (const [k, v] of Object.entries(desktop.assertions)) {
@@ -180,14 +199,36 @@ async function main() {
         failures.push(`desktop.${k} === ${v}`);
       }
     }
+    for (const view of [desktop, mobile]) {
+      const a = view.assertions;
+      // Zones present
+      if (a.agent_office_zone_plan === 0)  failures.push(`${view.label} PLAN zone missing`);
+      if (a.agent_office_zone_build === 0) failures.push(`${view.label} BUILD zone missing`);
+      if (a.agent_office_zone_ship === 0)  failures.push(`${view.label} SHIP zone missing`);
+      if (!a.plan_zone_label)  failures.push(`${view.label} PLAN ZONE label text missing`);
+      if (!a.build_zone_label) failures.push(`${view.label} BUILD ZONE label text missing`);
+      if (!a.ship_zone_label)  failures.push(`${view.label} SHIP ZONE label text missing`);
+      // 8 agents
+      if (!(a.pixel_agent >= 8)) {
+        failures.push(`${view.label} pixel_agent count was ${a.pixel_agent} (<8)`);
+      }
+      if (!(a.agent_slot >= 8)) {
+        failures.push(`${view.label} agent_slot count was ${a.agent_slot} (<8)`);
+      }
+      // Bubble hard cap
+      if (a.agent_speech_bubble > 3) {
+        failures.push(`${view.label} agent_speech_bubble count was ${a.agent_speech_bubble} (>3)`);
+      }
+      // No horizontal overflow
+      if (a.horizontal_overflow > 1) {
+        failures.push(
+          `${view.label} horizontal overflow ${a.horizontal_overflow}px (` +
+          `scrollWidth=${a.doc_scroll_width} clientWidth=${a.doc_client_width})`,
+        );
+      }
+    }
     if (!desktop.assertions.hero_text_present) failures.push("desktop hero text missing");
     if (!desktop.assertions.office_text_present) failures.push("desktop office text missing");
-    if (!(desktop.assertions.pixel_agent >= 8)) {
-      failures.push(`desktop pixel_agent count was ${desktop.assertions.pixel_agent} (<8)`);
-    }
-    if (!(mobile.assertions.pixel_agent >= 8)) {
-      failures.push(`mobile pixel_agent count was ${mobile.assertions.pixel_agent} (<8)`);
-    }
     if (!desktop.drawerSummary) {
       failures.push("desktop drawer did not open after clicking pixel-agent-pm");
     } else {

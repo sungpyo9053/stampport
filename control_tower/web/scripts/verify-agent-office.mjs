@@ -227,9 +227,14 @@ const REQUIRED_BEHAVIORS = [
     // textual fragment.
     return scene.body.includes("isFresh") && scene.body.includes("blocking_agent === agentId");
   }],
-  ["pixel-office stage label data-testid", () => {
+  ["office headline data-testid present", () => {
+    // The redesigned scene replaced the old tiny stage-label chip
+    // with a big readable headline (testid `office-headline`). The
+    // previous check looked for `pixel-office-stage-label` — kept
+    // out of the source since it implied a small chip we no longer
+    // ship.
     const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
-    return scene && scene.body.includes("pixel-office-stage-label");
+    return scene && scene.body.includes('data-testid="office-headline"');
   }],
   ["autopilot-stat-ellipsis class for long paths", () => {
     return searchAny("autopilot-stat-ellipsis").length > 0;
@@ -268,6 +273,47 @@ const REQUIRED_BEHAVIORS = [
     const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
     if (!panel) return false;
     return /setFeedback\(""\)/.test(panel.body) && /10000/.test(panel.body);
+  }],
+  // 3-zone redesign — strict structural rules
+  ["AgentOfficeScene defines 3 zones", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    if (!scene) return false;
+    return scene.body.includes("PLAN ZONE")
+      && scene.body.includes("BUILD ZONE")
+      && scene.body.includes("SHIP ZONE");
+  }],
+  [".agent-office-zone CSS exists", () =>
+    searchAny(".agent-office-zone").length > 0],
+  ["zone-grid CSS variants present", () => {
+    return searchAny(".agent-office-zone-grid-3").length > 0
+      && searchAny(".agent-office-zone-grid-2").length > 0;
+  }],
+  ["BUBBLE_HARD_CAP = 3 in scene", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    return scene && /BUBBLE_HARD_CAP\s*=\s*3/.test(scene.body);
+  }],
+  ["bubble-top/-right/-left position classes wired", () => {
+    const bubble = docs.find((d) => d.path.endsWith("AgentSpeechBubble.jsx"));
+    return bubble
+      && bubble.body.includes("bubble-")
+      && /bubble-top|bubble-left|bubble-right/.test(bubble.body);
+  }],
+  ["agent-slot fixed-row layout", () => {
+    return searchAny(".agent-slot-bubble").length > 0
+      && searchAny(".agent-slot-figure").length > 0
+      && searchAny(".agent-slot-nameplate").length > 0
+      && searchAny(".agent-slot-status").length > 0;
+  }],
+  ["overflow-x hidden guard on redesigned scene", () => {
+    return searchAny(".office-scene-redesign").length > 0
+      && searchAny("overflow-x: hidden").length > 0;
+  }],
+  ["mobile media query max-width 480px", () => {
+    return searchAny("max-width: 480px").length > 0;
+  }],
+  ["office headline replaces tiny stage chip", () => {
+    const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
+    return scene && scene.body.includes("office-headline");
   }],
 ];
 

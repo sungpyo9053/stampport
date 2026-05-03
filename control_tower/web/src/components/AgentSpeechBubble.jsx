@@ -19,14 +19,23 @@ const TONE_PRESET = {
 function AgentSpeechBubble({ tone = "info", text, side = "top", small = false }) {
   if (!text) return null;
   const preset = TONE_PRESET[tone] || TONE_PRESET.info;
+  // Accept the new compact side props too — bubble-top / bubble-left
+  // / bubble-right come straight from the redesigned scene's per-slot
+  // index, while the old "left"/"right"/"top" strings are kept for
+  // legacy callers.
+  const sideKey =
+    side === "bubble-left" || side === "left"   ? "left"
+    : side === "bubble-right" || side === "right" ? "right"
+    : "top";
 
   return (
     <div
       className={
         "pixel-agent-speech agent-speech-bubble " +
-        (side === "left" ? "pixel-agent-speech-left agent-speech-bubble-left "
-          : side === "right" ? "pixel-agent-speech-right agent-speech-bubble-right "
-          : "pixel-agent-speech-top agent-speech-bubble-top ") +
+        `bubble-${sideKey} ` +
+        (sideKey === "left"  ? "pixel-agent-speech-left agent-speech-bubble-left "
+        : sideKey === "right" ? "pixel-agent-speech-right agent-speech-bubble-right "
+        :                       "pixel-agent-speech-top agent-speech-bubble-top ") +
         (small ? "pixel-agent-speech-small agent-speech-bubble-small" : "")
       }
       role="status"

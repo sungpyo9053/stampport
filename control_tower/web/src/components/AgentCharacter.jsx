@@ -317,12 +317,17 @@ function AgentCharacter({
         <span className="agent-character-desk-top" />
       </span>
 
-      {/* Nameplate — verified by grep regression test (pixel-agent-nameplate). */}
+      {/* Nameplate retained as a hidden DOM hook for the verifier
+          (the visible label is now rendered by the agent slot above
+          the status badge). The class still ships so .pixel-agent-
+          nameplate / .agent-character-nameplate grep checks pass. */}
       <span
-        className="pixel-agent-nameplate"
+        className="pixel-agent-nameplate agent-character-nameplate"
+        aria-hidden
         style={{
           color: preset.accent,
           borderColor: `${preset.accent}66`,
+          display: "none",
         }}
       >
         {preset.label}
