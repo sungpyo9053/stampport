@@ -932,6 +932,79 @@ def _classify_failure(verdict: str, smoke: dict) -> str:
     return verdict
 
 
+def _hold_loop_root_cause(state: AutopilotState) -> list[str]:
+    """When the run terminated via max_cycles AND every recorded cycle
+    verdict was HOLD, surface the root-cause signals from the last
+    factory_state so the operator doesn't have to grep three artifacts
+    to figure out why nothing shipped.
+
+    Returns a list of markdown lines (empty when this is not a HOLD-loop
+    termination — caller appends only when non-empty).
+    """
+    history = list(state.history or [])
+    stop_reason = (state.stop_reason or "").lower()
+    if not history or "max_cycles" not in stop_reason:
+        return []
+    verdicts = {(h.get("verdict") or "").upper() for h in history}
+    if verdicts and verdicts != {"HOLD"}:
+        return []
+
+    lines: list[str] = ["", "## HOLD 반복 종료 (root cause)", ""]
+    lines.append(
+        f"- {len(history)}개 cycle 모두 HOLD 로 종료. claude_apply 가 한 번도 실행되지 않아 "
+        f"commit/push 가 발생할 수 없었습니다."
+    )
+
+    fs_path = _factory_state_path()
+    fs: dict = {}
+    try:
+        if fs_path.is_file():
+            with open(fs_path, "r", encoding="utf-8") as fh:
+                fs = json.load(fh) or {}
+    except Exception:
+        fs = {}
+
+    gate_failures = fs.get("product_planner_gate_failures") or []
+    if gate_failures:
+        lines.append("- 마지막 사이클 기획 품질 가드 실패:")
+        for f in list(gate_failures)[:5]:
+            lines.append(f"  - {f}")
+
+    skip_reason = fs.get("implementation_ticket_skipped_reason")
+    ticket_status = fs.get("implementation_ticket_status")
+    if ticket_status == "skipped_hold" or skip_reason == "pm_hold_for_rework":
+        lines.append(
+            "- implementation_ticket 가 매 cycle 마다 PM HOLD 게이트로 skip → "
+            "claude_propose 도 자동 skip → claude_apply 변경 없음."
+        )
+
+    spec_passed = bool(fs.get("design_spec_acceptance_passed"))
+    spec_status = fs.get("design_spec_status")
+    if spec_passed and spec_status == "generated":
+        lines.append(
+            "- design_spec.md acceptance=passed 였으나 PM HOLD 로 막혔습니다 — "
+            "spec_acceptance_bypass 이 동작하는 최신 cycle.py 인지 확인하세요."
+        )
+    elif spec_status and spec_status != "generated":
+        lines.append(f"- design_spec_status={spec_status} (acceptance bypass 비활성)")
+
+    pm_msg = fs.get("pm_decision_message") or fs.get("pm_decision_status")
+    if pm_msg:
+        lines.append(f"- 마지막 PM 결정 메시지: {pm_msg}")
+
+    lines.append("")
+    lines.append("**다음 cycle 권장 조치**:")
+    lines.append(
+        "- 직전 HOLD 사유를 후보 1개의 `사용자 문제` 로 옮긴 planner 출력을 만들거나, "
+        "design_spec.md acceptance 를 통과시켜 spec_acceptance_bypass 를 발동시키세요."
+    )
+    lines.append(
+        "- `cat .runtime/pm_decision.md`, `cat .runtime/designer_final_review.md`, "
+        "`cat .runtime/product_planner_report.md` 순서로 확인하면 어디서 막혔는지 보입니다."
+    )
+    return lines
+
+
 def _format_report(state: AutopilotState) -> str:
     lines = [
         "# Stampport Auto Pilot Report",
@@ -965,6 +1038,9 @@ def _format_report(state: AutopilotState) -> str:
             f"| {h.get('render_status') or '—'} "
             f"| {h.get('health_status') or '—'} |"
         )
+
+    lines.extend(_hold_loop_root_cause(state))
+
     lines += [
         "",
         "## 아침에 확인할 것",

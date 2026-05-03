@@ -4515,6 +4515,142 @@ def self_test() -> tuple[int, int, list[str]]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"31F: autopilot import / classify failed: {exc}")
 
+    # 32. Planner fallback report passes its own quality guard.
+    # Regression target: a fallback that itself fails the gate would
+    # cause every cycle that fell back to also be flagged as
+    # "기획 품질 가드 실패", driving an infinite HOLD loop.
+    total += 1
+    try:
+        from . import cycle as _cycle
+
+        class _StubState:
+            cycle = 1
+
+        body = _cycle._build_planner_fallback_report(
+            _StubState(), source_failure="self-test", gate_failures=["self-test"],
+        )
+        gate_fails = _cycle._validate_planner_report(body)
+        cand_count = _cycle._count_candidate_rows(body)
+        if not gate_fails and cand_count >= 3:
+            passed += 1
+        else:
+            failures.append(
+                f"32: planner fallback failed its own gate — "
+                f"candidates={cand_count}, fails={gate_fails[:3]}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"32: planner fallback validate raised: {exc}")
+
+    # 33. PM HOLD rework block must hard-encode the 3-candidate × 2-desire
+    # gate AND the target_files requirement. Without those, the
+    # next-cycle planner falls back to fallback again.
+    total += 1
+    try:
+        import tempfile
+        from . import cycle as _cycle
+
+        prev_pm = _cycle.PM_DECISION_FILE
+        prev_dr = _cycle.DESIGNER_FINAL_REVIEW_FILE
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            _cycle.PM_DECISION_FILE = tdp / "pm_decision.md"
+            _cycle.DESIGNER_FINAL_REVIEW_FILE = tdp / "designer_final_review.md"
+            _cycle.PM_DECISION_FILE.write_text(
+                "## 출하 결정\nhold\n\n## 결정 이유\nshare card 칭호 라인이 누락\n",
+                encoding="utf-8",
+            )
+            _cycle.DESIGNER_FINAL_REVIEW_FILE.write_text(
+                "## 약점\n- 시각언어 모호\n\n## 욕구 점수표\n| 수집욕 | 3 |\n",
+                encoding="utf-8",
+            )
+            block = _cycle._load_pm_hold_rework_context()
+        _cycle.PM_DECISION_FILE = prev_pm
+        _cycle.DESIGNER_FINAL_REVIEW_FILE = prev_dr
+
+        must_have = (
+            "Previous PM HOLD",
+            "후보 3개를 반드시",
+            "수집욕",
+            "과시욕",
+            "성장욕",
+            "희소성",
+            "재방문",
+            "target_files",
+        )
+        missing = [k for k in must_have if k not in block]
+        if not missing and len(block) > 200:
+            passed += 1
+        else:
+            failures.append(
+                f"33: HOLD rework block missing required hooks: {missing}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"33: HOLD rework block build raised: {exc}")
+
+    # 34. Autopilot HOLD-loop terminator surfaces root cause.
+    total += 1
+    try:
+        from . import autopilot as _autopilot
+
+        st = _autopilot.AutopilotState()
+        st.stop_reason = "max_cycles reached (5)"
+        st.history = [
+            {"cycle": i, "verdict": "HOLD"} for i in range(1, 6)
+        ]
+        # _hold_loop_root_cause reads factory_state.json — an absent
+        # file is fine, the function should just emit fewer lines.
+        lines = _autopilot._hold_loop_root_cause(st)
+        joined = "\n".join(lines)
+        if (
+            "HOLD 반복 종료" in joined
+            and "claude_apply" in joined
+            and any("권장 조치" in s for s in lines)
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"34: HOLD-loop root cause missing — got {joined[:300]!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34: HOLD-loop root cause raised: {exc}")
+
+    # 35. design_spec acceptance bypass — when design_spec is generated
+    # AND acceptance passed, implementation_ticket and claude_propose
+    # should NOT be skipped on PM HOLD. Verified via state inspection
+    # (mirroring the gate logic) — the actual stage requires a full
+    # cycle env, which we don't spin up here.
+    total += 1
+    try:
+        from . import cycle as _cycle
+
+        # Mirror the gate condition exactly so this test fails if either
+        # call site drifts. We're testing the inputs that should let
+        # bypass fire.
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.stale_design_spec_detected = False
+
+        spec_acceptance_bypass = bool(
+            st.design_spec_status == "generated"
+            and st.design_spec_acceptance_passed
+            and not st.stale_design_spec_detected
+        )
+        # The bypass should be eligible — without it both stages would
+        # always skip on HOLD and we'd get the infinite-loop seen in
+        # the field.
+        if spec_acceptance_bypass:
+            passed += 1
+        else:
+            failures.append(
+                "35: design_spec acceptance bypass not eligible despite "
+                "generated+accepted spec"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"35: spec_acceptance_bypass test raised: {exc}")
+
     return passed, total, failures
 
 

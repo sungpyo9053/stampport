@@ -303,16 +303,59 @@ export function stageToWorkingAgent(meta = {}, phase = null) {
 //   "unknown"            — no timestamps available
 // ---------------------------------------------------------------------------
 
+// Resolve the autopilot's "current cycle number" — uses
+// active_cycle_index while running (since cycle_count only ticks AFTER
+// a cycle finishes), otherwise cycle_count. Exported so callers /
+// tests can build the same comparison.
+export function resolveCurrentCycleNumber(ap) {
+  if (!ap) return null;
+  const status = String(ap.status || "").toLowerCase();
+  const live = status === "running" || status === "starting"
+    || status === "stopping" || status === "restarting";
+  if (live) {
+    const idx = ap.active_cycle_index != null ? Number(ap.active_cycle_index) : 0;
+    if (Number.isFinite(idx) && idx > 0) return idx;
+  }
+  if (ap.cycle_count != null) {
+    const n = Number(ap.cycle_count);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 export function freshnessOf({ artifactCycleId, artifactAt, autopilot }) {
   const ap = autopilot || {};
   const apStarted = ap.started_at ? Date.parse(ap.started_at) : null;
-  const apCycle = ap.cycle_count != null ? Number(ap.cycle_count) : null;
+  const status = String(ap.status || "").toLowerCase();
+  const live = status === "running" || status === "starting"
+    || status === "stopping" || status === "restarting";
+  const currentCycle = resolveCurrentCycleNumber(ap);
+  const apActive = ap.active_cycle_index != null ? Number(ap.active_cycle_index) : null;
 
-  // When agent_accountability writes cycle_id, we can compare directly.
-  if (artifactCycleId != null && apCycle != null) {
-    if (Number(artifactCycleId) === apCycle) return "current_cycle";
-    if (Number(artifactCycleId) < apCycle) return "previous_cycle";
-    return "current_cycle";
+  // Run-boundary check first — if the artifact predates the current
+  // autopilot run, it's stale regardless of cycle_id. cycle_id values
+  // are NOT globally unique across runs, so a previous run can leave
+  // a higher cycle_id on disk that would otherwise look "fresh".
+  if (artifactAt && Number.isFinite(apStarted)) {
+    const at = Date.parse(artifactAt);
+    if (Number.isFinite(at) && at < apStarted) {
+      return "stale_artifact";
+    }
+  }
+
+  // When the artifact has a cycle_id, compare to the active cycle
+  // (during a run) or the finished cycle_count (after stop).
+  if (artifactCycleId != null && currentCycle != null) {
+    const id = Number(artifactCycleId);
+    if (id === currentCycle) return "current_cycle";
+    if (id < currentCycle) return "previous_cycle";
+    // id > currentCycle. Default: stale (from a previous run with
+    // higher counter). Conservative exception: autopilot mid-startup
+    // with no active_cycle_index yet — treat as unknown so the UI
+    // doesn't aggressively hide an artifact that may legitimately be
+    // ahead of the not-yet-committed index.
+    if (live && (apActive == null || apActive === 0)) return "unknown";
+    return "stale_artifact";
   }
 
   if (artifactAt && apStarted) {
@@ -439,6 +482,89 @@ export function deriveEffectiveConfig({ phase, draft, autopilot }) {
       : draft.requireHealth,
     locked: isLocked,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Agent supervisor blob freshness — used by AgentAccountabilityPanel and
+// the verify-autopilot-ui matrix. Lives here (not in the panel) so
+// node-side fixtures can import it without bringing JSX along.
+// ---------------------------------------------------------------------------
+
+function _pickAccountabilityTs(aa) {
+  const candidates = [aa?.evaluated_at, aa?.updated_at, aa?.created_at];
+  for (const ts of candidates) {
+    if (!ts) continue;
+    const v = Date.parse(ts);
+    if (Number.isFinite(v)) return v;
+  }
+  return NaN;
+}
+
+// Returns:
+//   "fresh"    — same cycle as the autopilot is currently on, OR no
+//                autopilot run is active and accountability is recent.
+//   "stale"    — cycle_id is from a previous autopilot cycle / earlier
+//                run. The accountability shouldn't drive the main UI.
+//   "unknown"  — can't tell (mid-startup before active_cycle_index is
+//                committed, or no cycle_id and no timestamps).
+//
+// `runners` accepts either the runner-list shape (looks under
+// metadata_json.local_factory.autopilot) or `{ autopilot }` for tests.
+export function classifyAccountabilityFreshness(aa, runners = []) {
+  if (!aa) return "unknown";
+  const ap = (() => {
+    if (Array.isArray(runners)) {
+      for (const r of runners) {
+        const a = r?.metadata_json?.local_factory?.autopilot;
+        if (a) return a;
+      }
+      return null;
+    }
+    return runners?.autopilot || null;
+  })();
+  const accCycle = aa.cycle_id != null ? Number(aa.cycle_id) : null;
+  const apStatus = String(ap?.status || "").toLowerCase();
+  const apIsLive = apStatus === "running" || apStatus === "starting"
+    || apStatus === "stopping" || apStatus === "restarting";
+  const apStartedAt = ap?.started_at ? Date.parse(ap.started_at) : NaN;
+  const accAt = _pickAccountabilityTs(aa);
+  const currentCycle = resolveCurrentCycleNumber(ap);
+  const apActive = ap?.active_cycle_index != null ? Number(ap.active_cycle_index) : null;
+
+  // Run-boundary check: if the supervisor blob predates the current
+  // autopilot run, it's stale regardless of cycle numbers. cycle_id
+  // values aren't globally unique across runs.
+  if (
+    apIsLive
+    && Number.isFinite(apStartedAt)
+    && Number.isFinite(accAt)
+    && accAt < apStartedAt
+  ) {
+    return "stale";
+  }
+
+  if (accCycle == null) {
+    return apIsLive ? "unknown" : "fresh";
+  }
+
+  // Autopilot running but no cycle has been spawned yet AND the blob
+  // claims a cycle_id ≥ 1 → blob is from a prior run.
+  if (apIsLive && currentCycle === 0 && accCycle >= 1) {
+    return "stale";
+  }
+
+  if (currentCycle == null) {
+    return "fresh";
+  }
+
+  if (accCycle === currentCycle) return "fresh";
+  if (accCycle < currentCycle) return "stale";
+  // accCycle > currentCycle. Default: stale (blob from prior run with
+  // higher cycle counter). Conservative exception: when autopilot is
+  // mid-startup with no active_cycle_index yet, the heartbeat hasn't
+  // committed cycle 1's index — treat as unknown, not stale.
+  if (apIsLive && (apActive == null || apActive === 0)) return "unknown";
+  return "stale";
 }
 
 export const FRESHNESS_LABEL = {

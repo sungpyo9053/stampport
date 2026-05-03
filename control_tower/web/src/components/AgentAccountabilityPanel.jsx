@@ -8,6 +8,8 @@
 // that refusal visible — per-agent pass/fail, the blocking_agent, the
 // retry prompt, and meaningful-change evidence.
 
+import { classifyAccountabilityFreshness } from "../utils/autopilotPhase.js";
+
 const AGENT_LABELS = {
   planner:  "기획자",
   designer: "디자이너",
@@ -42,39 +44,6 @@ function pickAccountability(runners = []) {
     if (aa) return aa;
   }
   return null;
-}
-
-// Compare the supervisor's cycle_id to the live autopilot cycle.
-// Returns:
-//   "fresh"    — same cycle as the autopilot is currently on, OR no
-//                autopilot run is active and accountability is recent.
-//   "stale"    — cycle_id is from a previous autopilot cycle / earlier
-//                run. The accountability shouldn't drive the main UI.
-//   "unknown"  — no cycle_id field. Treat as stale to avoid the "stale
-//                blob looks fresh" trap.
-function classifyAccountabilityFreshness(aa, runners = []) {
-  if (!aa) return "unknown";
-  const ap = (() => {
-    for (const r of runners) {
-      const a = r?.metadata_json?.local_factory?.autopilot;
-      if (a) return a;
-    }
-    return null;
-  })();
-  const accCycle = aa.cycle_id != null ? Number(aa.cycle_id) : null;
-  const apCycle = ap?.cycle_count != null ? Number(ap.cycle_count) : null;
-  const apStatus = String(ap?.status || "").toLowerCase();
-  // Autopilot running but cycle_count==0: the supervisor's cycle_id is
-  // FROM AN EARLIER RUN. This is the exact scenario the user flagged
-  // (Auto Pilot cycle 0/5 + accountability cycle #1 from a prior run).
-  if (apStatus === "running" && apCycle === 0 && accCycle != null && accCycle >= 1) {
-    return "stale";
-  }
-  if (accCycle == null) return "unknown";
-  if (apCycle == null) return "fresh"; // autopilot not running — accountability is current
-  if (accCycle === apCycle) return "fresh";
-  if (accCycle < apCycle) return "stale";
-  return "fresh";
 }
 
 function fmtScore(n) {

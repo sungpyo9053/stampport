@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import {
   PHASES,
   buildStartPayload,
+  classifyAccountabilityFreshness,
   deriveButtonState,
   deriveDisplayCycle,
   deriveEffectiveConfig,
@@ -41,6 +42,7 @@ import {
   hasActiveCycle,
   pickAutopilot,
   pickRunnerMeta,
+  resolveCurrentCycleNumber,
   stageToWorkingAgent,
 } from "../src/utils/autopilotPhase.js";
 import { fmtTime, isAfterStart, parseUtcIso } from "../src/utils/time.js";
@@ -333,16 +335,10 @@ const apB = { started_at: "2026-05-03T01:00:00Z", cycle_count: 0 };
     artifactAt: "2026-05-02T01:30:00Z",
     autopilot: apB,
   });
-  // apB.cycle_count=0, artifactCycleId=1 → previous_cycle (artifact > 0)
-  // OR current_cycle (since aa.cycle_id is the only signal) — the
-  // freshnessOf rule returns current_cycle when artifactCycleId equals
-  // apCycle, otherwise previous_cycle when smaller. With apCycle=0 and
-  // artifactCycleId=1, the rule path falls into the else branch
-  // (current_cycle) — but the AgentAccountabilityPanel applies an
-  // additional guard `apStatus=running && cycle_count==0 && acc>=1
-  // → stale`. We test that guard separately below.
-  // For freshnessOf alone, the answer here is current_cycle.
-  check("freshnessOf: artifactCycleId=1, apCycle=0 → current_cycle", f === "current_cycle");
+  // artifactAt predates apB.started_at → run-boundary guard fires
+  // FIRST, regardless of cycle_id. This is the fix for the "stale
+  // blob looks fresh" trap.
+  check("freshnessOf: artifactAt < started_at → stale_artifact", f === "stale_artifact");
 }
 
 // Stale (older artifact)
@@ -364,6 +360,97 @@ const apB = { started_at: "2026-05-03T01:00:00Z", cycle_count: 0 };
 {
   const f = freshnessOf({ artifactCycleId: 1, autopilot: null });
   check("freshnessOf: no autopilot → unknown/current_cycle treated", ["unknown", "current_cycle"].includes(f));
+}
+
+// ---------- 6b. classifyAccountabilityFreshness — active_cycle_index ----------
+//
+// active_cycle_index is the in-flight cycle number while running.
+// cycle_count only ticks AFTER a cycle finishes. So during cycle #5 the
+// heartbeat reports cycle_count=4 + active_cycle_index=5, and the
+// supervisor blob's cycle_id=5 must classify as fresh.
+{
+  const ap = {
+    status: "running", cycle_count: 4, active_cycle_index: 5,
+    started_at: "2026-05-03T01:00:00Z",
+  };
+  const aa = { cycle_id: 5, evaluated_at: "2026-05-03T02:00:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: running + active_index=5 + acc.cycle=5 → fresh", got === "fresh");
+}
+
+{
+  const ap = {
+    status: "running", cycle_count: 4, active_cycle_index: 5,
+    started_at: "2026-05-03T01:00:00Z",
+  };
+  const aa = { cycle_id: 4, evaluated_at: "2026-05-03T01:30:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: running + active_index=5 + acc.cycle=4 → stale", got === "stale");
+}
+
+{
+  // First cycle just spawned: cycle_count=0, active_cycle_index=1.
+  const ap = {
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    started_at: "2026-05-03T01:00:00Z",
+  };
+  const aa = { cycle_id: 1, evaluated_at: "2026-05-03T01:00:30Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: running + active_index=1 + acc.cycle=1 → fresh", got === "fresh");
+}
+
+{
+  // No active_cycle_index yet (mid-startup), acc claims cycle 1 → stale
+  // because the run-boundary timestamp guard pushes back on a blob
+  // dated before the new run.
+  const ap = {
+    status: "running", cycle_count: 0,
+    started_at: "2026-05-03T01:00:00Z",
+  };
+  const aa = { cycle_id: 1, evaluated_at: "2026-05-02T20:00:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: running + no active_index + older blob → stale", got === "stale");
+}
+
+{
+  // Stopped run that completed 5 cycles — acc.cycle_id=5 from the
+  // final cycle is fresh, not stale.
+  const ap = { status: "stopped", cycle_count: 5 };
+  const aa = { cycle_id: 5, evaluated_at: "2026-05-03T03:00:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: stopped + cycle_count=5 + acc.cycle=5 → fresh", got === "fresh");
+}
+
+{
+  // New run: started_at = now, supervisor blob evaluated_at predates it.
+  const ap = {
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    started_at: "2026-05-03T05:00:00Z",
+  };
+  const aa = { cycle_id: 1, evaluated_at: "2026-05-03T04:00:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: new run, blob predates started_at → stale", got === "stale");
+}
+
+{
+  // updated_at fallback when evaluated_at is absent.
+  const ap = {
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    started_at: "2026-05-03T01:00:00Z",
+  };
+  const aa = { cycle_id: 1, updated_at: "2026-05-03T01:30:00Z" };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("acc: updated_at fallback → fresh", got === "fresh");
+}
+
+// resolveCurrentCycleNumber sanity — the helper that drives the rule.
+{
+  check("rcn: running + active_index=5 + cycle_count=4 → 5",
+    resolveCurrentCycleNumber({ status: "running", active_cycle_index: 5, cycle_count: 4 }) === 5);
+  check("rcn: stopped + cycle_count=5 → 5",
+    resolveCurrentCycleNumber({ status: "stopped", cycle_count: 5 }) === 5);
+  check("rcn: running + no active_index + cycle_count=0 → 0",
+    resolveCurrentCycleNumber({ status: "running", cycle_count: 0 }) === 0);
 }
 
 // ---------- 7. Stuck-before-first-cycle diagnostic ----------
@@ -537,26 +624,23 @@ const apB = { started_at: "2026-05-03T01:00:00Z", cycle_count: 0 };
   check("E: cycle_running canRestart=true", got.canRestart === true);
 }
 
-// F. previous PASS/REWORK shouldn't drive current visual when fresh
-//    cycle_count=0 + autopilot active_cycle_index=1.
+// F. previous-run leftover blob: artifactAt predates current run's
+//    started_at — stale even when cycle ids would match.
 {
-  // freshnessOf for an artifact with cycle_id=0 (previous run leftover)
   const f = freshnessOf({
     artifactCycleId: 0,
     artifactAt: "2026-05-01T00:00:00Z",
     autopilot: {
       cycle_count: 0,
       active_cycle_index: 1,
+      status: "running",
       started_at: new Date().toISOString(),
     },
   });
-  // The freshnessOf rule compares cycle_id to apCycle (cycle_count).
-  // 0 == 0 so technically "current_cycle"; the AgentAccountability
-  // panel separately stale-gates this via its
-  // classifyAccountabilityFreshness rule (running + cycle_count=0 +
-  // acc.cycle_id>=1 → stale). For freshnessOf alone, equal-numbers =
-  // current_cycle is acceptable here.
-  check("F: freshnessOf cycle 0/0 → current_cycle", f === "current_cycle");
+  // The run-boundary guard fires first: artifactAt < started_at →
+  // stale_artifact. This is the fix for the "stale blob looks fresh
+  // because cycle ids coincide" trap.
+  check("F: freshnessOf older artifact → stale_artifact", f === "stale_artifact");
 }
 
 // G. factory_smoke started_at without ended_at also keeps stuck=false
