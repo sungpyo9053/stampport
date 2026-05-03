@@ -239,6 +239,18 @@ class SmokeRun:
     scope_mismatch_reason: str | None = None
     scope_consistency_keywords_matched: list[str] = field(default_factory=list)
     scope_consistency_keywords_total: int = 0
+    # Apply revalidation failure mirror — set when claude_apply was
+    # rolled back because _revalidate_after_apply failed (typically
+    # build_app). Without these the smoke report would render
+    # claude_apply as passed/0.0s and hide the real failure.
+    apply_revalidation_failed: bool = False
+    apply_revalidation_target: str | None = None
+    claude_apply_status: str | None = None
+    claude_apply_message: str | None = None
+    claude_apply_rollback: bool | None = None
+    claude_apply_diff_path: str | None = None
+    app_build_after_apply_log_path: str | None = None
+    implementation_ticket_target_files: list[str] = field(default_factory=list)
     # Stale design_spec gate — set when cycle.py decided the on-disk
     # design_spec belongs to a different cycle/feature than the current
     # one. Surfaced in the smoke report so the operator can tell at a
@@ -478,6 +490,33 @@ HOLD_FACTORY_STATUSES: frozenset[str] = frozenset({
 })
 
 
+def _is_apply_revalidation_failure(state: dict) -> tuple[bool, str | None]:
+    """Detect the 'claude_apply applied → revalidation rejected → rolled
+    back' shape from factory_state.
+
+    Returns (matched, target). target is the failed revalidation check
+    name extracted from failed_reason (e.g. "build_app"). When the
+    failure clearly came from build_app, this lets the smoke runner
+    classify the cycle as build_app_after_apply_failed instead of
+    cycle_subprocess_failed.
+    """
+    failed_stage = (state.get("failed_stage") or "").strip()
+    apply_status = (state.get("claude_apply_status") or "").strip()
+    failed_reason = state.get("failed_reason") or ""
+    apply_msg = state.get("claude_apply_message") or ""
+    if failed_stage != "claude_apply" or apply_status != "rolled_back":
+        return False, None
+    blob = f"{failed_reason} {apply_msg}"
+    if "build_app" in blob:
+        return True, "build_app"
+    if "재검증" in blob or "revalidation" in blob.lower():
+        # Generic revalidation failure (syntax_check_py / risky_files /
+        # build_control / syntax_check_sh) — still an apply revalidation,
+        # just not specifically build_app.
+        return True, None
+    return False, None
+
+
 def resolve_verdict(state: dict, *, exit_code: int | None = None) -> tuple[str, str | None, str | None]:
     """Map factory_state.json + supplemental signals to a smoke verdict.
 
@@ -523,6 +562,20 @@ def resolve_verdict(state: dict, *, exit_code: int | None = None) -> tuple[str, 
         if "scope_mismatch" in reason or "스코프 일관성" in reason:
             return ("FAIL", "scope_mismatch",
                     state.get("failed_reason") or reason)
+        # claude_apply revalidation rollback (typically build_app failing
+        # immediately after Claude wrote a patch) — surface as a precise
+        # code so the repair prompt can target the actual app build
+        # instead of asking to fix factory_smoke.py / factory_observer.py.
+        is_apply_reval, reval_target = _is_apply_revalidation_failure(state)
+        if is_apply_reval:
+            code = (
+                "build_app_after_apply_failed"
+                if reval_target == "build_app"
+                else "claude_apply_revalidation_failed"
+            )
+            return ("FAIL", code,
+                    state.get("failed_reason")
+                    or "claude_apply 재검증 실패 — 롤백")
         return ("FAIL", "cycle_subprocess_failed",
                 f"cycle exited {exit_code}, factory_state.status=failed")
 
@@ -570,6 +623,14 @@ def resolve_verdict(state: dict, *, exit_code: int | None = None) -> tuple[str, 
         low = reason.lower() if isinstance(reason, str) else ""
         if "scope_mismatch" in low or "스코프 일관성" in low:
             return ("FAIL", "scope_mismatch", reason)
+        is_apply_reval, reval_target = _is_apply_revalidation_failure(state)
+        if is_apply_reval:
+            code = (
+                "build_app_after_apply_failed"
+                if reval_target == "build_app"
+                else "claude_apply_revalidation_failed"
+            )
+            return ("FAIL", code, reason)
         return ("FAIL", "cycle_failed", reason)
 
     if fs_status == "running":
@@ -952,12 +1013,73 @@ def _finalize_run(
     if svg_valid is not None:
         run.design_spec_svg_path_valid = bool(svg_valid)
 
+    # Apply revalidation failure mirror — pulled from factory_state so
+    # the smoke report doesn't have to re-derive it.
+    run.claude_apply_status = factory_state.get("claude_apply_status")
+    run.claude_apply_message = factory_state.get("claude_apply_message")
+    if factory_state.get("claude_apply_rollback") is not None:
+        run.claude_apply_rollback = bool(
+            factory_state.get("claude_apply_rollback")
+        )
+    run.claude_apply_diff_path = factory_state.get("claude_apply_diff_path")
+    is_apply_reval, reval_target = _is_apply_revalidation_failure(factory_state)
+    run.apply_revalidation_failed = is_apply_reval
+    run.apply_revalidation_target = reval_target
+    # When a build_app log was captured by cycle._revalidate_after_apply,
+    # surface its path so the operator (and the repair prompt) can read
+    # the actual vite/webpack error, not just the "build_app" label.
+    build_log = _runtime_dir() / "app_build_after_apply.log"
+    if build_log.is_file():
+        run.app_build_after_apply_log_path = str(build_log)
+    impl_targets = factory_state.get("implementation_ticket_target_files") or []
+    if isinstance(impl_targets, list):
+        run.implementation_ticket_target_files = [str(p) for p in impl_targets]
+
+    # When factory_state says claude_apply was rolled back, the per-stage
+    # observation we captured during polling will still read "passed" /
+    # "running" because the cycle subprocess closed cleanly from the
+    # smoke runner's perspective. Override that stage row with the
+    # ground truth from factory_state so the Stage table doesn't lie.
+    if (
+        (factory_state.get("failed_stage") or "") == "claude_apply"
+        and (factory_state.get("claude_apply_status") or "") == "rolled_back"
+    ):
+        for obs in run.stages:
+            if obs.name == "claude_apply":
+                obs.status = "failed"
+                obs.message = (
+                    factory_state.get("claude_apply_message")
+                    or factory_state.get("failed_reason")
+                    or "claude_apply rolled back after revalidation failure"
+                )
+
     # last successful stage / failed stage
     for obs in run.stages:
         if obs.status == "passed":
             run.last_successful_stage = obs.name
         if obs.status in {"failed", "timeout"} and not run.failed_stage:
             run.failed_stage = obs.name
+
+    # Authoritative override: if factory_state declares a failed_stage
+    # but the per-stage observations didn't catch it (e.g. claude_apply
+    # rollback), trust factory_state. Likewise scrub a stale
+    # last_successful_stage that points at the failed stage.
+    fs_failed_stage = (factory_state.get("failed_stage") or "").strip()
+    if fs_failed_stage and not run.failed_stage:
+        run.failed_stage = fs_failed_stage
+    if (
+        fs_failed_stage
+        and run.last_successful_stage == fs_failed_stage
+    ):
+        # Find the stage immediately before the failed one in the
+        # observed stages list and use that as the real last-successful.
+        prior: str | None = None
+        for obs in run.stages:
+            if obs.name == fs_failed_stage:
+                break
+            if obs.status == "passed":
+                prior = obs.name
+        run.last_successful_stage = prior
 
     write_outputs(run, factory_state, observer_classification)
     return run
@@ -1039,6 +1161,15 @@ def _serialize_run(run: SmokeRun) -> dict:
             run.scope_consistency_keywords_matched
         ),
         "scope_consistency_keywords_total": run.scope_consistency_keywords_total,
+        "apply_revalidation_failed": run.apply_revalidation_failed,
+        "apply_revalidation_target": run.apply_revalidation_target,
+        "claude_apply_status": run.claude_apply_status,
+        "claude_apply_message": run.claude_apply_message,
+        "claude_apply_rollback": run.claude_apply_rollback,
+        "claude_apply_diff_path": run.claude_apply_diff_path,
+        "app_build_after_apply_log_path": run.app_build_after_apply_log_path,
+        "implementation_ticket_target_files":
+            list(run.implementation_ticket_target_files),
         "stale_design_spec_detected": run.stale_design_spec_detected,
         "stale_design_spec_feature": run.stale_design_spec_feature,
         "stale_design_spec_cycle_id": run.stale_design_spec_cycle_id,
@@ -1103,6 +1234,7 @@ def _build_report(
     lines.extend(_build_design_spec_section(run))
     lines.extend(_build_stale_design_spec_section(run))
     lines.extend(_build_scope_consistency_section(run))
+    lines.extend(_build_apply_revalidation_section(run))
     lines.extend(_build_planning_timeout_section(run))
     lines.extend(_build_stale_artifact_section(run))
 
@@ -1326,6 +1458,53 @@ def _build_scope_consistency_section(run: SmokeRun) -> list[str]:
     return out
 
 
+def _build_apply_revalidation_section(run: SmokeRun) -> list[str]:
+    """Render the 'Apply revalidation failure' block whenever
+    claude_apply was rolled back because the post-apply revalidation
+    rejected the patch.
+
+    Without this section the operator only saw `claude_apply | passed |
+    0.0s` in the Stage table — which is wrong on its face: the cycle
+    *did* fail and the diff was rolled back. We surface the failed
+    stage, the original failure reason, the rollback message, the
+    revalidation target (typically build_app), and links to the build
+    log + the rolled-back diff so the next cycle's Claude has actual
+    evidence to repair against.
+    """
+    if not run.apply_revalidation_failed and run.claude_apply_status != "rolled_back":
+        return []
+    out = ["", "## Apply revalidation failure"]
+    out.append(f"- failed_stage: `{run.failed_stage or 'claude_apply'}`")
+    out.append(
+        f"- failed_reason: {run.failure_reason or run.claude_apply_message or '—'}"
+    )
+    out.append(
+        f"- claude_apply_status: `{run.claude_apply_status or '—'}`"
+    )
+    out.append(
+        f"- claude_apply_message: {run.claude_apply_message or '—'}"
+    )
+    rb = run.claude_apply_rollback
+    out.append(
+        f"- rollback executed: `{'yes' if rb else ('no' if rb is False else '—')}`"
+    )
+    out.append(
+        f"- revalidation target: `{run.apply_revalidation_target or '—'}`"
+    )
+    out.append(
+        f"- build log: `{run.app_build_after_apply_log_path or '.runtime/app_build_after_apply.log (없음)'}`"
+    )
+    out.append(
+        f"- failed apply diff: `{run.claude_apply_diff_path or '.runtime/claude_apply_rolled_back.diff (없음)'}`"
+    )
+    if run.implementation_ticket_target_files:
+        out.append("")
+        out.append("### implementation_ticket target_files")
+        for p in run.implementation_ticket_target_files[:20]:
+            out.append(f"- `{p}`")
+    return out
+
+
 def _build_stale_design_spec_section(run: SmokeRun) -> list[str]:
     """Render the Stale design_spec block when cycle.py decided the
     on-disk spec belongs to a previous cycle/feature.
@@ -1461,6 +1640,30 @@ def _recommend_next(run: SmokeRun) -> list[str]:
             "- 다음 사이클은 design_spec.md 를 단일 source of truth 로 다시 적용하세요. "
             "claude_proposal.md 가 남아 있다면 stale 로 분류되어 사용되지 않아야 합니다.",
         ]
+    if run.failure_code in {
+        "build_app_after_apply_failed",
+        "claude_apply_revalidation_failed",
+    }:
+        out = [
+            "- claude_apply 가 적용한 패치가 _revalidate_after_apply 의 "
+            f"`{run.apply_revalidation_target or '재검증'}` 단계를 통과하지 못해 롤백되었습니다.",
+            "- `.runtime/factory_smoke_report.md` 의 Apply revalidation failure 섹션 확인.",
+        ]
+        if run.app_build_after_apply_log_path:
+            out.append(
+                f"- 빌드 실패 로그: `{run.app_build_after_apply_log_path}` "
+                "— 실제 vite/webpack 오류를 여기서 확인."
+            )
+        if run.claude_apply_diff_path:
+            out.append(
+                f"- 롤백 직전 diff: `{run.claude_apply_diff_path}` "
+                "— 어떤 변경이 빌드를 깼는지 추적."
+            )
+        out.append(
+            "- 다음 사이클은 위 빌드 로그와 diff 를 입력 삼아 app/web 의 실제 "
+            "코드 변경을 수정해야 합니다 (control_tower 자체 수정 아님)."
+        )
+        return out
     return [
         "- `.runtime/factory_failure_report.md` 와 `.runtime/claude_repair_prompt.md` 확인.",
         "- Observer 가 진단한 코드: `{}`".format(run.failure_code or "—"),
@@ -1495,6 +1698,14 @@ def _build_failure_report(
         for e in (classification.get("evidence") or [])[:12]:
             lines.append(f"- {e}")
         lines.append("")
+    # Surface the apply-revalidation-failure forensic block here too —
+    # the failure report is what an operator opens first when verdict
+    # is FAIL, and the smoke report's section may not be visible
+    # depending on how the operator triages the run.
+    apply_block = _build_apply_revalidation_section(run)
+    if apply_block:
+        lines.extend(apply_block)
+        lines.append("")
     lines += [
         "## Stage table",
         "| Stage | Status | Duration (s) | Budget (s) |",
@@ -1515,6 +1726,17 @@ def _build_repair_prompt(
     code = run.failure_code or (
         (classification or {}).get("diagnostic_code") or "unknown"
     )
+    # Special-case: build_app_after_apply_failed / claude_apply_
+    # revalidation_failed must point Claude at the actual app code that
+    # broke the build (typically files under app/web/src/...), NOT at
+    # control_tower/local_runner/factory_smoke.py. The historical default
+    # asked Claude to rewrite the smoke runner, which is the wrong layer.
+    if code in {
+        "build_app_after_apply_failed",
+        "claude_apply_revalidation_failed",
+    }:
+        return _build_apply_revalidation_repair_prompt(run, code)
+
     targets = _observer.REPAIR_TARGETS_BY_CODE.get(code) or [
         "control_tower/local_runner/factory_smoke.py",
         "control_tower/local_runner/factory_observer.py",
@@ -1555,6 +1777,97 @@ def _build_repair_prompt(
     lines.append(f"- last_successful_stage: `{run.last_successful_stage or '—'}`")
     lines.append(f"- failed_stage: `{run.failed_stage or '—'}`")
     lines.append(f"- factory_state.status: `{run.factory_status}`")
+    return "\n".join(lines) + "\n"
+
+
+def _build_apply_revalidation_repair_prompt(
+    run: SmokeRun,
+    code: str,
+) -> str:
+    """Build a repair prompt aimed at the actual app/web code that
+    broke the post-apply revalidation. NOT a request to modify
+    control_tower itself.
+
+    Inputs Claude should read:
+      - .runtime/app_build_after_apply.log  (real vite/webpack error)
+      - .runtime/claude_apply_rolled_back.diff  (the diff that broke it)
+      - .runtime/implementation_ticket.md  (intended target files)
+      - the app/web/src/... files listed in implementation_ticket
+    """
+    target = run.apply_revalidation_target or "build_app"
+    build_log = run.app_build_after_apply_log_path or (
+        ".runtime/app_build_after_apply.log (캡쳐된 로그 없음)"
+    )
+    diff_path = run.claude_apply_diff_path or (
+        ".runtime/claude_apply_rolled_back.diff (보존된 diff 없음)"
+    )
+    ticket_path = ".runtime/implementation_ticket.md"
+    target_files = run.implementation_ticket_target_files or []
+
+    lines = [
+        "# Stampport Factory Smoke — Claude Repair Prompt",
+        "",
+        f"Smoke verdict: **{run.verdict}** · failure_code: `{code}`",
+        "",
+        "## 문제 (factory_smoke 에서 자동 분류)",
+        (
+            f"claude_apply 가 적용한 패치가 _revalidate_after_apply 의 "
+            f"`{target}` 단계에서 거부되어 즉시 롤백되었습니다. "
+            f"실패 메시지: {run.claude_apply_message or run.failure_reason or '—'}"
+        ),
+        "",
+        "## 분류 (중요)",
+        (
+            "이 실패는 control_tower/local_runner 자체의 버그가 아니라 "
+            "Stampport 앱 코드 (app/web/src/...) 의 빌드 실패입니다. "
+            "control_tower/local_runner 디렉터리는 절대 수정하지 마세요. "
+            "수정 대상은 아래 'app 코드 수정 대상' 의 파일입니다."
+        ),
+        "",
+        "## Claude 가 먼저 읽어야 할 파일",
+        f"- `{build_log}` — 실제 vite/webpack 오류 (스택트레이스 포함)",
+        f"- `{diff_path}` — 롤백되기 직전 적용된 패치",
+        f"- `{ticket_path}` — 이번 사이클에서 변경하려던 의도",
+        "",
+        "## app 코드 수정 대상",
+    ]
+    if target_files:
+        for p in target_files:
+            lines.append(f"- `{p}`")
+    else:
+        lines.append(
+            "- (implementation_ticket 에 target_files 가 비어 있음 — "
+            "ticket 본문을 직접 읽고 추출하세요)"
+        )
+    lines += [
+        "",
+        "## 요구 사항",
+        (
+            f"1. `{build_log}` 의 마지막 오류 메시지를 읽고 어떤 모듈 / 심볼 / "
+            "import 가 빌드를 깨뜨렸는지 식별.\n"
+            f"2. `{diff_path}` 를 보고 직전 사이클의 Claude 변경이 위 오류와 "
+            "어떻게 연결되는지 (실제 파일/라인) 확인.\n"
+            "3. 위 'app 코드 수정 대상' 파일 안에서만 수정 — control_tower / "
+            ".github / scripts 는 건드리지 않음.\n"
+            "4. 변경 후 `cd app/web && npm run build` 가 로컬에서 성공하는지 검증.\n"
+            "5. design_spec / implementation_ticket 의 요구 사항 (titleLabel, "
+            "SVG path, 카드 레이아웃 등) 을 그대로 만족시켜야 함 — scope 변경 금지."
+        ),
+        "",
+        "## 검증",
+        "1. `cd app/web && npm run build` 가 0 exit 로 끝나야 함.",
+        "2. `python3 -m control_tower.local_runner.factory_smoke --self-test` 통과.",
+        f"3. `python3 -m control_tower.local_runner.factory_smoke --mode {run.mode} "
+        f"--timeout {run.timeout_sec or 1800}` 재실행 시 같은 패턴 미재현.",
+        "",
+        "## 컨텍스트",
+        f"- last_successful_stage: `{run.last_successful_stage or '—'}`",
+        f"- failed_stage: `{run.failed_stage or 'claude_apply'}`",
+        f"- factory_state.status: `{run.factory_status}`",
+        f"- claude_apply_status: `{run.claude_apply_status or '—'}`",
+        f"- claude_apply_message: {run.claude_apply_message or '—'}",
+        f"- revalidation target: `{target}`",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -3936,6 +4249,271 @@ def self_test() -> tuple[int, int, list[str]]:
                 f"F: legacy scope_mismatch self-test broken — "
                 f"passed={passed_scope} reason={reason_scope}"
             )
+
+    # ----------------------------------------------------------------
+    # 31. claude_apply revalidation rollback diagnostics — fixtures.
+    # ----------------------------------------------------------------
+
+    # 31A. resolve_verdict must classify the documented build_app
+    # revalidation rollback as FAIL/build_app_after_apply_failed, not
+    # the generic cycle_subprocess_failed.
+    total += 1
+    apply_revalidation_state = {
+        "status": "failed",
+        "cycle": 1,
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+        "claude_apply_status": "rolled_back",
+        "claude_apply_message": "재검증 실패 (build_app) — 롤백",
+        "claude_apply_changed_files": [],
+        "claude_apply_rollback": True,
+        "failed_stage": "claude_apply",
+        "failed_reason": "재검증 실패 (build_app) — 롤백",
+    }
+    v_31a, c_31a, _r_31a = resolve_verdict(apply_revalidation_state, exit_code=1)
+    if v_31a == "FAIL" and c_31a == "build_app_after_apply_failed":
+        passed += 1
+    else:
+        failures.append(
+            f"31A: build_app revalidation rollback should resolve "
+            f"FAIL/build_app_after_apply_failed — got {v_31a}/{c_31a}"
+        )
+
+    # 31B. Generic revalidation rollback (no build_app keyword) maps to
+    # claude_apply_revalidation_failed.
+    total += 1
+    apply_revalidation_generic = {
+        "status": "failed",
+        "cycle": 1,
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+        "claude_apply_status": "rolled_back",
+        "claude_apply_message": "재검증 실패 (syntax_check_py) — 롤백",
+        "claude_apply_rollback": True,
+        "failed_stage": "claude_apply",
+        "failed_reason": "재검증 실패 (syntax_check_py) — 롤백",
+    }
+    v_31b, c_31b, _r_31b = resolve_verdict(
+        apply_revalidation_generic, exit_code=1,
+    )
+    if v_31b == "FAIL" and c_31b == "claude_apply_revalidation_failed":
+        passed += 1
+    else:
+        failures.append(
+            f"31B: generic revalidation rollback should resolve "
+            f"FAIL/claude_apply_revalidation_failed — got {v_31b}/{c_31b}"
+        )
+
+    # 31C. Even if exit_code is 0 (cycle subprocess somehow exited
+    # cleanly while marking the run failed), the same shape must still
+    # surface as FAIL/build_app_after_apply_failed — verdict is driven
+    # by factory_state, not by the cycle's exit code alone.
+    total += 1
+    v_31c, c_31c, _r_31c = resolve_verdict(
+        apply_revalidation_state, exit_code=0,
+    )
+    if v_31c == "FAIL" and c_31c == "build_app_after_apply_failed":
+        passed += 1
+    else:
+        failures.append(
+            f"31C: build_app rollback with exit=0 should still resolve "
+            f"FAIL/build_app_after_apply_failed — got {v_31c}/{c_31c}"
+        )
+
+    # 31D. End-to-end report rendering: smoke report and failure report
+    # must show claude_apply as failed (not passed/0.0s), set
+    # Failed/blocked stage to claude_apply, and include the new
+    # 'Apply revalidation failure' section. The repair prompt must
+    # target app code, not control_tower.
+    total += 1
+    repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCAL_RUNNER_REPO"] = tmp
+        try:
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            # Pre-create the build log so the smoke runner can link to it.
+            (runtime / "app_build_after_apply.log").write_text(
+                "vite v8.0.10 building...\n"
+                "ERROR: Failed to resolve import \"./TitleSeal\" from "
+                "\"src/screens/Badges.jsx\". Does the file exist?\n",
+                encoding="utf-8",
+            )
+            (runtime / "claude_apply_rolled_back.diff").write_text(
+                "diff --git a/app/web/src/screens/Badges.jsx ...\n",
+                encoding="utf-8",
+            )
+
+            run = SmokeRun(mode="local-cycle", timeout_sec=1800)
+            run.started_at = _utc_now_iso()
+            run.finished_at = _utc_now_iso()
+            run.cycle_subprocess_exit = 1
+            # Stage observations as captured during a real polling pass —
+            # claude_apply will look "passed/0.0s" before the override
+            # runs, exactly like the bug we are fixing.
+            run.stages = [
+                StageObservation(
+                    name="build_app", status="passed",
+                    duration_sec=2.0, timeout_sec=180,
+                ),
+                StageObservation(
+                    name="claude_apply", status="passed",
+                    duration_sec=0.0, timeout_sec=600,
+                ),
+            ]
+            fs = {
+                "status": "failed",
+                "cycle": 1,
+                "qa_status": "passed",
+                "implementation_ticket_status": "generated",
+                "implementation_ticket_target_files": [
+                    "app/web/src/components/TitleSeal.jsx",
+                    "app/web/src/screens/Badges.jsx",
+                ],
+                "claude_apply_status": "rolled_back",
+                "claude_apply_message": "재검증 실패 (build_app) — 롤백",
+                "claude_apply_rollback": True,
+                "claude_apply_changed_files": [],
+                "claude_apply_diff_path": str(
+                    runtime / "claude_apply_rolled_back.diff"
+                ),
+                "failed_stage": "claude_apply",
+                "failed_reason": "재검증 실패 (build_app) — 롤백",
+            }
+            verdict_31d, code_31d, reason_31d = resolve_verdict(
+                fs, exit_code=1,
+            )
+            run.verdict = verdict_31d
+            run.failure_code = code_31d
+            run.failure_reason = reason_31d
+            _finalize_run(
+                run, factory_state=fs, observer_classification=None,
+            )
+
+            smoke_report = (runtime / "factory_smoke_report.md").read_text(
+                encoding="utf-8"
+            )
+            failure_report = (
+                runtime / "factory_failure_report.md"
+            ).read_text(encoding="utf-8")
+            repair_prompt = (
+                runtime / "claude_repair_prompt.md"
+            ).read_text(encoding="utf-8")
+
+            # Override on the in-memory stages must mark claude_apply failed.
+            stage_row_ok = any(
+                obs.name == "claude_apply" and obs.status == "failed"
+                for obs in run.stages
+            )
+
+            ok = (
+                "build_app_after_apply_failed" in smoke_report
+                and "## Apply revalidation failure" in smoke_report
+                and "claude_apply_rolled_back.diff" in smoke_report
+                and "app_build_after_apply.log" in smoke_report
+                and "Failed / blocked stage" in smoke_report
+                and "`claude_apply`" in smoke_report
+                and "| `claude_apply` | failed |" in smoke_report
+                # Failure report
+                and "## Apply revalidation failure" in failure_report
+                and "build_app_after_apply_failed" in failure_report
+                # Repair prompt: app code, NOT control_tower
+                and "app/web/src/screens/Badges.jsx" in repair_prompt
+                and "factory_smoke.py" not in repair_prompt
+                and "factory_observer.py" not in repair_prompt
+                and "app_build_after_apply.log" in repair_prompt
+                and "claude_apply_rolled_back.diff" in repair_prompt
+                # SmokeRun mirror
+                and run.failure_code == "build_app_after_apply_failed"
+                and run.failed_stage == "claude_apply"
+                and run.apply_revalidation_failed is True
+                and run.apply_revalidation_target == "build_app"
+                and stage_row_ok
+            )
+            if ok:
+                passed += 1
+            else:
+                # Fail with enough context for the operator to see what's missing.
+                hint_bits = [
+                    f"verdict={run.verdict}/{run.failure_code}",
+                    f"failed_stage={run.failed_stage!r}",
+                    f"apply_revalidation_failed={run.apply_revalidation_failed}",
+                    f"smoke_section_present={'## Apply revalidation failure' in smoke_report}",
+                    f"failure_section_present={'## Apply revalidation failure' in failure_report}",
+                    f"repair_targets_app="
+                    f"{'app/web/src/screens/Badges.jsx' in repair_prompt}",
+                    f"repair_avoids_control_tower="
+                    f"{'factory_smoke.py' not in repair_prompt and 'factory_observer.py' not in repair_prompt}",
+                    f"stage_row_failed={stage_row_ok}",
+                ]
+                failures.append(
+                    "31D: apply revalidation reporting incomplete — "
+                    + "; ".join(hint_bits)
+                )
+        finally:
+            if repo_prev is not None:
+                os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+            else:
+                os.environ.pop("LOCAL_RUNNER_REPO", None)
+
+    # 31E. Observer must classify the same fixture as
+    # build_app_after_apply_failed and recommend app code (not
+    # control_tower) for repair.
+    total += 1
+    obs_state = _observer._empty_state()
+    obs_state["control_state"] = {"liveness": {"runner_online": True}}
+    obs_state["factory_state"] = {
+        "status": "failed",
+        "cycle": 1,
+        "qa_status": "passed",
+        "implementation_ticket_status": "generated",
+        "implementation_ticket_target_files": [
+            "app/web/src/components/TitleSeal.jsx",
+        ],
+        "claude_apply_status": "rolled_back",
+        "claude_apply_message": "재검증 실패 (build_app) — 롤백",
+        "claude_apply_rollback": True,
+        "failed_stage": "claude_apply",
+        "failed_reason": "재검증 실패 (build_app) — 롤백",
+    }
+    obs_class_31e = _observer.classify(
+        obs_state,
+        runner_processes=["fake python -m control_tower.local_runner.runner"],
+        caffeinate_processes=[],
+    )
+    if (
+        obs_class_31e["diagnostic_code"] == "build_app_after_apply_failed"
+        and obs_class_31e["is_failure"] is True
+        and obs_class_31e["category"] == "failure"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"31E: observer should classify build_app rollback — got "
+            f"{obs_class_31e['diagnostic_code']}/{obs_class_31e['is_failure']}"
+        )
+
+    # 31F. The autopilot self-test still passes through this code path:
+    # last_failure_code mirrors smoke.failure_code, so feeding the new
+    # code through _classify_failure must not crash and must propagate
+    # the code unchanged (autopilot's heuristic returns it as-is unless
+    # it's smoke_timeout / scope_mismatch).
+    total += 1
+    try:
+        from . import autopilot as _autopilot
+        ap_class = _autopilot._classify_failure(
+            "FAIL",
+            {"failure_code": "build_app_after_apply_failed"},
+        )
+        if ap_class == "build_app_after_apply_failed":
+            passed += 1
+        else:
+            failures.append(
+                f"31F: autopilot _classify_failure should propagate "
+                f"build_app_after_apply_failed — got {ap_class!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"31F: autopilot import / classify failed: {exc}")
 
     return passed, total, failures
 

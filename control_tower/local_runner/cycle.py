@@ -45,6 +45,15 @@ GOAL_FILE = RUNTIME / "factory_goal.txt"
 PAUSE_FILE = RUNTIME / "factory.paused"
 PROPOSAL_FILE = RUNTIME / "claude_proposal.md"
 APPLY_DIFF_FILE = RUNTIME / "claude_apply.diff"
+# Forensic artifacts for claude_apply revalidation rollback. When the
+# post-apply build/syntax/risky scan fails, we save:
+#   - the diff that was about to be rolled back, so the operator (or
+#     the next cycle's repair prompt) can see exactly which patch
+#     broke the build, and
+#   - the build_app stdout/stderr that triggered the rejection.
+# Both files are pure forensics — they are never re-applied automatically.
+APPLY_ROLLED_BACK_DIFF_FILE = RUNTIME / "claude_apply_rolled_back.diff"
+APP_BUILD_AFTER_APPLY_LOG = RUNTIME / "app_build_after_apply.log"
 # Product Planner v2 — replaces the older Product Discovery Mode
 # (.runtime/product_discovery.md). The new file enforces a richer
 # template (LLM need, data storage, MVP scope, success criteria) and
@@ -5706,16 +5715,43 @@ def _rollback_apply(
 def _revalidate_after_apply() -> tuple[bool, list[str]]:
     """Re-run the same correctness gates as the main cycle, but compact:
     we only care PASS/FAIL, not per-stage metrics. Returns
-    (all_passed, list_of_failed_check_names)."""
+    (all_passed, list_of_failed_check_names).
+
+    Side effect: when build_app fails, the captured stdout+stderr is
+    written to .runtime/app_build_after_apply.log so the smoke runner /
+    repair prompt can show the operator the actual vite/webpack error
+    instead of just "build_app". When the build passes (or no npm),
+    any stale log from a previous cycle is cleared so we never serve a
+    log that doesn't match the current rolled-back diff.
+    """
     failures: list[str] = []
     npm = shutil.which("npm")
 
     # 1. app/web build
     web = REPO_ROOT / "app" / "web"
     if web.is_dir() and npm:
-        ok, _ = _run([npm, "run", "build"], cwd=web, timeout=300, env_override={"CI": "1"})
+        ok, build_out = _run(
+            [npm, "run", "build"], cwd=web, timeout=300,
+            env_override={"CI": "1"},
+        )
         if not ok:
             failures.append("build_app")
+            try:
+                APP_BUILD_AFTER_APPLY_LOG.parent.mkdir(parents=True, exist_ok=True)
+                APP_BUILD_AFTER_APPLY_LOG.write_text(
+                    build_out or "(no output captured)",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        else:
+            # Drop the stale log so a downstream consumer never confuses
+            # last cycle's failure with this cycle's success.
+            try:
+                if APP_BUILD_AFTER_APPLY_LOG.is_file():
+                    APP_BUILD_AFTER_APPLY_LOG.unlink()
+            except OSError:
+                pass
 
     # 2. control_tower/web build
     cweb = REPO_ROOT / "control_tower" / "web"
@@ -6122,6 +6158,26 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     )
     revalidate_ok, failures = _revalidate_after_apply()
     if not revalidate_ok:
+        # Snapshot the diff that's about to vanish — without this, the
+        # operator (and the next cycle's repair prompt) has no record of
+        # which patch broke the build_app revalidation.
+        diff_files_pre_rb = changed_tracked + new_untracked
+        try:
+            ok_diff, diff_pre_rb = _run(
+                ["git", "-C", str(REPO_ROOT), "diff", "HEAD", "--",
+                 *diff_files_pre_rb],
+                timeout=60,
+            )
+            if ok_diff:
+                APPLY_ROLLED_BACK_DIFF_FILE.parent.mkdir(
+                    parents=True, exist_ok=True,
+                )
+                APPLY_ROLLED_BACK_DIFF_FILE.write_text(
+                    diff_pre_rb or "(empty diff)", encoding="utf-8",
+                )
+        except OSError:
+            pass
+
         ok_rb, rb_msg = _rollback_apply(changed_tracked, new_untracked)
         sr.status = "failed"
         sr.message = (
@@ -6133,6 +6189,10 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         state.claude_apply_rollback = True
         state.claude_apply_changed_files = []
         state.claude_apply_message = sr.message
+        # Surface the rolled-back diff path so factory_smoke / observer
+        # can link to the forensic artifact in their reports.
+        if APPLY_ROLLED_BACK_DIFF_FILE.is_file():
+            state.claude_apply_diff_path = str(APPLY_ROLLED_BACK_DIFF_FILE)
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
 

@@ -125,6 +125,14 @@ DIAGNOSTIC_CODES: tuple[str, ...] = (
     "smoke_timeout",
     "smoke_passed",
     "smoke_failed",
+    # 2026-05-03: claude_apply revalidation rollback diagnostics. Without
+    # these the observer fell through to "unknown" whenever cycle.py
+    # rolled back a Claude patch because the post-apply build failed —
+    # which made the repair prompt ask Claude to modify control_tower
+    # instead of the actual app code that broke the build.
+    "build_app_after_apply_failed",
+    "claude_apply_revalidation_failed",
+    "scope_mismatch",
     "unknown",
 )
 
@@ -1052,10 +1060,64 @@ def classify(
             "is_failure": True,
         }
 
-    # 7. claude_apply_failed_no_code_change — apply 했는데 0 파일.
+    # 6.5. build_app_after_apply_failed / claude_apply_revalidation_failed
+    # — Claude wrote a patch, _revalidate_after_apply rejected it
+    # (typically because `npm run build` in app/web failed), and cycle.py
+    # rolled the patch back. Without this case we used to fall through
+    # to "unknown" and ask Claude to modify factory_smoke.py / observer
+    # — wrong layer.
     apply_status = _str(fs.get("claude_apply_status"))
     apply_changed = list(fs.get("claude_apply_changed_files") or [])
     ticket_status = _str(fs.get("implementation_ticket_status"))
+    failed_stage = _str(fs.get("failed_stage"))
+    failed_reason_text = _str(fs.get("failed_reason"))
+    apply_message_text = _str(fs.get("claude_apply_message"))
+    if (
+        failed_stage == "claude_apply"
+        and apply_status == "rolled_back"
+    ):
+        revalidation_blob = f"{failed_reason_text} {apply_message_text}"
+        is_build_app = "build_app" in revalidation_blob
+        if (
+            is_build_app
+            or "재검증" in revalidation_blob
+            or "revalidation" in revalidation_blob.lower()
+        ):
+            code = (
+                "build_app_after_apply_failed"
+                if is_build_app
+                else "claude_apply_revalidation_failed"
+            )
+            target_files = list(
+                fs.get("implementation_ticket_target_files") or []
+            )
+            evidence = [
+                f"factory_state.failed_stage={failed_stage}",
+                f"claude_apply_status={apply_status}",
+                f"claude_apply_message={apply_message_text or '—'}",
+                f"failed_reason={failed_reason_text or '—'}",
+                f"implementation_ticket_status={ticket_status or '—'}",
+                f"implementation_ticket_target_files_count={len(target_files)}",
+            ]
+            return {
+                "diagnostic_code": code,
+                "severity": "error",
+                "category": "failure",
+                "root_cause": (
+                    "claude_apply 가 적용한 패치가 _revalidate_after_apply "
+                    f"의 `{'build_app' if is_build_app else '재검증'}` 단계를 "
+                    "통과하지 못해 즉시 롤백되었습니다. control_tower 자체의 "
+                    "버그가 아니라 Stampport 앱 코드 (app/web/src/...) 의 "
+                    "빌드 실패입니다 — repair 대상은 factory_smoke / "
+                    "factory_observer 가 아니라 implementation_ticket "
+                    "target_files 의 실제 소스 코드입니다."
+                ),
+                "evidence": evidence,
+                "auto_fix_possible": False,
+                "is_failure": True,
+            }
+
+    # 7. claude_apply_failed_no_code_change — apply 했는데 0 파일.
     if (
         apply_status in {"applied", "no_changes"}
         and len(apply_changed) == 0
@@ -1395,6 +1457,17 @@ MANUAL_COMMANDS_BY_CODE: dict[str, list[str]] = {
         "git diff --stat",
         "cat .runtime/qa_report.md | head -40",
     ],
+    "build_app_after_apply_failed": [
+        "cat .runtime/app_build_after_apply.log",
+        "cat .runtime/claude_apply_rolled_back.diff",
+        "cat .runtime/implementation_ticket.md",
+        "cd app/web && npm run build",
+    ],
+    "claude_apply_revalidation_failed": [
+        "cat .runtime/claude_apply_rolled_back.diff",
+        "cat .runtime/implementation_ticket.md",
+        "tail -200 .runtime/local_factory.log",
+    ],
     "unknown": [
         "cat .runtime/control_state.json | python3 -m json.tool",
         "cat .runtime/factory_state.json | python3 -m json.tool",
@@ -1461,6 +1534,20 @@ REPAIR_TARGETS_BY_CODE: dict[str, list[str]] = {
         "control_tower/local_runner/cycle.py (_check_scope_consistency / "
         "_extract_design_spec_scope_keywords)",
         ".runtime/design_spec.md / .runtime/implementation_ticket.md 정합성",
+    ],
+    # The targets here are app code, NOT control_tower code. Claude
+    # broke the app build with its patch — fix the app, leave the
+    # factory machinery alone.
+    "build_app_after_apply_failed": [
+        "(implementation_ticket 의 target_files 에 명시된 app/web/src/... 파일들)",
+        ".runtime/app_build_after_apply.log (실제 vite/webpack 오류)",
+        ".runtime/claude_apply_rolled_back.diff (롤백된 패치 본문)",
+        ".runtime/implementation_ticket.md (수정 의도)",
+    ],
+    "claude_apply_revalidation_failed": [
+        "(implementation_ticket 의 target_files 에 명시된 app/* 또는 control_tower/* 파일)",
+        ".runtime/claude_apply_rolled_back.diff (롤백된 패치 본문)",
+        ".runtime/implementation_ticket.md (수정 의도)",
     ],
     "unknown": [
         "(분류 추가 필요 — control_tower/local_runner/factory_observer.py 의 classify())",
@@ -1576,6 +1663,31 @@ REPAIR_REQUIREMENTS_BY_CODE: dict[str, str] = {
         "통과한 spec_bypass 라도 디자이너에게 더 명시적인 키워드 / 컴포넌트 이름을 "
         "요구."
     ),
+    "build_app_after_apply_failed": (
+        "1. `.runtime/app_build_after_apply.log` 의 마지막 vite/webpack "
+        "오류 메시지를 읽고 어떤 모듈 / 심볼 / import 가 빌드를 깼는지 식별.\n"
+        "2. `.runtime/claude_apply_rolled_back.diff` 를 보고 직전 사이클의 "
+        "Claude 변경이 위 오류와 어떻게 연결되는지 (실제 파일/라인) 확인.\n"
+        "3. `.runtime/implementation_ticket.md` 의 target_files 안에서만 "
+        "수정 — control_tower / .github / scripts 는 건드리지 않음.\n"
+        "4. 변경 후 `cd app/web && npm run build` 가 0 exit 로 끝나는지 "
+        "로컬에서 검증.\n"
+        "5. design_spec / implementation_ticket 의 요구 사항 (titleLabel, "
+        "SVG path, 카드 레이아웃 등) 을 그대로 만족시켜야 함 — scope 변경 "
+        "금지.\n"
+        "6. factory_smoke / factory_observer / cycle.py 자체는 수정하지 "
+        "마세요. 이 실패는 그 코드의 버그가 아니라 Stampport 앱 코드의 "
+        "빌드 실패입니다."
+    ),
+    "claude_apply_revalidation_failed": (
+        "1. `.runtime/claude_apply_rolled_back.diff` 와 "
+        "`.runtime/local_factory.log` 의 _revalidate_after_apply 출력을 "
+        "비교해 어떤 게이트 (build_control / syntax_check_py / "
+        "syntax_check_sh / risky_files) 가 거부했는지 식별.\n"
+        "2. implementation_ticket 의 target_files 범위 안에서만 수정.\n"
+        "3. 변경 후 해당 게이트의 명령을 로컬에서 직접 재실행해 통과 확인.\n"
+        "4. control_tower 자체는 수정하지 마세요."
+    ),
     "unknown": (
         "1. control_state.json / factory_state.json / pipeline_state.json / "
         "forward_progress_state.json 의 raw 필드를 읽고 어떤 시그널이 비어있고 어떤 "
@@ -1648,6 +1760,16 @@ ACCEPTANCE_TEMPLATE_BY_CODE: dict[str, str] = {
         "- factory_state.scope_consistency_status == 'passed' (또는 미설정)\n"
         "- claude_apply.diff 가 design_spec target_files 중 ≥1 변경 + 키워드 ≥3 매칭\n"
         "- design_spec_feature == implementation_ticket_selected_feature"
+    ),
+    "build_app_after_apply_failed": (
+        "- 다음 cycle 에서 factory_state.failed_stage != 'claude_apply'\n"
+        "- claude_apply_status in {applied, noop} (rolled_back 아님)\n"
+        "- _revalidate_after_apply 의 build_app 게이트 통과\n"
+        "- `cd app/web && npm run build` 가 로컬에서 0 exit"
+    ),
+    "claude_apply_revalidation_failed": (
+        "- 다음 cycle 에서 _revalidate_after_apply 의 모든 게이트 통과\n"
+        "- claude_apply_status != 'rolled_back'"
     ),
     "unknown": (
         "- factory_observer 가 새 diagnostic_code 로 분류\n"
@@ -1915,6 +2037,8 @@ def _suggest_commit_message(code: str) -> str:
         "actions_pending_timeout": "Refresh actions polling on long-pending workflow",
         "old_deploy_failed_stale": "UI: prefer control_state.deploy over deploy_progress for badge",
         "scope_mismatch": "Enforce scope consistency between design_spec and claude_apply",
+        "build_app_after_apply_failed": "Repair app build after claude_apply rollback",
+        "claude_apply_revalidation_failed": "Repair source so claude_apply revalidation passes",
         "unknown": "(diagnose-only — extend factory_observer.classify with new code)",
     }
     return headers.get(code, "Repair factory cycle blocker")
