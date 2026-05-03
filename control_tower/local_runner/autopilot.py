@@ -261,6 +261,18 @@ class AutopilotState:
     first_cycle_spawn_at: str | None = None
     current_cycle_started_at: str | None = None
     current_cycle_finished_at: str | None = None
+    # Active cycle markers. The dashboard's stuck-before-first-cycle
+    # diagnostic was firing while a real smoke subprocess was alive
+    # because we hadn't published the live cycle index. We now write
+    # active_cycle_index = cycle_count + 1 the moment we spawn factory
+    # smoke and clear it when the spawn returns; current_stage mirrors
+    # the cycle-py stage name so the office scene can route the
+    # working agent. live_report_path is `.runtime/autopilot_live_
+    # report.md` while running so the UI can distinguish "current run
+    # status" from "last final autopilot_report.md".
+    active_cycle_index: int | None = None
+    current_stage: str | None = None
+    live_report_path: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -285,6 +297,78 @@ _LOCK = threading.RLock()
 _THREAD: "threading.Thread | None" = None
 _STOP_EVENT = threading.Event()
 _STATE: AutopilotState = AutopilotState()
+
+# Cadence for the smoke heartbeat thread. 20s matches the runner's
+# heartbeat interval so the dashboard sees a fresh updated_at every
+# heartbeat tick even when factory_smoke runs for an hour.
+_SMOKE_HEARTBEAT_INTERVAL_SEC = 20.0
+
+
+def _smoke_heartbeat(stop_event: threading.Event) -> None:
+    """Background thread that mirrors factory_state.current_stage into
+    autopilot_state.current_stage while a smoke subprocess blocks the
+    main loop. Without this, a long product_planning / designer_critique
+    leaves autopilot_state.current_stage frozen on "factory_smoke" and
+    the dashboard can't say "Designer가 비평 중".
+
+    Stops as soon as the parent loop sets stop_event.
+    """
+    while not stop_event.is_set():
+        try:
+            fs = _read_json(_factory_state_path()) or {}
+            stage = fs.get("current_stage")
+            with _LOCK:
+                if stage:
+                    _STATE.current_stage = str(stage)
+                # `_save_state` always bumps updated_at — that alone is
+                # enough to convince the dashboard the loop is alive.
+            _save_state()
+        except Exception:  # noqa: BLE001
+            # Heartbeat is best-effort; never let a transient read
+            # error kill the cycle loop.
+            pass
+        # Use Event.wait so a stop is acknowledged immediately; we
+        # don't want to oversleep when the main loop calls .set()
+        # right after the smoke subprocess returns.
+        stop_event.wait(_SMOKE_HEARTBEAT_INTERVAL_SEC)
+
+
+def _write_live_report(cycle: int, config: "AutopilotConfig",
+                       last_smoke: dict | None = None) -> None:
+    """Append a tiny markdown snapshot to .runtime/autopilot_live_
+    report.md while running. The dashboard surfaces this path during
+    a live run so the operator isn't reading the previous run's
+    autopilot_report.md by mistake. Final autopilot_report.md is
+    still written on stop by `_write_report` below.
+    """
+    try:
+        path = _runtime_dir() / "autopilot_live_report.md"
+        snap = _STATE.to_dict() if _STATE else {}
+        lines = [
+            f"# Auto Pilot Live Report (cycle {cycle})",
+            "",
+            f"- updated_at: `{snap.get('updated_at') or _utc_now()}`",
+            f"- status: `{snap.get('status')}`",
+            f"- mode: `{config.autopilot_mode}`",
+            f"- active_cycle_index: `{snap.get('active_cycle_index')}`",
+            f"- cycle_count: `{snap.get('cycle_count')}` / max `{config.max_cycles}`",
+            f"- current_stage: `{snap.get('current_stage')}`",
+            f"- current_cycle_started_at: `{snap.get('current_cycle_started_at')}`",
+            f"- current_cycle_finished_at: `{snap.get('current_cycle_finished_at')}`",
+            "",
+            ("> 진행 중" if snap.get("active_cycle_index") else "> 사이클 완료 — 다음 사이클 대기"),
+        ]
+        if last_smoke:
+            lines += [
+                "",
+                "## last smoke result",
+                f"- verdict: `{last_smoke.get('verdict')}`",
+                f"- failure_code: `{last_smoke.get('failure_code')}`",
+            ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        sys.stderr.write(f"[autopilot] live_report write failed: {exc}\n")
 
 
 def _save_state() -> None:
@@ -921,6 +1005,13 @@ def _stop(reason: str, *, status: str = "stopped") -> None:
         _STATE.status = status
         _STATE.stop_reason = reason
         _STATE.ended_at = _utc_now()
+        # Clear live-cycle markers — a stopped run must not leave
+        # active_cycle_index / current_stage behind for the next
+        # heartbeat, otherwise the dashboard would still claim a
+        # cycle is in flight.
+        _STATE.active_cycle_index = None
+        _STATE.current_stage = None
+        _STATE.live_report_path = None
         rep = _report_path()
         _write_text(rep, _format_report(_STATE))
         _STATE.report_path = str(rep)
@@ -956,6 +1047,14 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
         _STATE.last_note = None
         _STATE.stop_reason = None
         _STATE.history = []
+        # Reset live-cycle markers from any prior run so the dashboard
+        # starts each new run from a clean "no cycle yet" baseline.
+        _STATE.first_cycle_spawn_at = None
+        _STATE.current_cycle_started_at = None
+        _STATE.current_cycle_finished_at = None
+        _STATE.active_cycle_index = None
+        _STATE.current_stage = None
+        _STATE.live_report_path = None
         _save_state()
 
     _log(
@@ -977,27 +1076,60 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
             rec = CycleRecord(cycle=cycle, started_at=_utc_now())
             _log(f"cycle {cycle} starting")
 
-            # Stuck-before-first-cycle diagnostic: stamp first_cycle_spawn_at
-            # the very first time we're about to spawn a smoke. Also set
-            # current_cycle_started_at so the dashboard can tell the
-            # autopilot loop is actively spawning vs hung between cycles.
+            # ── Live state pre-spawn ────────────────────────────────
+            # Publish the cycle index BEFORE we spawn factory_smoke so
+            # the dashboard's stuck-before-first-cycle check sees an
+            # active cycle marker the moment the subprocess is alive.
+            # Without this, a long-running first cycle painted CYCLE
+            # 0 / 5 + STUCK while real product_planning / designer_
+            # critique work was happening.
             with _LOCK:
                 now = _utc_now()
                 if _STATE.first_cycle_spawn_at is None:
                     _STATE.first_cycle_spawn_at = now
                 _STATE.current_cycle_started_at = now
-                # Leave finished_at as it was — pre-spawn we set it to
-                # the previous finish so started > finished signals
-                # "in flight".
+                _STATE.current_cycle_finished_at = None
+                _STATE.active_cycle_index = cycle
+                _STATE.current_stage = "factory_smoke"
+                _STATE.last_note = f"cycle {cycle} running"
+                _STATE.live_report_path = str(_runtime_dir() / "autopilot_live_report.md")
             _save_state()
+            _write_live_report(cycle, config)
 
-            smoke = _run_smoke_cycle(config.smoke_timeout_sec)
+            # ── Heartbeat thread ───────────────────────────────────
+            # While factory_smoke blocks (subprocess.run), tail factory
+            # _state.json every 20s and mirror current_stage into our
+            # state so the UI shows "Designer가 비평 중" instead of a
+            # frozen "factory_smoke" label.
+            hb_stop = threading.Event()
+            hb_thread = threading.Thread(
+                target=_smoke_heartbeat,
+                args=(hb_stop,),
+                daemon=True,
+                name="autopilot-smoke-hb",
+            )
+            hb_thread.start()
 
-            # Mark the smoke subprocess complete so the UI can flip
-            # off "cycle in flight".
+            try:
+                smoke = _run_smoke_cycle(config.smoke_timeout_sec)
+            finally:
+                hb_stop.set()
+                hb_thread.join(timeout=2.0)
+
+            # ── Live state post-spawn ───────────────────────────────
+            # The subprocess returned. Cycle index goes back to "no
+            # active cycle" and cycle_count advances by one. Verdict
+            # is recorded by the existing _record_cycle below.
             with _LOCK:
                 _STATE.current_cycle_finished_at = _utc_now()
+                _STATE.active_cycle_index = None
+                _STATE.current_stage = None
+                _STATE.last_note = (
+                    f"cycle {cycle} finished verdict="
+                    + (smoke.get("verdict") or "—")
+                )
             _save_state()
+            _write_live_report(cycle, config, last_smoke=smoke)
             verdict = (smoke.get("verdict") or "").strip()
             failure = (smoke.get("failure_code") or "").strip()
             rec.verdict = verdict

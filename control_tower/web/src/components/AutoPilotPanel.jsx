@@ -5,6 +5,7 @@ import {
   MODE_BADGE,
   buildStartPayload,
   deriveButtonState,
+  deriveDisplayCycle,
   deriveEffectiveConfig,
   derivePhase,
   deriveStuckDiagnostic,
@@ -292,7 +293,11 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   const safeRunWarning = isRunning && effectiveMode === "safe_run";
 
   // -------- Status summary text --------
-  const cycleCount = state?.cycle_count ?? 0;
+  // displayCycle prefers active_cycle_index when a smoke is mid-flight
+  // — keeps the panel from sitting on 0/5 while the first product_
+  // planning runs.
+  const cycleDisplay = useMemo(() => deriveDisplayCycle(meta), [meta]);
+  const cycleCount = cycleDisplay.number;
   const totalCycles = state?.max_cycles ?? draft.maxCycles;
   const elapsed = fmtElapsed(state?.started_at, isRunning);
   const lastVerdict = state?.last_verdict || "—";
@@ -302,7 +307,19 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   const lastHealth = state?.last_health_status || "—";
   const lastRender = state?.last_render_status || "—";
   const stopReason = state?.stop_reason || "—";
-  const reportPath = state?.report_path || ".runtime/autopilot_report.md";
+  // While running, surface the LIVE report path so the operator
+  // doesn't read the previous run's autopilot_report.md by mistake.
+  // After stop, the final report is at autopilot_report.md.
+  const reportPath = (
+    state?.live_report_path && state?.status === "running"
+      ? state.live_report_path
+      : (state?.report_path || ".runtime/autopilot_report.md")
+  );
+  const reportLabel = (
+    state?.live_report_path && state?.status === "running"
+      ? "live report"
+      : (state?.status === "running" ? "마지막 종료 report" : "report")
+  );
 
   const phaseLine = (() => {
     if (phase === "cycle_running") return "factory_smoke / cycle 실행 중";
@@ -412,7 +429,14 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
       >
         <div className="autopilot-panel-section-title">실행 상태 요약</div>
         <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-          <StatRow label="현재 cycle" value={`${cycleCount} / ${totalCycles}`} />
+          <StatRow
+            label="현재 cycle"
+            value={
+              cycleDisplay.active
+                ? `${cycleCount} / ${totalCycles} · 실행 중`
+                : `${cycleCount} / ${totalCycles}`
+            }
+          />
           <StatRow label="elapsed" value={elapsed} />
           <StatRow label="시작" value={fmtIso(state?.started_at)} />
           <StatRow label="종료" value={fmtIso(state?.ended_at)} />
@@ -619,7 +643,7 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
               <StatRow label="last health" value={lastHealth} />
               <StatRow label="stop reason" value={stopReason} />
               <StatRow
-                label="report"
+                label={reportLabel}
                 value={
                   <span
                     className="autopilot-stat-ellipsis autopilot-stat-ellipsis-wide font-mono"

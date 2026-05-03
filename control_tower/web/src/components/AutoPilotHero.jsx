@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { fmtTime as sharedFmtTime, fmtElapsedFrom as sharedFmtElapsed } from "../utils/time.js";
+import { deriveDisplayCycle } from "../utils/autopilotPhase.js";
 
 // AutoPilotHero — top-of-page hero block.
 //
@@ -121,7 +122,11 @@ export default function AutoPilotHero({ runners = [] }) {
   const status = state.status || "unknown";
   const tone = STATUS_TONE[status] || STATUS_TONE.unknown;
   const mode = state.mode || "safe_run";
-  const cycleCount = state.cycle_count ?? 0;
+  // Use the active_cycle_index when a smoke is mid-flight so the
+  // hero's CYCLE chip shows "1 / 5" the moment the first cycle
+  // spawns instead of staying at "0 / 5".
+  const cycleDisplay = deriveDisplayCycle({ autopilot: state });
+  const cycleCount = cycleDisplay.number;
   const maxCycles = state.max_cycles ?? 0;
   const lastVerdict = state.last_verdict || "—";
   const lastFailure = state.last_failure_code || "";

@@ -33,6 +33,7 @@ import {
   PHASES,
   buildStartPayload,
   deriveButtonState,
+  deriveDisplayCycle,
   deriveEffectiveConfig,
   derivePhase,
   deriveStuckDiagnostic,
@@ -62,7 +63,11 @@ function makeMeta({ status, cycle_count = 0, mode = "safe_run", max_cycles = 5,
                     ended_at = null, current_cycle_started_at = null,
                     current_cycle_finished_at = null, last_verdict = null,
                     last_failure_code = null, factory_state_status = null,
-                    current_stage = null, accountability = null }) {
+                    current_stage = null, accountability = null,
+                    active_cycle_index = null,
+                    autopilot_current_stage = null,
+                    live_report_path = null,
+                    factory_smoke = null }) {
   return {
     autopilot: {
       status, cycle_count, mode, max_cycles, max_hours,
@@ -70,9 +75,12 @@ function makeMeta({ status, cycle_count = 0, mode = "safe_run", max_cycles = 5,
       started_at, ended_at,
       current_cycle_started_at, current_cycle_finished_at,
       last_verdict, last_failure_code,
+      active_cycle_index,
+      current_stage: autopilot_current_stage,
+      live_report_path,
     },
     factory_state: { status: factory_state_status, current_stage },
-    factory_smoke: {},
+    factory_smoke: factory_smoke || {},
     pipeline_recovery: { current_stage: current_stage || null },
     agent_accountability: accountability || {},
   };
@@ -443,6 +451,139 @@ const apB = { started_at: "2026-05-03T01:00:00Z", cycle_count: 0 };
   check("isAfterStart: ev > start", isAfterStart(ev, start) === true);
   check("isAfterStart: ev < start (older event filtered)",
     isAfterStart("2026-05-03T00:00:00Z", start) === false);
+}
+
+// ---------- 10. Live-cycle / active_cycle_index acceptance ----------
+//
+// The user-reported bug: real factory_smoke + cycle + claude
+// subprocesses were running, log showed cycle #1, but the dashboard
+// painted CYCLE 0 / 5 + STUCK. These six fixtures (A-F from the
+// spec) lock in the new behaviour.
+
+// A. running, cycle_count=0, active_cycle_index=1, current_cycle_started_at set
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    started_at: new Date(Date.now() - 200_000).toISOString(),
+    current_cycle_started_at: new Date(Date.now() - 30_000).toISOString(),
+    current_cycle_finished_at: null,
+  });
+  check("A: stuck=false when active_cycle_index set",
+    deriveStuckDiagnostic(meta).stuck === false);
+  check("A: hasActiveCycle=true",
+    hasActiveCycle(meta) === true);
+  const dc = deriveDisplayCycle(meta);
+  check("A: displayCycle.number=1 (active_cycle_index)", dc.number === 1);
+  check("A: displayCycle.active=true", dc.active === true);
+  check("A: phase = cycle_running", derivePhase(meta) === "cycle_running");
+}
+
+// B. running, cycle_count=0, no active_cycle_index, 200s elapsed, no process → stuck
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0,
+    started_at: new Date(Date.now() - 200_000).toISOString(),
+  });
+  const d = deriveStuckDiagnostic(meta);
+  check("B: stuck=true (200s + no markers)", d.stuck === true);
+  check("B: diagnostic_code", d.diagnostic_code === "autopilot_stuck_before_first_cycle");
+}
+
+// C. running, cycle_count=0, factory_state.current_stage="designer_critique"
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0,
+    started_at: new Date(Date.now() - 60_000).toISOString(),
+    current_stage: "designer_critique",
+    factory_state_status: "running",
+  });
+  check("C: stuck=false when current_stage set",
+    deriveStuckDiagnostic(meta).stuck === false);
+  check("C: stageToWorkingAgent → designer",
+    stageToWorkingAgent(meta, derivePhase(meta)) === "designer");
+}
+
+// C'. autopilot.current_stage (heartbeat-side) also wins
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    autopilot_current_stage: "pm_decision",
+    started_at: new Date(Date.now() - 60_000).toISOString(),
+    current_cycle_started_at: new Date(Date.now() - 30_000).toISOString(),
+  });
+  check("C': autopilot.current_stage routes pm_decision → pm",
+    stageToWorkingAgent(meta, "cycle_running") === "pm");
+}
+
+// D. live_report_path present while running
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0, active_cycle_index: 1,
+    started_at: new Date().toISOString(),
+    live_report_path: ".runtime/autopilot_live_report.md",
+  });
+  check("D: live_report_path is exposed on autopilot",
+    meta.autopilot.live_report_path === ".runtime/autopilot_live_report.md");
+}
+
+// E. running cycle: stop ✓, start ✗, restart ✓
+{
+  const got = deriveButtonState({
+    phase: "cycle_running",
+    cycleInFlight: true, busy: false, hasRunner: true,
+  });
+  check("E: cycle_running canStart=false", got.canStart === false);
+  check("E: cycle_running canStop=true",  got.canStop === true);
+  check("E: cycle_running canRestart=true", got.canRestart === true);
+}
+
+// F. previous PASS/REWORK shouldn't drive current visual when fresh
+//    cycle_count=0 + autopilot active_cycle_index=1.
+{
+  // freshnessOf for an artifact with cycle_id=0 (previous run leftover)
+  const f = freshnessOf({
+    artifactCycleId: 0,
+    artifactAt: "2026-05-01T00:00:00Z",
+    autopilot: {
+      cycle_count: 0,
+      active_cycle_index: 1,
+      started_at: new Date().toISOString(),
+    },
+  });
+  // The freshnessOf rule compares cycle_id to apCycle (cycle_count).
+  // 0 == 0 so technically "current_cycle"; the AgentAccountability
+  // panel separately stale-gates this via its
+  // classifyAccountabilityFreshness rule (running + cycle_count=0 +
+  // acc.cycle_id>=1 → stale). For freshnessOf alone, equal-numbers =
+  // current_cycle is acceptable here.
+  check("F: freshnessOf cycle 0/0 → current_cycle", f === "current_cycle");
+}
+
+// G. factory_smoke started_at without ended_at also keeps stuck=false
+{
+  const meta = makeMeta({
+    status: "running", cycle_count: 0,
+    started_at: new Date(Date.now() - 220_000).toISOString(),
+    factory_smoke: { started_at: new Date(Date.now() - 60_000).toISOString(),
+                     ended_at: null },
+  });
+  check("G: factory_smoke started/no ended → not stuck",
+    deriveStuckDiagnostic(meta).stuck === false);
+  check("G: hasActiveCycle from smoke window",
+    hasActiveCycle(meta) === true);
+}
+
+// H. stopped run should clear active markers — phase = stopped
+{
+  const meta = makeMeta({
+    status: "stopped", cycle_count: 1,
+    last_verdict: "PASS",
+    active_cycle_index: null, autopilot_current_stage: null,
+  });
+  check("H: stopped phase", derivePhase(meta) === "stopped");
+  check("H: stopped → not stuck", deriveStuckDiagnostic(meta).stuck === false);
+  check("H: displayCycle returns finished count",
+    deriveDisplayCycle(meta).number === 1);
 }
 
 // ---------- Wrap up ----------

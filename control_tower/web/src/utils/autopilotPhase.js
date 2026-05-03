@@ -67,31 +67,68 @@ export function pickRunnerMeta(runners = []) {
 }
 
 // "Active cycle process exists" — multiple signals must agree before
-// we'll claim work is in progress. Otherwise an old factory_smoke
-// timestamp can paint Frontend as WORKING long after the loop went
-// idle. The autopilot loop now also writes current_cycle_started_at /
-// _finished_at around every smoke spawn so the UI has a definitive
-// "cycle in flight" answer without polling subprocesses.
+// we'll claim work is in progress. ANY of the following → active:
+//   * autopilot.active_cycle_index is set (loop has spawned smoke)
+//   * autopilot.current_stage is set (loop is mid-cycle, even if the
+//     stage label hasn't reached factory_state yet)
+//   * autopilot.current_cycle_started_at without a matching
+//     current_cycle_finished_at (smoke subprocess blocking)
+//   * factory_state.status == "running"
+//   * factory_smoke.status == "running"  OR  started_at without ended_at
+//   * pipeline_recovery.current_stage / factory_state.current_stage
+//   * runner heartbeat reports a live process flag
+//
+// This is the core fix for "STUCK · 첫 cycle 미시작 while real
+// designer_critique was running". Previously hasActiveCycle missed
+// the active_cycle_index signal and the smoke started_at/ended_at
+// pair from factory_smoke_state.
 export function hasActiveCycle(meta = {}) {
   const fs = meta.factory_state || {};
   const smoke = meta.factory_smoke || meta.smoke || {};
   const ap = meta.autopilot || {};
-  const fsRunning = String(fs.status || "").toLowerCase() === "running";
-  const smokeRunning = String(smoke.status || "").toLowerCase() === "running";
-  const stagePresent = !!(fs.current_stage || meta?.pipeline_recovery?.current_stage);
-  // current_cycle_started_at > current_cycle_finished_at means a smoke
-  // subprocess is currently blocking the autopilot thread.
-  let smokeInFlight = false;
+  const pr = meta.pipeline_recovery || {};
+
+  if (ap.active_cycle_index != null && Number(ap.active_cycle_index) > 0) return true;
+  if (ap.current_stage) return true;
+
   if (ap.current_cycle_started_at) {
     const started = Date.parse(ap.current_cycle_started_at);
     const finished = ap.current_cycle_finished_at
       ? Date.parse(ap.current_cycle_finished_at)
       : 0;
     if (Number.isFinite(started) && (!Number.isFinite(finished) || started > finished)) {
-      smokeInFlight = true;
+      return true;
     }
   }
-  return fsRunning || smokeRunning || stagePresent || smokeInFlight;
+
+  if (String(fs.status || "").toLowerCase() === "running") return true;
+  if (String(smoke.status || "").toLowerCase() === "running") return true;
+  if (smoke.started_at && !smoke.ended_at) return true;
+
+  if (fs.current_stage || pr.current_stage) return true;
+
+  // Optional process-alive flags from the runner heartbeat (added by
+  // future runner work; today they're undefined and the early-exit
+  // signals above are sufficient).
+  if (ap.factory_smoke_process_alive || ap.cycle_process_alive
+      || ap.claude_process_alive || ap.autopilot_process_alive) {
+    return true;
+  }
+  return false;
+}
+
+// Display-cycle resolution — UI surfaces the *active* cycle index
+// when a smoke subprocess is mid-flight, otherwise the count of
+// finished cycles. With this, "CYCLE 1 / 5 · 실행 중" shows the
+// moment the first smoke spawns instead of staying at 0/5 until
+// the smoke returns.
+export function deriveDisplayCycle(meta = {}) {
+  const ap = meta.autopilot || {};
+  const idx = ap.active_cycle_index;
+  if (idx != null && Number(idx) > 0) {
+    return { number: Number(idx), active: true };
+  }
+  return { number: Number(ap.cycle_count || 0), active: false };
 }
 
 // stuck_before_first_cycle — the diagnostic the user asked for.
@@ -107,6 +144,14 @@ export function deriveStuckDiagnostic(meta = {}) {
   if (String(ap.status || "").toLowerCase() !== "running") {
     return { stuck: false };
   }
+  // active_cycle_index is the strongest "loop spawned a smoke" signal —
+  // when it's set we never return stuck, even if the surrounding
+  // metadata is stale. This is the fix for the false-positive STUCK
+  // card that fired during real product_planning / designer_critique.
+  if (ap.active_cycle_index != null && Number(ap.active_cycle_index) > 0) {
+    return { stuck: false };
+  }
+  if (ap.current_stage) return { stuck: false };
   if ((Number(ap.cycle_count) || 0) > 0) return { stuck: false };
   if (hasActiveCycle(meta)) return { stuck: false };
   const startedAt = ap.started_at ? Date.parse(ap.started_at) : null;
@@ -231,7 +276,11 @@ export function stageToWorkingAgent(meta = {}, phase = null) {
   if (phase && !isRunningPhase(phase)) return null;
   if (!hasActiveCycle(meta)) return null;
 
+  // Priority: autopilot.current_stage (set by the heartbeat thread
+  // around the smoke spawn) wins because it's the freshest signal,
+  // then the runner-side recovery / state stages, then factory_state.
   const stageRaw =
+    meta?.autopilot?.current_stage ||
     meta?.pipeline_recovery?.current_stage ||
     meta?.pipeline_state?.current_stage ||
     meta?.factory_state?.current_stage ||
