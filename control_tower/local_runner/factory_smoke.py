@@ -6125,6 +6125,181 @@ def self_test() -> tuple[int, int, list[str]]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"Claude-G: autopilot helper raised: {exc}")
 
+    # ----------------------------------------------------------------
+    # Claude command parsing regression tests (CmdParser-A..D from the
+    # bug report: LOCAL_RUNNER_CLAUDE_COMMAND was being treated as a
+    # single executable path, causing
+    # "[Errno 2] No such file or directory: '/path/to/claude --dangerously-skip-permissions'"
+    # when the env var actually carried trailing flags).
+    # ----------------------------------------------------------------
+
+    # CmdParser-A. shell-style command must split executable from
+    # flags. argv[0] is the binary, --dangerously-skip-permissions is
+    # an extra arg.
+    total += 1
+    _prev_local = os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND")
+    _prev_bin = os.environ.get("CLAUDE_BIN")
+    try:
+        os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = (
+            "/tmp/fake-claude --dangerously-skip-permissions"
+        )
+        os.environ.pop("CLAUDE_BIN", None)
+        spec_a = _cycle._resolve_claude_command()
+        if (
+            spec_a["executable"] == "/tmp/fake-claude"
+            and spec_a["argv"] == [
+                "/tmp/fake-claude", "--dangerously-skip-permissions",
+            ]
+            and spec_a["extra_args"] == ["--dangerously-skip-permissions"]
+            and spec_a["raw_command"]
+                == "/tmp/fake-claude --dangerously-skip-permissions"
+            and spec_a["source"] == "LOCAL_RUNNER_CLAUDE_COMMAND"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"CmdParser-A: shlex split must separate executable + flags — "
+                f"got {spec_a}"
+            )
+    finally:
+        if _prev_local is None:
+            os.environ.pop("LOCAL_RUNNER_CLAUDE_COMMAND", None)
+        else:
+            os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = _prev_local
+        if _prev_bin is None:
+            os.environ.pop("CLAUDE_BIN", None)
+        else:
+            os.environ["CLAUDE_BIN"] = _prev_bin
+
+    # CmdParser-B. Whole command string must NOT be treated as a
+    # single executable path. The non-existent file probe targets
+    # argv[0] only — missing=True (the file does not exist) AND
+    # executable equals "/tmp/__definitely_missing_claude__" (NOT the
+    # full string with the trailing flag glued on).
+    total += 1
+    _prev_local = os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND")
+    try:
+        os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = (
+            "/tmp/__definitely_missing_claude__ --dangerously-skip-permissions"
+        )
+        os.environ.pop("CLAUDE_BIN", None)
+        spec_b = _cycle._resolve_claude_command()
+        if (
+            spec_b["missing"] is True
+            and spec_b["executable"] == "/tmp/__definitely_missing_claude__"
+            and "--dangerously-skip-permissions" not in (spec_b["executable"] or "")
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "CmdParser-B: missing executable check must target argv[0] "
+                f"only, not the whole string — got {spec_b}"
+            )
+    finally:
+        if _prev_local is None:
+            os.environ.pop("LOCAL_RUNNER_CLAUDE_COMMAND", None)
+        else:
+            os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = _prev_local
+
+    # CmdParser-C. _claude_argv_with preserves
+    # --dangerously-skip-permissions when it is already in base argv;
+    # caller-side duplicates of the flag are deduped (operators
+    # frequently set it both in the env var and in stage code paths).
+    total += 1
+    base_c = ["/tmp/fake-claude", "--dangerously-skip-permissions"]
+    extra_clean = ["-p", "smoke", "--output-format", "text"]
+    extra_dup = ["-p", "smoke", "--dangerously-skip-permissions"]
+    out_clean = _cycle._claude_argv_with(base_c, extra_clean)
+    out_dup = _cycle._claude_argv_with(base_c, extra_dup)
+    flag_count_clean = out_clean.count("--dangerously-skip-permissions")
+    flag_count_dup = out_dup.count("--dangerously-skip-permissions")
+    if (
+        flag_count_clean == 1
+        and flag_count_dup == 1
+        and out_clean[0] == "/tmp/fake-claude"
+        and "-p" in out_clean
+        and "-p" in out_dup
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"CmdParser-C: --dangerously-skip-permissions handling — "
+            f"clean={out_clean} dup={out_dup}"
+        )
+
+    # CmdParser-D. claude_apply_command.json records argv / executable
+    # / extra_args / raw_command separately so the operator can see
+    # the parsed spec. failure_reason in the executor payload shows
+    # argv[0] only — NEVER the full "executable + flags" string that
+    # produced the original Errno-2 bug.
+    total += 1
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    with _tempfile.TemporaryDirectory() as _td:
+        runtime_save = _cycle.RUNTIME
+        cmd_save = _cycle.CLAUDE_APPLY_COMMAND_FILE
+        state_save = _cycle.CLAUDE_EXECUTOR_STATE_FILE
+        try:
+            _cycle.RUNTIME = _Path(_td)
+            _cycle.CLAUDE_APPLY_COMMAND_FILE = (
+                _Path(_td) / "claude_apply_command.json"
+            )
+            _cycle.CLAUDE_EXECUTOR_STATE_FILE = (
+                _Path(_td) / "claude_executor_state.json"
+            )
+            argv_d = ["/tmp/fake-claude", "--dangerously-skip-permissions",
+                      "-p", "x"]
+            _prev_local = os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND")
+            os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = (
+                "/tmp/fake-claude --dangerously-skip-permissions"
+            )
+            try:
+                payload_d = _cycle._write_claude_executor_state(
+                    status="failed",
+                    stage="claude_preflight",
+                    command=argv_d,
+                    exit_code=None,
+                    timed_out=False,
+                    duration_sec=0.5,
+                    failure_code="claude_cli_missing",
+                    failure_reason=(
+                        "claude executable not found: '/tmp/fake-claude'"
+                    ),
+                    stdout_path=None, stderr_path=None,
+                    retryable=False, retry_count=0,
+                )
+            finally:
+                if _prev_local is None:
+                    os.environ.pop("LOCAL_RUNNER_CLAUDE_COMMAND", None)
+                else:
+                    os.environ["LOCAL_RUNNER_CLAUDE_COMMAND"] = _prev_local
+            cmd_json = json.loads(
+                _cycle.CLAUDE_APPLY_COMMAND_FILE.read_text(encoding="utf-8")
+            )
+            reason = payload_d.get("failure_reason") or ""
+            if (
+                cmd_json.get("argv") == argv_d
+                and cmd_json.get("executable") == "/tmp/fake-claude"
+                and cmd_json.get("extra_args") == [
+                    "--dangerously-skip-permissions", "-p", "x",
+                ]
+                and cmd_json.get("raw_command")
+                    == "/tmp/fake-claude --dangerously-skip-permissions"
+                and "/tmp/fake-claude" in reason
+                and "--dangerously-skip-permissions" not in reason
+            ):
+                passed += 1
+            else:
+                failures.append(
+                    f"CmdParser-D: command.json must store argv/exec/extra_args "
+                    f"separately and failure_reason must show argv[0] only — "
+                    f"cmd_json={cmd_json} reason={reason!r}"
+                )
+        finally:
+            _cycle.RUNTIME = runtime_save
+            _cycle.CLAUDE_APPLY_COMMAND_FILE = cmd_save
+            _cycle.CLAUDE_EXECUTOR_STATE_FILE = state_save
+
     # H. Preflight success path leaves the existing pipeline contract
     # unchanged — claude_executor_status=passed and no failure_code
     # must NOT block can_publish, and the checks/blocking_code stay

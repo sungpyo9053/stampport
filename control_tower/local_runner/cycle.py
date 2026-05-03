@@ -7105,13 +7105,27 @@ def _write_claude_executor_state(
 ) -> dict:
     """Persist the executor verdict to claude_executor_state.json and
     claude_apply_command.json. Returns the dict that was written so
-    callers can mirror it onto CycleState in a single place."""
+    callers can mirror it onto CycleState in a single place.
+
+    `command` is normalized to argv for the command.json file (argv +
+    raw_command + executable + extra_args), while the executor state
+    keeps the shell-quoted single-line form for backwards compat."""
     if isinstance(command, list):
-        cmd_str = " ".join(shlex.quote(str(a)) for a in command)
+        argv = [str(a) for a in command]
+        cmd_str = " ".join(shlex.quote(a) for a in argv)
     elif isinstance(command, str):
+        argv = command.split() if command else []
         cmd_str = command
     else:
+        argv = []
         cmd_str = ""
+    raw_command = (
+        os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND")
+        or os.environ.get("CLAUDE_BIN")
+        or ""
+    )
+    executable = argv[0] if argv else None
+    extra_args = list(argv[1:]) if argv else []
     payload = {
         "status": status,
         "stage": stage,
@@ -7135,7 +7149,14 @@ def _write_claude_executor_state(
         )
         CLAUDE_APPLY_COMMAND_FILE.write_text(
             json.dumps(
-                {"stage": stage, "command": cmd_str, "argv": command if isinstance(command, list) else None},
+                {
+                    "stage": stage,
+                    "raw_command": raw_command,
+                    "argv": argv,
+                    "executable": executable,
+                    "extra_args": extra_args,
+                    "command": cmd_str,
+                },
                 ensure_ascii=False, indent=2,
             ),
             encoding="utf-8",
@@ -7252,6 +7273,105 @@ def _run_claude_capture(
     }
 
 
+def _resolve_claude_command() -> dict:
+    """Resolve the Claude CLI command spec from env vars.
+
+    LOCAL_RUNNER_CLAUDE_COMMAND is treated as a SHELL-STYLE COMMAND
+    STRING (e.g. "claude --dangerously-skip-permissions"), not a single
+    executable path. We split it via shlex so flags like
+    `--dangerously-skip-permissions` become argv entries instead of
+    being mistaken for part of the binary name.
+
+    Returns:
+        {
+          "raw_command": str        # original env value (or "" / None)
+          "argv": list[str]         # shlex.split() result, [] if empty
+          "executable": str | None  # argv[0] if any, resolved via PATH
+          "extra_args": list[str]   # argv[1:]
+          "missing": bool           # True when no executable can be found
+          "source": str             # "LOCAL_RUNNER_CLAUDE_COMMAND" |
+                                    #   "CLAUDE_BIN" | "PATH" | "none"
+        }
+
+    Resolution priority: LOCAL_RUNNER_CLAUDE_COMMAND → CLAUDE_BIN →
+    `which claude`. CLAUDE_BIN is treated as a single binary path (no
+    args), to preserve the legacy contract; only LOCAL_RUNNER_CLAUDE_
+    COMMAND can carry trailing flags.
+    """
+    raw_local = (os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND") or "").strip()
+    raw_bin = (os.environ.get("CLAUDE_BIN") or "").strip()
+
+    raw_command = ""
+    source = "none"
+    argv: list[str] = []
+
+    if raw_local:
+        raw_command = raw_local
+        source = "LOCAL_RUNNER_CLAUDE_COMMAND"
+        try:
+            argv = shlex.split(raw_local)
+        except ValueError:
+            # Unbalanced quotes — fall back to a whitespace split so
+            # the operator still gets a clear "missing executable"
+            # diagnostic instead of a Python crash.
+            argv = raw_local.split()
+    elif raw_bin:
+        raw_command = raw_bin
+        source = "CLAUDE_BIN"
+        argv = [raw_bin]
+    else:
+        which_path = shutil.which("claude")
+        if which_path:
+            raw_command = which_path
+            source = "PATH"
+            argv = [which_path]
+
+    executable: str | None = argv[0] if argv else None
+    if executable:
+        # If the executable isn't an absolute / relative path, try to
+        # resolve it via PATH so the missing check below uses the
+        # actual binary location.
+        if not os.path.sep in executable and not executable.startswith("."):
+            resolved = shutil.which(executable)
+            if resolved:
+                executable = resolved
+                argv = [resolved] + argv[1:]
+    extra_args = list(argv[1:]) if argv else []
+    missing = bool(
+        not executable
+        or (
+            os.path.sep in executable
+            and not Path(executable).exists()
+        )
+        or (
+            os.path.sep not in executable
+            and shutil.which(executable) is None
+        )
+    )
+    return {
+        "raw_command": raw_command,
+        "argv": list(argv),
+        "executable": executable,
+        "extra_args": extra_args,
+        "missing": bool(missing),
+        "source": source,
+    }
+
+
+_DSP_FLAG = "--dangerously-skip-permissions"
+
+
+def _claude_argv_with(
+    base_argv: list[str], extra: list[str], *, dedupe_dsp: bool = True,
+) -> list[str]:
+    """Compose `base_argv + extra` while never duplicating the
+    --dangerously-skip-permissions flag (operators commonly include
+    it in LOCAL_RUNNER_CLAUDE_COMMAND, and the flag is allowed once)."""
+    if dedupe_dsp and _DSP_FLAG in base_argv:
+        extra = [a for a in extra if a != _DSP_FLAG]
+    return list(base_argv) + list(extra)
+
+
 def stage_claude_preflight(state: CycleState) -> StageResult:
     """Verify the `claude` CLI is reachable, authenticated, and able to
     answer a tiny smoke prompt within 30s. Runs BEFORE product_planning
@@ -7273,23 +7393,27 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
         return sr
 
     timeout_sec = float(os.environ.get("FACTORY_CLAUDE_PREFLIGHT_TIMEOUT_SEC", "30"))
-    claude_bin = (
-        os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND", "").strip()
-        or os.environ.get("CLAUDE_BIN", "").strip()
-        or shutil.which("claude")
-    )
-    if not claude_bin:
+    spec = _resolve_claude_command()
+    base_argv = list(spec["argv"])
+    if spec["missing"] or not spec["executable"]:
+        # Note: failure_reason carries argv[0] only — never the raw
+        # command string with its trailing flags — because the Errno-2
+        # report previously included things like
+        # "/path/to/claude --dangerously-skip-permissions" as a single
+        # path, which was the original confusing failure mode.
+        missing_executable = spec["executable"] or "claude"
         payload = _write_claude_executor_state(
             status="failed",
             stage="claude_preflight",
-            command="claude",
+            command=spec["argv"] or [missing_executable],
             exit_code=None,
             timed_out=False,
             duration_sec=time.time() - t0,
             failure_code="claude_cli_missing",
             failure_reason=(
-                "claude CLI not found on PATH and neither "
-                "LOCAL_RUNNER_CLAUDE_COMMAND nor CLAUDE_BIN is set."
+                f"claude executable not found: {missing_executable!r} "
+                f"(source={spec['source']}). Set LOCAL_RUNNER_CLAUDE_COMMAND "
+                f"or CLAUDE_BIN to a valid path."
             ),
             stdout_path=None,
             stderr_path=None,
@@ -7303,7 +7427,7 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
     # Step 1: `claude --version` (or equivalent). Fast sanity check that
     # the binary at least exits cleanly. Some packages don't have
     # --version; we accept any zero exit.
-    version_argv = [claude_bin, "--version"]
+    version_argv = _claude_argv_with(base_argv, ["--version"])
     version_result = _run_claude_capture(
         version_argv,
         cwd=REPO_ROOT,
@@ -7320,7 +7444,10 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
             timed_out=version_result["timed_out"],
             duration_sec=time.time() - t0,
             failure_code="claude_cli_missing",
-            failure_reason=(version_result["stderr"] or "claude binary not found"),
+            failure_reason=(
+                f"claude executable not runnable: {spec['executable']!r} "
+                f"({(version_result['stderr'] or 'no error output').strip()[:200]})"
+            ),
             stdout_path=None,
             stderr_path=None,
             retryable=False,
@@ -7332,12 +7459,14 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
 
     # Step 2: Smoke prompt. We ask claude to print a single token so a
     # broken auth / rate-limit / hung process is caught fast.
-    smoke_argv = [
-        claude_bin,
-        "-p", "Reply with exactly: STAMPPORT_OK",
-        "--output-format", "text",
-        "--max-budget-usd", "0.05",
-    ]
+    smoke_argv = _claude_argv_with(
+        base_argv,
+        [
+            "-p", "Reply with exactly: STAMPPORT_OK",
+            "--output-format", "text",
+            "--max-budget-usd", "0.05",
+        ],
+    )
     smoke_result = _run_claude_capture(
         smoke_argv,
         cwd=REPO_ROOT,
@@ -7938,28 +8067,25 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         )
         return sr
 
-    # Pre-condition 5: tools + input source.
-    claude_bin = (
-        os.environ.get("LOCAL_RUNNER_CLAUDE_COMMAND", "").strip()
-        or os.environ.get("CLAUDE_BIN", "").strip()
-        or shutil.which("claude")
-    )
-    if not claude_bin:
-        # Treat a missing CLI at apply time as a hard executor failure
-        # (not a skip) so the autopilot retry / pipeline_decision layer
-        # can see it. The stage status stays `failed` so the cycle is
-        # not silently shipped as planning_only.
+    # Pre-condition 5: tools + input source. Use the same parser as
+    # stage_claude_preflight so a LOCAL_RUNNER_CLAUDE_COMMAND like
+    # `claude --dangerously-skip-permissions` is split into argv —
+    # treating it as a single executable path was the original bug
+    # behind the Errno-2 "no such file" report.
+    spec = _resolve_claude_command()
+    if spec["missing"] or not spec["executable"]:
+        missing_executable = spec["executable"] or "claude"
         payload = _write_claude_executor_state(
             status="failed",
             stage="claude_apply",
-            command="claude",
+            command=spec["argv"] or [missing_executable],
             exit_code=None,
             timed_out=False,
             duration_sec=time.time() - t0,
             failure_code="claude_cli_missing",
             failure_reason=(
-                "claude CLI not found at apply time — "
-                "neither CLAUDE_BIN/LOCAL_RUNNER_CLAUDE_COMMAND nor PATH resolved."
+                f"claude executable not found at apply time: {missing_executable!r} "
+                f"(source={spec['source']})."
             ),
             stdout_path=None,
             stderr_path=None,
@@ -7976,6 +8102,7 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         state.failed_reason = payload["failure_reason"]
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
+    base_argv = list(spec["argv"])
     if apply_spec_bypass:
         try:
             design_spec_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
@@ -8005,14 +8132,38 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     budget_usd = os.environ.get("FACTORY_CLAUDE_BUDGET_USD", "1.0").strip() or "1.0"
     timeout_sec = float(os.environ.get("FACTORY_CLAUDE_APPLY_TIMEOUT_SEC", "900"))
 
-    argv = [
-        claude_bin,
-        "-p", prompt,
-        "--allowed-tools", "Read,Glob,Grep,Edit,Write",
-        "--output-format", "text",
-        "--model", model,
-        "--max-budget-usd", budget_usd,
-    ]
+    argv = _claude_argv_with(
+        base_argv,
+        [
+            "-p", prompt,
+            "--allowed-tools", "Read,Glob,Grep,Edit,Write",
+            "--output-format", "text",
+            "--model", model,
+            "--max-budget-usd", budget_usd,
+        ],
+    )
+    # Persist the parsed command spec — operators (and self-tests)
+    # need to see raw_command vs argv vs executable separately to
+    # diagnose preflight bugs without re-parsing env vars themselves.
+    try:
+        CLAUDE_APPLY_COMMAND_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CLAUDE_APPLY_COMMAND_FILE.write_text(
+            json.dumps(
+                {
+                    "stage": "claude_apply",
+                    "raw_command": spec["raw_command"],
+                    "argv": list(argv),
+                    "executable": spec["executable"],
+                    "extra_args": list(argv[1:]),
+                    "source": spec["source"],
+                    "command": " ".join(shlex.quote(a) for a in argv),
+                },
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
     capture = _run_claude_capture(
         argv,
         cwd=REPO_ROOT,
