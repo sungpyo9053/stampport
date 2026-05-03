@@ -35,6 +35,9 @@ export const BADGE_DEFS = [
     icon: '☕',
     titleLabel: '카페 입문자',
     required: 3,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.category === 'cafe'),
   },
   {
@@ -44,6 +47,9 @@ export const BADGE_DEFS = [
     icon: '🥐',
     titleLabel: '빵지 순례자',
     required: 3,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.category === 'bakery'),
   },
   {
@@ -53,6 +59,9 @@ export const BADGE_DEFS = [
     icon: '🍽',
     titleLabel: '맛집 탐험가',
     required: 5,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 1,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.category === 'restaurant'),
   },
   {
@@ -62,6 +71,9 @@ export const BADGE_DEFS = [
     icon: '🍰',
     titleLabel: '디저트 탐험가',
     required: 5,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 1,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.category === 'dessert'),
   },
   {
@@ -71,6 +83,9 @@ export const BADGE_DEFS = [
     icon: '🏙',
     titleLabel: '성수 카페 비자',
     required: 3,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 2,
     progress: (stamps) =>
       distinctPlaces(stamps, (s) => s.area === '성수' && s.category === 'cafe'),
   },
@@ -81,6 +96,9 @@ export const BADGE_DEFS = [
     icon: '🌿',
     titleLabel: '망원 디저트 비자',
     required: 2,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) =>
       distinctPlaces(stamps, (s) => s.area === '망원' && s.category === 'dessert'),
   },
@@ -91,6 +109,9 @@ export const BADGE_DEFS = [
     icon: '🌸',
     titleLabel: '연남 단골',
     required: 3,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 2,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.area === '연남'),
   },
   {
@@ -100,6 +121,9 @@ export const BADGE_DEFS = [
     icon: '🗺',
     titleLabel: '관악 로컬',
     required: 3,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 2,
     progress: (stamps) => distinctPlaces(stamps, (s) => s.area === '관악'),
   },
   {
@@ -109,6 +133,9 @@ export const BADGE_DEFS = [
     icon: '🧂',
     titleLabel: '소금빵 수집가',
     required: 3,
+    level: 2,
+    tier: 'lover',
+    lockedUntilLevel: 1,
     progress: (stamps) =>
       distinctPlaces(stamps, (s) => s.tags?.includes('소금빵')),
   },
@@ -119,6 +146,9 @@ export const BADGE_DEFS = [
     icon: '🥣',
     titleLabel: '혼밥 미식가',
     required: 3,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) =>
       distinctPlaces(stamps, (s) => s.tags?.includes('혼밥 가능')),
   },
@@ -129,6 +159,9 @@ export const BADGE_DEFS = [
     icon: '🌤',
     titleLabel: '주말 탐험가',
     required: 3,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) =>
       stamps.filter((s) => {
         if (!s.visited_at) return false;
@@ -143,6 +176,9 @@ export const BADGE_DEFS = [
     icon: '🏷',
     titleLabel: '여권 비자 수집가',
     required: 3,
+    level: 3,
+    tier: 'master',
+    lockedUntilLevel: 3,
     progress: (stamps) =>
       stamps.filter((s) => {
         const g = s.grade?.grade || (s.verification_level === 'verified' ? 'S' : null);
@@ -157,6 +193,9 @@ export const BADGE_DEFS = [
     icon: '🪪',
     titleLabel: '단골 후보',
     required: 1,
+    level: 1,
+    tier: 'starter',
+    lockedUntilLevel: 1,
     progress: (stamps) => regularPlaceCount(stamps),
   },
 ];
@@ -174,6 +213,9 @@ export function computeBadges(stamps) {
       required: def.required,
       progress,
       earned,
+      level: def.level,
+      tier: def.tier,
+      lockedUntilLevel: def.lockedUntilLevel,
     };
   });
 }

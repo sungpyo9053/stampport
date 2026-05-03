@@ -1161,6 +1161,8 @@
   overflow: hidden;
   box-shadow: var(--shadow-card);
   min-height: 420px;
+  max-width: 390px;
+  max-height: 560px;
   display: flex;
   flex-direction: column;
 }
@@ -2695,6 +2697,45 @@
   gap: 8px;
 }
 
+.share-hero {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px dashed rgba(246, 239, 222, 0.35);
+  margin-bottom: 12px;
+}
+
+.share-title-seal {
+  flex-shrink: 0;
+  width: 80px;
+  height: 80px;
+}
+
+.share-hero-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.share-hero-meta h2 {
+  margin-top: 0;
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.share-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .share-canvas .share-grade {
   font-family: var(--font-serif);
   font-size: 11px;
@@ -2706,6 +2747,11 @@
 }
 
 .share-canvas .share-note {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: break-word;
   margin: 14px 0 0;
   padding: 0 0 0 10px;
   border-left: 2px solid var(--color-gold-soft);

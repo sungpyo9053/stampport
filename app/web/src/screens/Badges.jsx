@@ -2,9 +2,32 @@ import { useState } from 'react';
 import { useApp } from '../context/appContext.js';
 import { BADGE_DEFS } from '../data/badges.js';
 
+function getBadgeNavPath(b) {
+  const text = (b.description || '') + ' ' + (b.name || '');
+  let category = '';
+  if (text.includes('카페')) category = 'cafe';
+  else if (text.includes('빵')) category = 'bakery';
+  else if (text.includes('맛집')) category = 'restaurant';
+  else if (text.includes('디저트')) category = 'dessert';
+  let area = '';
+  for (const a of ['성수', '망원', '연남', '관악']) {
+    if (text.includes(a)) { area = a; break; }
+  }
+  const params = new URLSearchParams();
+  if (category) params.set('category', category);
+  if (area) params.set('area', area);
+  const qs = params.toString();
+  return qs ? `/stamp?${qs}` : '/stamp';
+}
+
 export default function Badges({ navigate }) {
   const { badges, earnedBadges, profileMeta, setSelectedTitle, selectedTitle } = useApp();
   const [toast, setToast] = useState('');
+
+  const selectedTitleId = profileMeta?.selected_title_id;
+  const currentTitleLevel =
+    badges.find((b) => b.id === selectedTitleId)?.level
+    ?? Math.max(...earnedBadges.map((b) => b.level).filter(Boolean), 1);
 
   const showToast = (text) => {
     setToast(text);
@@ -69,7 +92,7 @@ export default function Badges({ navigate }) {
           .filter((b) => !b.earned)
           .map((b) => {
             const ratio = Math.min(b.progress / b.required, 1);
-            const locked = b.progress === 0;
+            const locked = (b.lockedUntilLevel ?? 1) > currentTitleLevel;
             return (
               <div
                 key={b.id}
@@ -86,6 +109,16 @@ export default function Badges({ navigate }) {
                     {b.progress}/{b.required}
                   </div>
                 </div>
+                {!locked && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ marginTop: 8, fontSize: 12, padding: '4px 10px' }}
+                    onClick={() => navigate(getBadgeNavPath(b))}
+                  >
+                    여기 다음에 가봐 →
+                  </button>
+                )}
               </div>
             );
           })}

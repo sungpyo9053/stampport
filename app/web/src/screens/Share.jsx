@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { useApp } from '../context/appContext.js';
-import { categoryIcon, categoryLabel } from '../data/options.js';
+import { categoryLabel } from '../data/options.js';
 import { stampGradeFor, verificationDef } from '../utils/leveling.js';
 import VisaBadge from '../components/VisaBadge.jsx';
+import StampSeal from '../components/StampSeal.jsx';
 
 export default function Share({ navigate, stampId }) {
   const { stampById, user, level, selectedTitle, badges } = useApp();
@@ -17,9 +18,6 @@ export default function Share({ navigate, stampId }) {
     ) || null;
   }, [badges, stamp]);
 
-  // We pick the badge with the highest progress ratio that involves
-  // *this stamp's category or area* — gives the share card a "이 도장
-  // 덕분에 X까지 N곳 남음" line that matters.
   const relatedBadge = useMemo(() => {
     if (!stamp) return null;
     const candidates = badges
@@ -90,69 +88,70 @@ export default function Share({ navigate, stampId }) {
       </div>
 
       <div className="share-canvas" data-grade={grade.grade}>
-        <div className="share-top">
-          <span className="share-eyebrow">STAMPPORT · 로컬 여권</span>
-          <span className="share-grade" style={{ backgroundColor: grade.color }}>
-            {grade.grade} · {verification.short}
-          </span>
+        <div className="share-hero">
+          <div className="share-title-seal">
+            <StampSeal category={stamp.category} grade={grade} size={80} />
+          </div>
+          <div className="share-hero-meta">
+            <span className="share-eyebrow">STAMPPORT · 로컬 여권</span>
+            <span className="share-grade" style={{ backgroundColor: grade.color }}>
+              {grade.grade} · {verification.short}
+            </span>
+            <h2>{stamp.place_name}</h2>
+          </div>
         </div>
-        <h2>{stamp.place_name}</h2>
-        <p className="share-sub">
-          {stamp.area} · {categoryLabel(stamp.category)} · {dateLabel}
-        </p>
-        {stamp.representative_menu ? (
-          <p className="share-sub">대표 메뉴 · {stamp.representative_menu}</p>
-        ) : null}
-        {stamp.experience_note ? (
-          <blockquote className="share-note">
-            “{stamp.experience_note}”
-          </blockquote>
-        ) : null}
-        {stamp.tags?.length ? (
-          <div className="share-tags">
-            {stamp.tags.map((t) => (
-              <span key={t} className="tag-pill">#{t}</span>
-            ))}
-          </div>
-        ) : null}
 
-        {relatedBadge ? (
-          <div className="share-badge-progress">
-            <div className="sbp-line">
-              <span aria-hidden="true">{relatedBadge.icon}</span>
-              <span>
-                <strong>{relatedBadge.name}</strong> · {relatedBadge.progress}/
-                {relatedBadge.required}
-              </span>
+        <div className="share-body">
+          <p className="share-sub">
+            {stamp.area} · {categoryLabel(stamp.category)} · {dateLabel}
+          </p>
+          {stamp.representative_menu ? (
+            <p className="share-sub">대표 메뉴 · {stamp.representative_menu}</p>
+          ) : null}
+          {stamp.experience_note ? (
+            <blockquote className="share-note">
+              "{stamp.experience_note}"
+            </blockquote>
+          ) : null}
+          {stamp.tags?.length ? (
+            <div className="share-tags">
+              {stamp.tags.map((t) => (
+                <span key={t} className="tag-pill">#{t}</span>
+              ))}
             </div>
-            <div className="sbp-bar">
-              <div
-                className="fill"
-                style={{
-                  width: `${Math.round((relatedBadge.progress / relatedBadge.required) * 100)}%`,
-                }}
-              />
-            </div>
-          </div>
-        ) : null}
+          ) : null}
 
-        {earnedVisa && (
-          <div className="share-visa">
-            <VisaBadge badge={earnedVisa} />
-            <span className="share-visa-label">{earnedVisa.titleLabel} 비자 보유</span>
-          </div>
-        )}
+          {relatedBadge ? (
+            <div className="share-badge-progress">
+              <div className="sbp-line">
+                <span aria-hidden="true">{relatedBadge.icon}</span>
+                <span>
+                  <strong>{relatedBadge.titleLabel}</strong>까지 {relatedBadge.required - relatedBadge.progress}곳 남았어요
+                </span>
+              </div>
+              <div className="sbp-bar">
+                <div
+                  className="fill"
+                  style={{
+                    width: `${Math.round((relatedBadge.progress / relatedBadge.required) * 100)}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
+
+          {earnedVisa && (
+            <div className="share-visa">
+              <VisaBadge badge={earnedVisa} />
+              <span className="share-visa-label">{earnedVisa.titleLabel} 비자 보유</span>
+            </div>
+          )}
+        </div>
 
         <div className="share-foot">
           <div className="share-id">
             <strong>{user?.nickname || '여행자'}</strong>
-            <span>Lv.{level} · {selectedTitle}</span>
             <span className="share-exp-line">+{stamp.exp_gained} EXP</span>
-          </div>
-          <div className="share-stamp" aria-hidden="true">
-            <span>STAMP</span>
-            <strong>{categoryIcon(stamp.category)}</strong>
-            <span>{stamp.area}</span>
           </div>
         </div>
       </div>
