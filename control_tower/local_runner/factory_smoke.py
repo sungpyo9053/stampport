@@ -238,6 +238,28 @@ class SmokeRun:
     design_spec_target_files_count: int = 0
     design_spec_svg_path_valid: bool | None = None
     design_spec_feature: str | None = None
+    design_spec_feature_id: str | None = None
+    # Cycle Source-of-Truth Contract — mirrors the canonical feature_id
+    # locked by `_lock_source_of_truth` after planner_revision /
+    # product_planning. Surfaced in the smoke report's
+    # `Source-of-Truth Contract` section so the operator can see at a
+    # glance which stage owns the cycle's feature_id.
+    source_of_truth_feature: str | None = None
+    source_of_truth_feature_id: str | None = None
+    source_of_truth_stage: str | None = None
+    source_of_truth_locked_at: str | None = None
+    source_of_truth_contract_status: str | None = None
+    source_of_truth_contract_reason: str | None = None
+    implementation_ticket_feature_id: str | None = None
+    claude_proposal_feature_id: str | None = None
+    # Runtime artifact sweep — mirror of stage_runtime_artifact_sweep
+    # output. Rendered in the smoke report under
+    # `Runtime Artifact Sweep` so the operator can see which stale
+    # files (and which previous run) the sweep isolated this cycle.
+    runtime_artifact_sweep_status: str = "not_run"
+    runtime_artifact_sweep_isolated_count: int = 0
+    runtime_artifact_sweep_isolated_files: list[str] = field(default_factory=list)
+    runtime_artifact_sweep_current_run_id: str | None = None
     # Per-cycle source provenance — answers "where did the cycle's
     # 'what to build' answer come from?" so the operator can detect a
     # spec/proposal mismatch at a glance.
@@ -965,6 +987,54 @@ def _finalize_run(
         run.design_spec_target_files = [str(p) for p in target_files]
         run.design_spec_target_files_count = len(target_files)
     run.design_spec_feature = factory_state.get("design_spec_feature")
+    # Cycle Source-of-Truth Contract — mirrored from factory_state so
+    # the smoke report and the autopilot don't have to reach back into
+    # cycle.py to render the canonical feature_id / sweep status.
+    run.source_of_truth_feature = factory_state.get(
+        "source_of_truth_feature"
+    )
+    run.source_of_truth_feature_id = factory_state.get(
+        "source_of_truth_feature_id"
+    )
+    run.source_of_truth_stage = factory_state.get(
+        "source_of_truth_stage"
+    )
+    run.source_of_truth_locked_at = factory_state.get(
+        "source_of_truth_locked_at"
+    )
+    run.source_of_truth_contract_status = factory_state.get(
+        "source_of_truth_contract_status"
+    )
+    run.source_of_truth_contract_reason = factory_state.get(
+        "source_of_truth_contract_reason"
+    )
+    run.implementation_ticket_feature_id = factory_state.get(
+        "implementation_ticket_feature_id"
+    )
+    run.claude_proposal_feature_id = factory_state.get(
+        "claude_proposal_feature_id"
+    )
+    run.design_spec_feature_id = factory_state.get(
+        "design_spec_feature_id"
+    )
+    run.runtime_artifact_sweep_status = (
+        factory_state.get("runtime_artifact_sweep_status") or "not_run"
+    )
+    sweep_files = factory_state.get(
+        "runtime_artifact_sweep_isolated_files"
+    ) or []
+    if isinstance(sweep_files, list):
+        run.runtime_artifact_sweep_isolated_files = [str(p) for p in sweep_files]
+    sweep_count = factory_state.get("runtime_artifact_sweep_isolated_count")
+    if isinstance(sweep_count, int):
+        run.runtime_artifact_sweep_isolated_count = sweep_count
+    else:
+        run.runtime_artifact_sweep_isolated_count = len(
+            run.runtime_artifact_sweep_isolated_files
+        )
+    run.runtime_artifact_sweep_current_run_id = factory_state.get(
+        "runtime_artifact_sweep_current_run_id"
+    )
     run.selected_feature = factory_state.get("selected_feature")
     run.selected_feature_source = factory_state.get("selected_feature_source")
     run.implementation_ticket_source = factory_state.get(
@@ -1191,6 +1261,25 @@ def _serialize_run(run: SmokeRun) -> dict:
         "design_spec_target_files_count": run.design_spec_target_files_count,
         "design_spec_svg_path_valid": run.design_spec_svg_path_valid,
         "design_spec_feature": run.design_spec_feature,
+        "design_spec_feature_id": run.design_spec_feature_id,
+        "source_of_truth_feature": run.source_of_truth_feature,
+        "source_of_truth_feature_id": run.source_of_truth_feature_id,
+        "source_of_truth_stage": run.source_of_truth_stage,
+        "source_of_truth_locked_at": run.source_of_truth_locked_at,
+        "source_of_truth_contract_status":
+            run.source_of_truth_contract_status,
+        "source_of_truth_contract_reason":
+            run.source_of_truth_contract_reason,
+        "implementation_ticket_feature_id":
+            run.implementation_ticket_feature_id,
+        "claude_proposal_feature_id": run.claude_proposal_feature_id,
+        "runtime_artifact_sweep_status": run.runtime_artifact_sweep_status,
+        "runtime_artifact_sweep_isolated_count":
+            run.runtime_artifact_sweep_isolated_count,
+        "runtime_artifact_sweep_isolated_files":
+            list(run.runtime_artifact_sweep_isolated_files),
+        "runtime_artifact_sweep_current_run_id":
+            run.runtime_artifact_sweep_current_run_id,
         "selected_feature": run.selected_feature,
         "selected_feature_source": run.selected_feature_source,
         "implementation_ticket_source": run.implementation_ticket_source,
@@ -1273,6 +1362,8 @@ def _build_report(
     ]
 
     lines.extend(_build_pipeline_decision_section(run, factory_state))
+    lines.extend(_build_source_of_truth_section(run, factory_state))
+    lines.extend(_build_runtime_artifact_sweep_section(run))
     lines.extend(_build_design_spec_section(run))
     lines.extend(_build_stale_design_spec_section(run))
     lines.extend(_build_scope_consistency_section(run))
@@ -1402,6 +1493,81 @@ def _build_pipeline_decision_section(
         ):
             if name in checks:
                 out.append(f"| {name} | `{checks[name]}` |")
+    return out
+
+
+def _build_source_of_truth_section(
+    run: SmokeRun, factory_state: dict | None
+) -> list[str]:
+    """Render the Cycle Source-of-Truth Contract block. Always emitted
+    once SoT is active in factory_state (even when missing) so the
+    operator can tell at a glance whether a cycle had a canonical
+    feature_id and whether downstream stages agreed."""
+    factory_state = factory_state or {}
+    sot_fid = (
+        run.source_of_truth_feature_id
+        or factory_state.get("source_of_truth_feature_id")
+    )
+    sot_status = (
+        run.source_of_truth_contract_status
+        or factory_state.get("source_of_truth_contract_status")
+    )
+    if not sot_fid and not sot_status:
+        return []
+    out = ["", "## Source-of-Truth Contract"]
+    out.append(
+        f"- source_of_truth_feature: `{run.source_of_truth_feature or '—'}`"
+    )
+    out.append(f"- source_of_truth_feature_id: `{sot_fid or '—'}`")
+    out.append(
+        f"- source_of_truth_stage: `{run.source_of_truth_stage or '—'}`"
+    )
+    out.append(
+        f"- source_of_truth_locked_at: `{run.source_of_truth_locked_at or '—'}`"
+    )
+    out.append(f"- contract_status: `{sot_status or '—'}`")
+    if run.source_of_truth_contract_reason:
+        out.append(
+            f"- contract_reason: {run.source_of_truth_contract_reason}"
+        )
+    out.append("")
+    out.append("| stage | feature_id | aligns with SoT? |")
+    out.append("|-------|------------|------------------|")
+    for label, fid in (
+        ("design_spec", run.design_spec_feature_id),
+        ("implementation_ticket", run.implementation_ticket_feature_id),
+        ("claude_proposal", run.claude_proposal_feature_id),
+    ):
+        norm = (fid or "").strip()
+        ok = "—" if not norm else (
+            "✅" if (sot_fid or "").strip() == norm else "❌"
+        )
+        out.append(f"| {label} | `{norm or '—'}` | {ok} |")
+    return out
+
+
+def _build_runtime_artifact_sweep_section(run: SmokeRun) -> list[str]:
+    """Render the runtime artifact sweep result. Empty when the sweep
+    never ran AND nothing was isolated — keeps the report tidy on
+    fresh-runtime cycles."""
+    status = run.runtime_artifact_sweep_status or "not_run"
+    if status == "not_run" and not run.runtime_artifact_sweep_isolated_files:
+        return []
+    out = ["", "## Runtime Artifact Sweep"]
+    out.append(f"- status: `{status}`")
+    out.append(
+        f"- current_run_id: `{run.runtime_artifact_sweep_current_run_id or '—'}`"
+    )
+    out.append(
+        f"- isolated_count: `{run.runtime_artifact_sweep_isolated_count}`"
+    )
+    if run.runtime_artifact_sweep_isolated_files:
+        out.append("- isolated_files:")
+        for p in run.runtime_artifact_sweep_isolated_files[:10]:
+            out.append(f"  - `{p}`")
+        if len(run.runtime_artifact_sweep_isolated_files) > 10:
+            extra = len(run.runtime_artifact_sweep_isolated_files) - 10
+            out.append(f"  - … (+{extra} more)")
     return out
 
 
@@ -6480,6 +6646,678 @@ def self_test() -> tuple[int, int, list[str]]:
             f"Claude-H: passed executor + applied must remain "
             f"ready_to_publish — got {decision}"
         )
+
+    # ------------------------------------------------------------------
+    # Cycle Source-of-Truth Contract — fixtures A–N. These exercise
+    # `_lock_source_of_truth`, `validate_source_of_truth_contract`,
+    # the runtime artifact sweep, and `validate_apply_preflight`'s
+    # refactored stale-artifact gate end-to-end against the same
+    # cycle.py module the live runner uses. Each test states the
+    # invariant it covers; fixture state dicts are minimal and reuse
+    # the same factory_state defaults.
+    # ------------------------------------------------------------------
+    if _cycle is not None:
+        from dataclasses import dataclass as _dc, field as _fld
+
+        def _new_state(**overrides) -> "_cycle.CycleState":
+            st = _cycle.CycleState(cycle=1)
+            st.run_id = "r-sot-test-0001"
+            for k, v in overrides.items():
+                setattr(st, k, v)
+            return st
+
+        # SoT-A. planner generates feature A → SoT locks to A by id.
+        total += 1
+        st = _new_state(
+            product_planner_status="generated",
+            product_planner_selected_feature="Local Visa 배지",
+        )
+        out = _cycle._lock_source_of_truth(st)
+        if (
+            out["ok"]
+            and st.source_of_truth_feature_id == _cycle._to_feature_id(
+                "Local Visa 배지"
+            )
+            and st.source_of_truth_stage == "product_planning"
+            and st.source_of_truth_contract_status == "locked"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-A: planner=A must lock SoT to A — out={out} "
+                f"sot_fid={st.source_of_truth_feature_id!r} "
+                f"stage={st.source_of_truth_stage!r}"
+            )
+
+        # SoT-B. planner=A, planner_revision=B → SoT locks to B
+        # (planner_revision wins per policy decision #3).
+        total += 1
+        st = _new_state(
+            product_planner_status="generated",
+            product_planner_selected_feature="A 기능",
+            planner_revision_status="generated",
+            planner_revision_selected_feature="B 기능",
+        )
+        _cycle._lock_source_of_truth(st)
+        if (
+            st.source_of_truth_feature_id
+            == _cycle._to_feature_id("B 기능")
+            and st.source_of_truth_stage == "planner_revision"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-B: revision must override planner — sot_fid="
+                f"{st.source_of_truth_feature_id!r} "
+                f"stage={st.source_of_truth_stage!r}"
+            )
+
+        # SoT-C. design_spec extracted feature_id=B but SoT=A → the
+        # SoT contract validator fails with source_of_truth_mismatch.
+        total += 1
+        st = _new_state(
+            source_of_truth_feature="A 기능",
+            source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+            source_of_truth_stage="planner_revision",
+            source_of_truth_contract_status="locked",
+            design_spec_status="generated",
+            design_spec_acceptance_passed=True,
+            design_spec_feature="B 기능",
+            design_spec_feature_id=_cycle._to_feature_id("B 기능"),
+        )
+        sot_check = _cycle.validate_source_of_truth_contract(st)
+        if (
+            sot_check["ok"] is False
+            and sot_check["code"] == "source_of_truth_mismatch"
+            and any(
+                m["stage"] == "design_spec"
+                for m in (sot_check.get("evidence") or {}).get(
+                    "mismatches", []
+                )
+            )
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-C: design_spec feature_id=B vs SoT=A must fail "
+                f"with source_of_truth_mismatch — got {sot_check}"
+            )
+
+        # SoT-D. design_spec_status=skipped + on-disk design_spec.md
+        # with a different run_id → validate_apply_preflight() does
+        # NOT trip stale_artifact_preflight; the design_spec disk
+        # file is simply ignored (sweep's responsibility).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_repo = os.environ.get("LOCAL_RUNNER_REPO")
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            saved_runtime = _cycle.RUNTIME
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_proposal = _cycle.PROPOSAL_FILE
+            saved_active = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            saved_stale_dir = _cycle.STALE_ARTIFACTS_DIR
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.RUNTIME = runtime
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.PROPOSAL_FILE = runtime / "claude_proposal.md"
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = runtime / "active_rework_feature.json"
+                _cycle.STALE_ARTIFACTS_DIR = runtime / "stale_artifacts"
+                # Write a stale design_spec.md (different run_id).
+                _cycle.safe_write_artifact(
+                    _cycle.DESIGN_SPEC_FILE, "# Stampport Design Implementation Spec\nold body",
+                    cycle_id=1, stage="design_spec",
+                    source_agent="designer",
+                    feature_id=_cycle._to_feature_id("Old Feature"),
+                    run_id="r-OLD",
+                    extra={"acceptance": "passed"},
+                )
+                # Current cycle: design_spec was SKIPPED — must not
+                # cause apply_preflight stale_artifact_preflight.
+                st_d = _new_state(
+                    run_id="r-CURRENT",
+                    source_of_truth_feature="A 기능",
+                    source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+                    source_of_truth_stage="planner_revision",
+                    source_of_truth_contract_status="locked",
+                    product_planner_status="generated",
+                    product_planner_selected_feature="A 기능",
+                    planner_revision_status="generated",
+                    planner_revision_selected_feature="A 기능",
+                    design_spec_status="skipped",
+                    implementation_ticket_status="generated",
+                    implementation_ticket_selected_feature="A 기능",
+                    implementation_ticket_feature_id=_cycle._to_feature_id("A 기능"),
+                    implementation_ticket_target_files=["app/web/src/screens/Foo.jsx"],
+                )
+                # Write the matching ticket so the artifact-stale
+                # check reads the current run_id.
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# Implementation Ticket\nbody",
+                    cycle_id=1, stage="implementation_ticket",
+                    source_agent="pm",
+                    feature_id=_cycle._to_feature_id("A 기능"),
+                    run_id="r-CURRENT",
+                )
+                pf = _cycle.validate_apply_preflight(st_d)
+                ok_d = pf["code"] != "stale_artifact_preflight"
+                if ok_d:
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-D: skipped design_spec + stale design_spec.md "
+                        f"on disk must NOT trip stale_artifact_preflight — "
+                        f"got {pf}"
+                    )
+            finally:
+                _cycle.RUNTIME = saved_runtime
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+                _cycle.PROPOSAL_FILE = saved_proposal
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_active
+                _cycle.STALE_ARTIFACTS_DIR = saved_stale_dir
+                if saved_repo is None:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+                else:
+                    os.environ["LOCAL_RUNNER_REPO"] = saved_repo
+
+        # SoT-E. ticket feature_id != SoT → SoT validator fails with
+        # source_of_truth_mismatch (apply_preflight inherits the code
+        # so claude budget is never spent).
+        total += 1
+        st = _new_state(
+            source_of_truth_feature="A 기능",
+            source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+            source_of_truth_stage="planner_revision",
+            source_of_truth_contract_status="locked",
+            implementation_ticket_status="generated",
+            implementation_ticket_selected_feature="B 기능",
+            implementation_ticket_feature_id=_cycle._to_feature_id("B 기능"),
+            implementation_ticket_target_files=["x.jsx"],
+        )
+        sot_check = _cycle.validate_source_of_truth_contract(st)
+        if (
+            sot_check["code"] == "source_of_truth_mismatch"
+            and any(
+                m["stage"] == "implementation_ticket"
+                for m in (sot_check.get("evidence") or {}).get(
+                    "mismatches", []
+                )
+            )
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-E: ticket feature_id != SoT must fail SoT contract — "
+                f"got {sot_check}"
+            )
+
+        # SoT-F. claude_proposal feature_id != SoT → same.
+        total += 1
+        st = _new_state(
+            source_of_truth_feature="A 기능",
+            source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+            source_of_truth_stage="planner_revision",
+            source_of_truth_contract_status="locked",
+            claude_proposal_status="generated",
+            claude_proposal_feature_id=_cycle._to_feature_id("B 기능"),
+        )
+        sot_check = _cycle.validate_source_of_truth_contract(st)
+        if (
+            sot_check["code"] == "source_of_truth_mismatch"
+            and any(
+                m["stage"] == "claude_proposal"
+                for m in (sot_check.get("evidence") or {}).get(
+                    "mismatches", []
+                )
+            )
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-F: proposal feature_id != SoT must fail SoT contract — "
+                f"got {sot_check}"
+            )
+
+        # SoT-G. planner fallback feature differs from design_spec
+        # feature → SoT comes from planner_revision (not design_spec).
+        total += 1
+        st = _new_state(
+            product_planner_status="generated",
+            product_planner_selected_feature="Planner Pick",
+            planner_revision_status="generated",
+            planner_revision_selected_feature="Revision Pick",
+            design_spec_status="generated",
+            design_spec_acceptance_passed=True,
+            design_spec_feature="Spec-only Feature",
+            design_spec_feature_id=_cycle._to_feature_id("Spec-only Feature"),
+        )
+        _cycle._lock_source_of_truth(st)
+        if (
+            st.source_of_truth_feature_id
+            == _cycle._to_feature_id("Revision Pick")
+            and st.source_of_truth_stage == "planner_revision"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"SoT-G: planner SoT must dominate design_spec feature — "
+                f"sot_fid={st.source_of_truth_feature_id!r} "
+                f"stage={st.source_of_truth_stage!r}"
+            )
+
+        # SoT-H. design_spec_status=skipped + stale design_spec.md
+        # run_id != current_run_id → validate_apply_preflight DOES NOT
+        # fail with stale_artifact_preflight (sweep's responsibility,
+        # not the apply gate's).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_runtime = _cycle.RUNTIME
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.RUNTIME = runtime
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.safe_write_artifact(
+                    _cycle.DESIGN_SPEC_FILE, "# spec body",
+                    cycle_id=1, stage="design_spec", source_agent="designer",
+                    feature_id="x", run_id="r-OLD",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# ticket body",
+                    cycle_id=1, stage="implementation_ticket", source_agent="pm",
+                    feature_id=_cycle._to_feature_id("A 기능"), run_id="r-CURR",
+                )
+                st_h = _new_state(
+                    run_id="r-CURR",
+                    source_of_truth_feature="A 기능",
+                    source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+                    source_of_truth_stage="planner_revision",
+                    source_of_truth_contract_status="locked",
+                    design_spec_status="skipped",
+                    implementation_ticket_status="generated",
+                    implementation_ticket_selected_feature="A 기능",
+                    implementation_ticket_feature_id=_cycle._to_feature_id("A 기능"),
+                    implementation_ticket_target_files=["x.jsx"],
+                )
+                pf = _cycle.validate_apply_preflight(st_h)
+                if pf["code"] != "stale_artifact_preflight":
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-H: skipped spec + stale design_spec.md must NOT "
+                        f"trip stale_artifact_preflight — got {pf}"
+                    )
+            finally:
+                _cycle.RUNTIME = saved_runtime
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+
+        # SoT-I. design_spec_status=generated && accepted but spec on
+        # disk has a stale run_id → validate_apply_preflight fails
+        # with stale_artifact_preflight (or source_of_truth_mismatch
+        # when feature_ids also diverge).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_runtime = _cycle.RUNTIME
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.RUNTIME = runtime
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.safe_write_artifact(
+                    _cycle.DESIGN_SPEC_FILE, "# spec body",
+                    cycle_id=1, stage="design_spec",
+                    source_agent="designer",
+                    feature_id=_cycle._to_feature_id("A 기능"),
+                    run_id="r-OLD-STALE",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# ticket body",
+                    cycle_id=1, stage="implementation_ticket",
+                    source_agent="pm",
+                    feature_id=_cycle._to_feature_id("A 기능"),
+                    run_id="r-CURR",
+                )
+                st_i = _new_state(
+                    run_id="r-CURR",
+                    source_of_truth_feature="A 기능",
+                    source_of_truth_feature_id=_cycle._to_feature_id("A 기능"),
+                    source_of_truth_stage="planner_revision",
+                    source_of_truth_contract_status="locked",
+                    design_spec_status="generated",
+                    design_spec_acceptance_passed=True,
+                    design_spec_feature="A 기능",
+                    design_spec_feature_id=_cycle._to_feature_id("A 기능"),
+                    implementation_ticket_status="generated",
+                    implementation_ticket_selected_feature="A 기능",
+                    implementation_ticket_feature_id=_cycle._to_feature_id("A 기능"),
+                    implementation_ticket_target_files=["x.jsx"],
+                )
+                pf = _cycle.validate_apply_preflight(st_i)
+                if pf["code"] in {
+                    "stale_artifact_preflight", "source_of_truth_mismatch",
+                }:
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-I: active spec with stale run_id must fail "
+                        f"preflight — got {pf}"
+                    )
+            finally:
+                _cycle.RUNTIME = saved_runtime
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+
+        # SoT-J. runtime_artifact_sweep isolates a stale-run
+        # design_spec.md (header run_id != current_run_id).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_proposal = _cycle.PROPOSAL_FILE
+            saved_active = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            saved_stale_dir = _cycle.STALE_ARTIFACTS_DIR
+            saved_targets_md = _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS
+            saved_targets_json = _cycle.RUNTIME_SWEEP_JSON_TARGETS
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.PROPOSAL_FILE = runtime / "claude_proposal.md"
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = runtime / "active_rework_feature.json"
+                _cycle.STALE_ARTIFACTS_DIR = runtime / "stale_artifacts"
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = (
+                    _cycle.DESIGN_SPEC_FILE,
+                    _cycle.IMPLEMENTATION_TICKET_FILE,
+                    _cycle.PROPOSAL_FILE,
+                )
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = (
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE,
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.DESIGN_SPEC_FILE, "# old spec",
+                    cycle_id=1, stage="design_spec", source_agent="designer",
+                    feature_id="x", run_id="r-OLD",
+                )
+                st_j = _new_state(run_id="r-J-CURR")
+                out = _cycle._runtime_artifact_sweep(st_j)
+                isolated = out["isolated"]
+                if (
+                    out["status"] == "passed"
+                    and any("design_spec.md" in p for p in isolated)
+                    and not _cycle.DESIGN_SPEC_FILE.is_file()
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-J: stale design_spec.md must be isolated — "
+                        f"out={out} live_exists={_cycle.DESIGN_SPEC_FILE.is_file()}"
+                    )
+            finally:
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+                _cycle.PROPOSAL_FILE = saved_proposal
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_active
+                _cycle.STALE_ARTIFACTS_DIR = saved_stale_dir
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = saved_targets_md
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = saved_targets_json
+
+        # SoT-K. same-run implementation_ticket.md / claude_proposal.md
+        # are NOT isolated by the sweep (same run_id → fresh).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_proposal = _cycle.PROPOSAL_FILE
+            saved_active = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            saved_stale_dir = _cycle.STALE_ARTIFACTS_DIR
+            saved_targets_md = _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS
+            saved_targets_json = _cycle.RUNTIME_SWEEP_JSON_TARGETS
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.PROPOSAL_FILE = runtime / "claude_proposal.md"
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = runtime / "active_rework_feature.json"
+                _cycle.STALE_ARTIFACTS_DIR = runtime / "stale_artifacts"
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = (
+                    _cycle.DESIGN_SPEC_FILE,
+                    _cycle.IMPLEMENTATION_TICKET_FILE,
+                    _cycle.PROPOSAL_FILE,
+                )
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = (
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE,
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# fresh ticket",
+                    cycle_id=1, stage="implementation_ticket", source_agent="pm",
+                    feature_id="x", run_id="r-K-CURR",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.PROPOSAL_FILE, "# fresh proposal",
+                    cycle_id=1, stage="claude_propose", source_agent="claude_propose",
+                    feature_id="x", run_id="r-K-CURR",
+                )
+                st_k = _new_state(run_id="r-K-CURR")
+                out = _cycle._runtime_artifact_sweep(st_k)
+                if (
+                    out["isolated"] == []
+                    and _cycle.IMPLEMENTATION_TICKET_FILE.is_file()
+                    and _cycle.PROPOSAL_FILE.is_file()
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-K: same-run ticket/proposal must NOT be isolated "
+                        f"— out={out}"
+                    )
+            finally:
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+                _cycle.PROPOSAL_FILE = saved_proposal
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_active
+                _cycle.STALE_ARTIFACTS_DIR = saved_stale_dir
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = saved_targets_md
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = saved_targets_json
+
+        # SoT-L. different-run implementation_ticket.md /
+        # claude_proposal.md ARE isolated.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_proposal = _cycle.PROPOSAL_FILE
+            saved_active = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            saved_stale_dir = _cycle.STALE_ARTIFACTS_DIR
+            saved_targets_md = _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS
+            saved_targets_json = _cycle.RUNTIME_SWEEP_JSON_TARGETS
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.PROPOSAL_FILE = runtime / "claude_proposal.md"
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = runtime / "active_rework_feature.json"
+                _cycle.STALE_ARTIFACTS_DIR = runtime / "stale_artifacts"
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = (
+                    _cycle.DESIGN_SPEC_FILE,
+                    _cycle.IMPLEMENTATION_TICKET_FILE,
+                    _cycle.PROPOSAL_FILE,
+                )
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = (
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE,
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# old ticket",
+                    cycle_id=1, stage="implementation_ticket", source_agent="pm",
+                    feature_id="x", run_id="r-L-OLD",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.PROPOSAL_FILE, "# old proposal",
+                    cycle_id=1, stage="claude_propose", source_agent="claude_propose",
+                    feature_id="x", run_id="r-L-OLD",
+                )
+                st_l = _new_state(run_id="r-L-CURR")
+                out = _cycle._runtime_artifact_sweep(st_l)
+                names = {Path(p).name for p in out["isolated"]}
+                if (
+                    "implementation_ticket.md" in names
+                    and "claude_proposal.md" in names
+                    and not _cycle.IMPLEMENTATION_TICKET_FILE.is_file()
+                    and not _cycle.PROPOSAL_FILE.is_file()
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-L: different-run ticket/proposal must be "
+                        f"isolated — out={out}"
+                    )
+            finally:
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+                _cycle.PROPOSAL_FILE = saved_proposal
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_active
+                _cycle.STALE_ARTIFACTS_DIR = saved_stale_dir
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = saved_targets_md
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = saved_targets_json
+
+        # SoT-M. cli_failed retry path with same run_id → ticket and
+        # proposal artifacts on disk are PRESERVED (sweep keeps them
+        # in place because they belong to this run). Models the
+        # FACTORY_APPLY_RETRY_ONLY path.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_proposal = _cycle.PROPOSAL_FILE
+            saved_targets_md = _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS
+            saved_targets_json = _cycle.RUNTIME_SWEEP_JSON_TARGETS
+            saved_stale_dir = _cycle.STALE_ARTIFACTS_DIR
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                _cycle.PROPOSAL_FILE = runtime / "claude_proposal.md"
+                _cycle.STALE_ARTIFACTS_DIR = runtime / "stale_artifacts"
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = (
+                    _cycle.IMPLEMENTATION_TICKET_FILE,
+                    _cycle.PROPOSAL_FILE,
+                )
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = ()
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# ticket",
+                    cycle_id=1, stage="implementation_ticket", source_agent="pm",
+                    feature_id="x", run_id="r-M-CURR",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.PROPOSAL_FILE, "# proposal",
+                    cycle_id=1, stage="claude_propose", source_agent="claude_propose",
+                    feature_id="x", run_id="r-M-CURR",
+                )
+                st_m = _new_state(
+                    run_id="r-M-CURR",
+                    claude_apply_status="cli_failed",
+                )
+                out = _cycle._runtime_artifact_sweep(st_m)
+                if (
+                    out["isolated"] == []
+                    and _cycle.IMPLEMENTATION_TICKET_FILE.is_file()
+                    and _cycle.PROPOSAL_FILE.is_file()
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-M: cli_failed retry must reuse same-run "
+                        f"ticket/proposal — out={out}"
+                    )
+            finally:
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
+                _cycle.PROPOSAL_FILE = saved_proposal
+                _cycle.STALE_ARTIFACTS_DIR = saved_stale_dir
+                _cycle.RUNTIME_SWEEP_MARKDOWN_TARGETS = saved_targets_md
+                _cycle.RUNTIME_SWEEP_JSON_TARGETS = saved_targets_json
+
+        # SoT-N. happy path: planner / design_spec / ticket / proposal
+        # / apply feature_id all match → SoT validator passes,
+        # apply_preflight passes (with no in-memory disk artifacts
+        # set up; the validator does not read disk in the SoT-only
+        # path), and pipeline_decision.can_publish is True.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_design = _cycle.DESIGN_SPEC_FILE
+            saved_ticket = _cycle.IMPLEMENTATION_TICKET_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+                _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+                fid = _cycle._to_feature_id("Happy Path Feature")
+                _cycle.safe_write_artifact(
+                    _cycle.DESIGN_SPEC_FILE, "# spec",
+                    cycle_id=1, stage="design_spec", source_agent="designer",
+                    feature_id=fid, run_id="r-N-CURR",
+                )
+                _cycle.safe_write_artifact(
+                    _cycle.IMPLEMENTATION_TICKET_FILE, "# ticket",
+                    cycle_id=1, stage="implementation_ticket", source_agent="pm",
+                    feature_id=fid, run_id="r-N-CURR",
+                )
+                st_n = _new_state(
+                    run_id="r-N-CURR",
+                    source_of_truth_feature="Happy Path Feature",
+                    source_of_truth_feature_id=fid,
+                    source_of_truth_stage="planner_revision",
+                    source_of_truth_contract_status="locked",
+                    product_planner_status="generated",
+                    product_planner_selected_feature="Happy Path Feature",
+                    planner_revision_status="generated",
+                    planner_revision_selected_feature="Happy Path Feature",
+                    selected_feature="Happy Path Feature",
+                    selected_feature_id=fid,
+                    design_spec_status="generated",
+                    design_spec_acceptance_passed=True,
+                    design_spec_feature="Happy Path Feature",
+                    design_spec_feature_id=fid,
+                    design_spec_target_files=["app/web/src/screens/Foo.jsx"],
+                    implementation_ticket_status="generated",
+                    implementation_ticket_selected_feature="Happy Path Feature",
+                    implementation_ticket_feature_id=fid,
+                    implementation_ticket_target_files=["app/web/src/screens/Foo.jsx"],
+                    claude_proposal_status="generated",
+                    claude_proposal_feature_id=fid,
+                    claude_apply_status="applied",
+                    claude_apply_changed_files=["app/web/src/screens/Foo.jsx"],
+                    qa_status="passed",
+                )
+                pf = _cycle.validate_apply_preflight(st_n)
+                st_n.apply_preflight_status = pf["code"]
+                st_n.apply_preflight_reason = pf["message"]
+                decision = _cycle.build_pipeline_decision(st_n)
+                if (
+                    pf["ok"] is True
+                    and decision.get("can_publish") is True
+                    and decision.get("blocking_code") is None
+                ):
+                    passed += 1
+                else:
+                    failures.append(
+                        f"SoT-N: happy path must reach can_publish=True — "
+                        f"pf={pf} decision={decision}"
+                    )
+            finally:
+                _cycle.DESIGN_SPEC_FILE = saved_design
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
 
     return passed, total, failures
 

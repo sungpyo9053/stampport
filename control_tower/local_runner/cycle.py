@@ -103,6 +103,11 @@ IMPLEMENTATION_TICKET_FILE  = RUNTIME / "implementation_ticket.md"
 # Cleared automatically after claude_apply succeeds (real code change
 # shipped) or when the operator deletes the file.
 ACTIVE_REWORK_FEATURE_FILE = RUNTIME / "active_rework_feature.json"
+# Stale runtime artifacts isolated by stage_runtime_artifact_sweep are
+# moved here (one timestamped subdirectory per sweep) so the operator
+# can still inspect them but no downstream stage can mistake them for
+# the current cycle's output.
+STALE_ARTIFACTS_DIR = RUNTIME / "stale_artifacts"
 # QA Gatekeeper artifacts. qa_report.md is always (re)written by
 # stage_qa_gate; qa_feedback.md is written ONLY when a check fails so
 # the next cycle's qa_fix_propose stage has a precise repro/instruction
@@ -381,6 +386,15 @@ STAGES: list[tuple[str, str, int]] = [
     # short-circuits past every Claude-consuming stage so we never burn
     # planner budget on top of a broken executor.
     ("claude_preflight",         "Claude CLI 점검",         0),
+    # Runtime artifact sweep — runs AFTER claude_preflight (so a broken
+    # CLI doesn't waste time sweeping) and BEFORE product_planning, so
+    # any leftover .runtime/design_spec.md / implementation_ticket.md /
+    # claude_proposal.md from a previous run is moved aside before any
+    # current-cycle stage can consume it as if it were fresh. The
+    # sweep is the kernel mechanism behind the Cycle Source-of-Truth
+    # Contract; apply_preflight is then free to act as the last
+    # defense rather than the stale-file janitor.
+    ("runtime_artifact_sweep",   "런타임 아티팩트 정리",     0),
     # Product Planner sits BEFORE the build/syntax gates: a planning
     # tick produces a report file that the later claude_propose stage
     # consumes verbatim. Runs only when FACTORY_PRODUCT_PLANNER_MODE is
@@ -702,6 +716,39 @@ class CycleState:
     claude_apply_source: str | None = None         # claude_proposal|design_spec
     design_spec_feature: str | None = None
     design_spec_feature_id: str | None = None
+    # Cycle Source-of-Truth Contract — locked once per cycle by
+    # `_lock_source_of_truth` after product_planning / planner_revision
+    # finishes. Every downstream stage (design_spec / implementation_
+    # ticket / claude_propose / claude_apply) MUST emit feature_id ==
+    # source_of_truth_feature_id; `validate_source_of_truth_contract`
+    # enforces this and the apply_preflight short-circuits with code
+    # `source_of_truth_mismatch` on violation. The lock prevents the
+    # "design_spec belongs to a previous cycle / feature" symptom by
+    # making one feature_id authoritative for the whole cycle instead
+    # of letting each stage re-derive a candidate.
+    source_of_truth_feature: str | None = None
+    source_of_truth_feature_id: str | None = None
+    # The stage that produced the canonical feature: one of
+    # "planner_revision" | "product_planning" | "active_rework_feature".
+    source_of_truth_stage: str | None = None
+    source_of_truth_locked_at: str | None = None
+    source_of_truth_contract_status: str | None = None  # locked|missing|failed|None
+    source_of_truth_contract_reason: str | None = None
+    # claude_proposal feature_id — set by stage_claude_propose so the
+    # SoT validator can compare against the SoT slug without re-parsing
+    # the proposal artifact header.
+    claude_proposal_feature_id: str | None = None
+    # Runtime artifact sweep — populated by stage_runtime_artifact_sweep
+    # at cycle start (after claude_preflight, before product_planning).
+    # Stale (cross-run) .runtime/ artifacts get moved to
+    # `.runtime/stale_artifacts/<timestamp>/` instead of deleted so the
+    # operator can still inspect them; same-run artifacts are kept in
+    # place so apply-only retry can reuse implementation_ticket.md /
+    # claude_proposal.md.
+    runtime_artifact_sweep_status: str = "not_run"  # passed|skipped|not_run
+    runtime_artifact_sweep_isolated_count: int = 0
+    runtime_artifact_sweep_isolated_files: list[str] = field(default_factory=list)
+    runtime_artifact_sweep_current_run_id: str | None = None
     # run_id — the autopilot run identifier this cycle belongs to. Set
     # at cycle start from FACTORY_RUN_ID / autopilot_state. Every
     # artifact this cycle writes carries the same id, so the UI's
@@ -902,6 +949,20 @@ class CycleState:
             "claude_apply_source": self.claude_apply_source,
             "design_spec_feature": self.design_spec_feature,
             "design_spec_feature_id": self.design_spec_feature_id,
+            "source_of_truth_feature": self.source_of_truth_feature,
+            "source_of_truth_feature_id": self.source_of_truth_feature_id,
+            "source_of_truth_stage": self.source_of_truth_stage,
+            "source_of_truth_locked_at": self.source_of_truth_locked_at,
+            "source_of_truth_contract_status": self.source_of_truth_contract_status,
+            "source_of_truth_contract_reason": self.source_of_truth_contract_reason,
+            "claude_proposal_feature_id": self.claude_proposal_feature_id,
+            "runtime_artifact_sweep_status": self.runtime_artifact_sweep_status,
+            "runtime_artifact_sweep_isolated_count":
+                self.runtime_artifact_sweep_isolated_count,
+            "runtime_artifact_sweep_isolated_files":
+                list(self.runtime_artifact_sweep_isolated_files),
+            "runtime_artifact_sweep_current_run_id":
+                self.runtime_artifact_sweep_current_run_id,
             "run_id": self.run_id,
             "contract_results": list(self.contract_results),
             "apply_preflight_status": self.apply_preflight_status,
@@ -3336,6 +3397,12 @@ def stage_product_planning(state: CycleState) -> StageResult:
         # Stamp the cycle-wide feature_id at planner time so every
         # downstream stage can compare ids rather than fragile names.
         state.selected_feature_id = state.selected_feature_id or _to_feature_id(selected)
+    # Tentatively lock the cycle's source-of-truth feature here so
+    # design_spec / ticket / propose can already compare against the
+    # canonical id when planner_revision is disabled (ping-pong off).
+    # planner_revision will overwrite the lock if it generates a
+    # different feature later in the pipeline.
+    _lock_source_of_truth(state)
     state.product_planner_solution_pattern = pattern or None
     state.product_planner_value_summary = value_summary or None
     state.product_planner_llm_needed = llm_needed or None
@@ -3726,6 +3793,12 @@ def stage_planner_revision(state: CycleState) -> StageResult:
         state.selected_feature_id = (
             state.selected_feature_id or _to_feature_id(revision_selected)
         )
+    # Re-lock the cycle source-of-truth — per policy decision #3
+    # planner_revision is the FINAL canonical source when it generates
+    # a feature (overrides whatever product_planning tentatively
+    # locked). _lock_source_of_truth resolves this naturally because
+    # planner_revision_status now == "generated".
+    _lock_source_of_truth(state)
     state.planner_revision_message = state.planner_revision_selected_feature or "수정안 생성"
     sr.status = "passed"
     sr.message = (
@@ -4360,6 +4433,94 @@ def _feature_ids_match(a: str | None, b: str | None) -> bool:
     return ia == ib
 
 
+def _lock_source_of_truth(state: "CycleState") -> dict:
+    """Lock the cycle's canonical source-of-truth feature_id.
+
+    The kernel rule for the autopilot pipeline is "one cycle, one
+    feature_id". Any drift between planner / design_spec /
+    implementation_ticket / claude_proposal feature_ids is a contract
+    violation surfaced as `source_of_truth_mismatch` at apply preflight.
+    This helper computes the canonical feature once based on the most
+    recent planner output and stamps it onto state.
+
+    Resolution order (latest planner verdict wins; planner_revision
+    overrides product_planning per policy decision #3):
+      1. planner_revision_selected_feature when planner_revision_status
+         == "generated"
+      2. else product_planner_selected_feature when product_planner_
+         status in {"generated", "fallback_generated"}
+      3. else active_rework_feature carry-over (HOLD lock)
+
+    Comparison is by `_to_feature_id` slug — never by string title —
+    per policy decision #4. Subsequent stages MUST consult
+    `state.source_of_truth_feature_id`, not the per-stage selected_
+    feature fields, when emitting their own feature_id.
+
+    Returns a dict {ok, code, feature, feature_id, stage} for callers
+    that want to log the lock outcome.
+    """
+    feature: str | None = None
+    stage: str | None = None
+    if (
+        state.planner_revision_status == "generated"
+        and (state.planner_revision_selected_feature or "").strip()
+    ):
+        feature = state.planner_revision_selected_feature
+        stage = "planner_revision"
+    elif (
+        state.product_planner_status in {"generated", "fallback_generated"}
+        and (state.product_planner_selected_feature or "").strip()
+    ):
+        feature = state.product_planner_selected_feature
+        stage = "product_planning"
+    elif (state.active_rework_feature or "").strip():
+        feature = state.active_rework_feature
+        stage = "active_rework_feature"
+    if not feature:
+        state.source_of_truth_contract_status = "missing"
+        state.source_of_truth_contract_reason = (
+            "neither planner_revision nor product_planner produced a feature"
+        )
+        return {
+            "ok": False,
+            "code": "missing_source_of_truth",
+            "feature": None,
+            "feature_id": None,
+            "stage": None,
+        }
+    feature = feature.strip()
+    fid = _to_feature_id(feature)
+    if not fid:
+        state.source_of_truth_contract_status = "failed"
+        state.source_of_truth_contract_reason = (
+            f"feature='{feature}' did not slugify"
+        )
+        return {
+            "ok": False,
+            "code": "missing_source_of_truth",
+            "feature": feature,
+            "feature_id": None,
+            "stage": stage,
+        }
+    state.source_of_truth_feature = feature
+    state.source_of_truth_feature_id = fid
+    state.source_of_truth_stage = stage
+    state.source_of_truth_locked_at = utc_now_iso()
+    state.source_of_truth_contract_status = "locked"
+    state.source_of_truth_contract_reason = None
+    # Mirror to the legacy selected_feature_id so older readers
+    # (validate_planner_contract / scope_contract) stay aligned.
+    if not state.selected_feature_id:
+        state.selected_feature_id = fid
+    return {
+        "ok": True,
+        "code": "locked",
+        "feature": feature,
+        "feature_id": fid,
+        "stage": stage,
+    }
+
+
 def _resolve_run_id() -> str:
     """Return the active run_id for this cycle process.
 
@@ -4498,6 +4659,151 @@ def _clear_active_rework_feature() -> bool:
     except OSError:
         pass
     return False
+
+
+# Header-bearing markdown artifacts swept at cycle start. Each carries
+# a `run_id:` field in its `<!-- stampport_artifact -->` header that we
+# parse to decide whether the file belongs to the current run.
+RUNTIME_SWEEP_MARKDOWN_TARGETS: tuple[Path, ...] = (
+    DESIGN_SPEC_FILE,
+    IMPLEMENTATION_TICKET_FILE,
+    PROPOSAL_FILE,
+)
+# JSON artifacts swept at cycle start. The on-disk shape includes a
+# top-level `run_id` field (see `_save_active_rework_feature`).
+RUNTIME_SWEEP_JSON_TARGETS: tuple[Path, ...] = (
+    ACTIVE_REWORK_FEATURE_FILE,
+)
+
+
+def _runtime_artifact_sweep(
+    state: "CycleState",
+) -> dict:
+    """Move .runtime artifacts whose embedded run_id != current_run_id
+    into `.runtime/stale_artifacts/<timestamp>/`. Same-run artifacts
+    are left in place so the apply-only retry path can reuse the
+    current cycle's implementation_ticket.md / claude_proposal.md.
+
+    Pure-ish: returns a summary dict and writes only to the filesystem
+    (no state mutation). The caller (stage_runtime_artifact_sweep)
+    mirrors the result onto state.
+
+    `.diff` files (claude_apply.diff, claude_apply_rolled_back.diff)
+    have no header so they are intentionally NOT swept here — the
+    runner / apply_preflight gate covers diff freshness separately,
+    and the operator may need them as forensic evidence on failure.
+    """
+    cur_run = (state.run_id or _resolve_run_id() or "").strip()
+    if not cur_run:
+        return {
+            "status": "skipped",
+            "isolated": [],
+            "current_run_id": None,
+        }
+    isolated: list[str] = []
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    dest_dir: Path | None = None
+
+    def _ensure_dest() -> Path | None:
+        nonlocal dest_dir
+        if dest_dir is None:
+            try:
+                d = STALE_ARTIFACTS_DIR / ts
+                d.mkdir(parents=True, exist_ok=True)
+                dest_dir = d
+            except OSError:
+                return None
+        return dest_dir
+
+    for path in RUNTIME_SWEEP_MARKDOWN_TARGETS:
+        try:
+            if not path.is_file():
+                continue
+            head = path.read_text(encoding="utf-8")[:512]
+        except OSError:
+            continue
+        rid = _parse_artifact_run_id(head)
+        if not rid or rid == cur_run:
+            continue
+        d = _ensure_dest()
+        if d is None:
+            continue
+        try:
+            target = d / path.name
+            if target.exists():
+                target.unlink()
+            path.rename(target)
+            isolated.append(str(target))
+        except OSError:
+            pass
+
+    for path in RUNTIME_SWEEP_JSON_TARGETS:
+        try:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rid = ""
+        if isinstance(data, dict):
+            rid = (data.get("run_id") or "").strip()
+        if not rid or rid == cur_run:
+            continue
+        d = _ensure_dest()
+        if d is None:
+            continue
+        try:
+            target = d / path.name
+            if target.exists():
+                target.unlink()
+            path.rename(target)
+            isolated.append(str(target))
+        except OSError:
+            pass
+
+    return {
+        "status": "passed",
+        "isolated": isolated,
+        "current_run_id": cur_run,
+    }
+
+
+def stage_runtime_artifact_sweep(state: CycleState) -> StageResult:
+    """Cycle-init hygiene step: move stale (cross-run) artifacts aside
+    so design_spec / implementation_ticket / claude_propose stages
+    cannot consume a previous run's output as if it were fresh."""
+    label = next(
+        (lab for n, lab, _ in STAGES if n == "runtime_artifact_sweep"),
+        "런타임 아티팩트 정리",
+    )
+    sr = StageResult(name="runtime_artifact_sweep", label=label, status="running")
+    t0 = time.time()
+    out = _runtime_artifact_sweep(state)
+    sr.duration_sec = round(time.time() - t0, 3)
+    state.runtime_artifact_sweep_status = out["status"]
+    state.runtime_artifact_sweep_isolated_count = len(out["isolated"])
+    state.runtime_artifact_sweep_isolated_files = list(out["isolated"])
+    state.runtime_artifact_sweep_current_run_id = out["current_run_id"]
+    if out["status"] == "skipped":
+        sr.status = "skipped"
+        sr.message = "current_run_id 미확정 — sweep 스킵"
+        return sr
+    if out["isolated"]:
+        sr.status = "passed"
+        sr.message = (
+            f"stale .runtime 아티팩트 {len(out['isolated'])}건 격리 → "
+            f".runtime/stale_artifacts/"
+        )
+        _emit_cycle_log(
+            state, "runtime_artifact_sweep_isolated",
+            sr.message,
+            isolated=out["isolated"][:8],
+            current_run_id=out["current_run_id"],
+        )
+    else:
+        sr.status = "passed"
+        sr.message = "stale 아티팩트 없음 — 모든 파일 current run_id 일치"
+    return sr
 
 
 def _classify_design_spec_freshness(
@@ -4896,18 +5202,59 @@ def stage_design_spec(state: CycleState) -> StageResult:
 
     # Resolve the spec's canonical feature + feature_id BEFORE writing,
     # so the artifact header carries the same id every downstream stage
-    # will see. This is the kernel-contract anchor: once design_spec is
-    # generated + accepted, this feature_id is the single source of
-    # truth for the rest of the cycle.
+    # will see. The Cycle Source-of-Truth Contract makes the planner
+    # (or planner_revision) the canonical source of feature_id; the
+    # design_spec stage is a CONSUMER, not the SoT. If the LLM
+    # reframed the feature under a different name, we hard-fail the
+    # spec with `failed_scope_mismatch` so the next cycle's planner /
+    # design_spec retry can converge — claude_apply must never try to
+    # apply a spec under a different feature_id than the cycle's SoT.
     ds_feature_name = _extract_design_spec_feature(body)
     ds_feature_id = _to_feature_id(ds_feature_name)
+    sot_fid = (state.source_of_truth_feature_id or "").strip()
+    if sot_fid and ds_feature_id and ds_feature_id != sot_fid:
+        # Persist the mismatch on state so the smoke report and the
+        # source_of_truth validator can both render the divergence,
+        # but DO NOT write design_spec.md to disk under the wrong
+        # feature_id — runtime artifact sweep would just have to
+        # isolate it on the next cycle.
+        state.design_spec_status = "failed_scope_mismatch"
+        state.design_spec_acceptance_passed = False
+        state.design_spec_acceptance_failures = [
+            f"design_spec feature_id='{ds_feature_id}' "
+            f"!= source_of_truth_feature_id='{sot_fid}'"
+        ]
+        state.design_spec_feature = ds_feature_name or state.design_spec_feature
+        state.design_spec_feature_id = ds_feature_id
+        state.design_spec_message = (
+            f"design_spec feature_id mismatch — "
+            f"SoT={sot_fid}, spec={ds_feature_id} (격리)"
+        )
+        sr.status = "failed"
+        sr.message = state.design_spec_message
+        sr.detail = state.design_spec_acceptance_failures[0]
+        _emit_cycle_log(
+            state, "design_spec_scope_mismatch",
+            state.design_spec_message,
+            source_of_truth_feature_id=sot_fid,
+            design_spec_feature_id=ds_feature_id,
+        )
+        # Move any prior spec aside so it cannot be read as current.
+        moved = _move_stale_artifact_aside(DESIGN_SPEC_FILE)
+        if moved:
+            _emit_cycle_log(
+                state, "design_spec_prior_moved",
+                f"prior design_spec.md moved aside → {moved}",
+            )
+        return sr
     safe_write_artifact(
         DESIGN_SPEC_FILE, body,
         cycle_id=state.cycle, stage="design_spec", source_agent="designer",
-        feature_id=ds_feature_id or None,
+        feature_id=ds_feature_id or sot_fid or None,
         extra={
             "spec_mode_keywords": ",".join(keywords)[:200],
             "acceptance": "passed" if not fails else "insufficient",
+            "source_of_truth_feature_id": sot_fid or "—",
         },
     )
     state.design_spec_path = str(DESIGN_SPEC_FILE)
@@ -5422,16 +5769,23 @@ def stage_claude_propose(state: CycleState) -> StageResult:
 
     # When the design_spec is the cycle's source of truth (accepted +
     # not stale), we feed the design_spec body itself into the proposal
-    # prompt instead of the product_planner output. This prevents an
-    # earlier planner candidate name (e.g. "Local Visa 배지") from
-    # leaking into the proposal when a different feature_id has already
-    # been signed off via design_spec — the bug behind every recent
-    # scope_mismatch rollback.
+    # prompt instead of the product_planner output. Cycle Source-of-
+    # Truth Contract layer: even when the spec is on disk, we refuse
+    # to feed it into the prompt if its feature_id diverges from the
+    # locked SoT — that would just produce a proposal under the wrong
+    # feature_id and trip the apply_preflight on the next stage.
+    sot_fid_propose = (state.source_of_truth_feature_id or "").strip()
     spec_for_propose = bool(
         state.design_spec_status == "generated"
         and state.design_spec_acceptance_passed
         and not state.stale_design_spec_detected
         and DESIGN_SPEC_FILE.is_file()
+        and (
+            not sot_fid_propose
+            or _feature_ids_match(
+                state.design_spec_feature_id, sot_fid_propose,
+            )
+        )
     )
     planner_md: str | None = None
     if spec_for_propose:
@@ -5502,16 +5856,27 @@ def stage_claude_propose(state: CycleState) -> StageResult:
         return sr
     body = body[idx:].rstrip()
 
+    # SoT precedence: the locked source-of-truth feature_id ALWAYS
+    # wins. design_spec_feature_id is the per-stage representation;
+    # planner candidates are the legacy fallback. Without this, a
+    # spec_anchored proposal could carry the spec's feature_id when
+    # SoT had already converged on a different planner-revision
+    # feature, and apply_preflight would fail with
+    # source_of_truth_mismatch downstream.
     propose_feature_id = (
-        state.design_spec_feature_id
-        if spec_for_propose
-        else state.selected_feature_id
-    ) or _to_feature_id(
-        state.design_spec_feature
-        if spec_for_propose
-        else (
-            state.planner_revision_selected_feature
-            or state.product_planner_selected_feature
+        sot_fid_propose
+        or (
+            state.design_spec_feature_id
+            if spec_for_propose
+            else state.selected_feature_id
+        )
+        or _to_feature_id(
+            state.design_spec_feature
+            if spec_for_propose
+            else (
+                state.planner_revision_selected_feature
+                or state.product_planner_selected_feature
+            )
         )
     )
     safe_write_artifact(
@@ -5519,11 +5884,15 @@ def stage_claude_propose(state: CycleState) -> StageResult:
         cycle_id=state.cycle, stage="claude_propose",
         source_agent="claude_propose",
         feature_id=propose_feature_id or None,
-        extra={"spec_anchored": "true" if spec_for_propose else "false"},
+        extra={
+            "spec_anchored": "true" if spec_for_propose else "false",
+            "source_of_truth_feature_id": sot_fid_propose or "—",
+        },
     )
     state.claude_proposal_status = "generated"
     state.claude_proposal_path = str(PROPOSAL_FILE)
     state.claude_proposal_at = utc_now_iso()
+    state.claude_proposal_feature_id = propose_feature_id or None
     state.claude_proposal_skipped_reason = None
 
     sr.status = "passed"
@@ -6154,11 +6523,116 @@ def validate_scope_contract(state: "CycleState") -> dict:
     )
 
 
+def validate_source_of_truth_contract(state: "CycleState") -> dict:
+    """Enforce the Cycle Source-of-Truth Contract.
+
+    The kernel rule: every feature_id-bearing stage in this cycle MUST
+    emit `feature_id == state.source_of_truth_feature_id`. The check is
+    skip-aware so a leftover artifact on disk does NOT cause a false
+    failure — only stages whose status indicates an active artifact
+    are gated:
+
+      * implementation_ticket  → checked when status == "generated"
+      * claude_proposal        → checked when status == "generated"
+      * design_spec            → checked ONLY when
+                                 status == "generated" AND
+                                 design_spec_acceptance_passed.
+                                 design_spec_status in {"skipped",
+                                 "stale_isolated", "not_run", None}
+                                 means the design_spec is INACTIVE for
+                                 this cycle and the disk file is the
+                                 runtime artifact sweep's responsibility
+                                 to isolate, not this validator's to
+                                 fail on.
+
+    Returns a `_validator_result` dict. The failure code is the
+    canonical `source_of_truth_mismatch`; `apply_preflight_status`
+    inherits this code so `pipeline_decision.blocking_code` becomes
+    `source_of_truth_mismatch` instead of the generic
+    `apply_preflight_failed` / `scope_mismatch_preflight`.
+    """
+    sot_fid = (state.source_of_truth_feature_id or "").strip()
+    if not sot_fid:
+        # Soft fallback for legacy callers that hit this validator
+        # before _lock_source_of_truth ran (apply-only retry pre-
+        # rehydrate, legacy regression fixtures predating the SoT
+        # contract). The validator is the LAST defense — if SoT
+        # genuinely never got locked, defer to scope_check / legacy
+        # contracts rather than fail here, so the strictly correct
+        # production wiring (planner stage calls _lock_source_of_truth
+        # explicitly) is what enforces the contract.
+        return _validator_result(
+            "source_of_truth_contract", True, "not_locked",
+            "source_of_truth_feature_id not locked — defer to scope/legacy contracts",
+            {
+                "planner_revision_status": state.planner_revision_status,
+                "product_planner_status": state.product_planner_status,
+                "active_rework_feature": state.active_rework_feature,
+            },
+        )
+    mismatches: list[dict] = []
+    if state.implementation_ticket_status == "generated":
+        tfid = (
+            state.implementation_ticket_feature_id
+            or _to_feature_id(state.implementation_ticket_selected_feature)
+        )
+        if tfid and tfid != sot_fid:
+            mismatches.append({
+                "stage": "implementation_ticket",
+                "feature_id": tfid,
+            })
+    if state.claude_proposal_status == "generated":
+        pfid = (
+            state.claude_proposal_feature_id
+            or _to_feature_id(state.selected_feature)
+        )
+        if pfid and pfid != sot_fid:
+            mismatches.append({
+                "stage": "claude_proposal",
+                "feature_id": pfid,
+            })
+    spec_active = (
+        state.design_spec_status == "generated"
+        and bool(state.design_spec_acceptance_passed)
+    )
+    if spec_active:
+        dfid = (
+            state.design_spec_feature_id
+            or _to_feature_id(state.design_spec_feature)
+        )
+        if dfid and dfid != sot_fid:
+            mismatches.append({
+                "stage": "design_spec",
+                "feature_id": dfid,
+            })
+    if mismatches:
+        first = mismatches[0]
+        return _validator_result(
+            "source_of_truth_contract", False, "source_of_truth_mismatch",
+            f"{first['stage']} feature_id='{first['feature_id']}' "
+            f"!= source_of_truth_feature_id='{sot_fid}'",
+            {
+                "source_of_truth_feature_id": sot_fid,
+                "source_of_truth_stage": state.source_of_truth_stage,
+                "mismatches": mismatches,
+            },
+        )
+    return _validator_result(
+        "source_of_truth_contract", True, "passed",
+        f"source-of-truth contract OK (feature_id={sot_fid})",
+        {
+            "source_of_truth_feature_id": sot_fid,
+            "source_of_truth_stage": state.source_of_truth_stage,
+        },
+    )
+
+
 def validate_apply_preflight(state: "CycleState") -> dict:
     """Final gate before stage_claude_apply spends Claude budget.
 
     Aggregate of:
       * planner contract
+      * source-of-truth contract (Cycle SoT — overrides per-stage scope)
       * design_spec contract (when applicable)
       * implementation_ticket contract
       * scope contract
@@ -6184,6 +6658,19 @@ def validate_apply_preflight(state: "CycleState") -> dict:
         return _validator_result(
             "apply_preflight", False, ticket_check["code"],
             ticket_check["message"], ticket_check["evidence"],
+        )
+
+    # 1b. Cycle Source-of-Truth Contract — checked BEFORE the legacy
+    # design_spec / scope checks so the more specific
+    # `source_of_truth_mismatch` blocking_code wins over generic
+    # `scope_mismatch_preflight`. The old design_spec_stale code path
+    # is intentionally kept downstream for the case where SoT is set
+    # AND design_spec ran AND its acceptance failed.
+    sot_check = validate_source_of_truth_contract(state)
+    if not sot_check["ok"]:
+        return _validator_result(
+            "apply_preflight", False, sot_check["code"],
+            sot_check["message"], sot_check["evidence"],
         )
 
     # 2. design_spec contract (only enforced when the spec ran).
@@ -6239,13 +6726,25 @@ def validate_apply_preflight(state: "CycleState") -> dict:
             {"lock_feature_id": lock_fid, "design_spec_feature_id": spec_fid},
         )
 
-    # 5. Stale-artifact preflight — design_spec.md / implementation_
-    # ticket.md must carry the current run_id when present.
-    stale = []
-    for path, label in (
-        (DESIGN_SPEC_FILE, "design_spec"),
+    # 5. Stale-artifact preflight — implementation_ticket.md MUST carry
+    # the current run_id; design_spec.md is only gated when the spec is
+    # ACTIVE this cycle (status==generated AND acceptance_passed). A
+    # leftover design_spec.md from a previous cycle whose spec stage
+    # was skipped/stale this cycle is the runtime artifact sweep's
+    # responsibility — failing here would punish cycles that correctly
+    # decided NOT to use the on-disk spec body. apply_preflight is the
+    # last defense, not the stale-file janitor.
+    spec_active_for_stale = (
+        state.design_spec_status == "generated"
+        and bool(state.design_spec_acceptance_passed)
+    )
+    stale_targets: list[tuple[Path, str]] = [
         (IMPLEMENTATION_TICKET_FILE, "implementation_ticket"),
-    ):
+    ]
+    if spec_active_for_stale:
+        stale_targets.append((DESIGN_SPEC_FILE, "design_spec"))
+    stale = []
+    for path, label in stale_targets:
         try:
             if not path.is_file():
                 continue
@@ -6414,6 +6913,23 @@ def build_pipeline_decision(state) -> dict:
         )
         checks["apply"] = "failed"
 
+    # Source-of-Truth mismatch — surfaced as a precise blocking_code
+    # ahead of the generic stage_failed cascade so the operator (and
+    # the smoke report) can tell the cycle was blocked specifically by
+    # a planner / design_spec / ticket / proposal feature_id divergence
+    # rather than by some unrelated stage failure that happened to land
+    # on claude_apply.
+    if not blocking_code and (
+        _norm(s.get("apply_preflight_status")) == "source_of_truth_mismatch"
+    ):
+        blocking_code = "source_of_truth_mismatch"
+        blocking_reason = (
+            _norm(s.get("apply_preflight_reason"))
+            or "source_of_truth_feature_id mismatch detected at apply preflight"
+        )
+        checks["scope"] = "failed"
+        checks["apply"] = "failed"
+
     if blocking_code:
         pass  # executor short-circuited; skip the cascading detection
     elif failed_stage:
@@ -6479,7 +6995,10 @@ def build_pipeline_decision(state) -> dict:
         pipeline_status = "ready_to_publish"
     elif executor_blocked:
         pipeline_status = "blocked"
-    elif blocking_code in {"stage_failed", "qa_failed", "apply_preflight_failed"}:
+    elif blocking_code in {
+        "stage_failed", "qa_failed", "apply_preflight_failed",
+        "source_of_truth_mismatch",
+    }:
         pipeline_status = "blocked"
     elif blocking_code in {
         "missing_ticket_contract",
@@ -6853,6 +7372,17 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         feature = _selected_feature_for_ticket(state)
     state.implementation_ticket_selected_feature = feature
     state.implementation_ticket_feature_id = _to_feature_id(feature)
+    # Cycle Source-of-Truth Contract: when a SoT is locked, it OWNS the
+    # ticket's feature/feature_id. design_spec body still supplies
+    # target_files / SVG details when spec_bypass holds, but the
+    # ticket's NAME comes from the planner-locked SoT — never from a
+    # leftover design_spec_feature that drifted from the planner pick.
+    sot_fid = (state.source_of_truth_feature_id or "").strip()
+    sot_name = (state.source_of_truth_feature or "").strip()
+    if sot_fid:
+        feature = sot_name or feature
+        state.implementation_ticket_selected_feature = feature
+        state.implementation_ticket_feature_id = sot_fid
 
     if not target_files:
         # No concrete file targets → ticket is "missing". We still write
@@ -6923,6 +7453,17 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             state.implementation_ticket_feature_id = _to_feature_id(
                 ds_feature_for_body
             )
+        # Re-enforce the Cycle Source-of-Truth Contract: even when
+        # design_spec has its own canonical feature name, SoT wins.
+        # design_spec_feature already passed the SoT check in
+        # stage_design_spec (or design_spec_status would be
+        # failed_scope_mismatch and we wouldn't be on the spec_bypass
+        # path), so this is normally a no-op — but it's the kernel
+        # invariant the apply_preflight contract relies on.
+        if sot_fid:
+            feature = sot_name or feature
+            state.implementation_ticket_selected_feature = feature
+            state.implementation_ticket_feature_id = sot_fid
     else:
         body = _build_ticket_markdown(
             state,
@@ -9949,6 +10490,7 @@ def main() -> int:
             "downstream Claude stages skipped"
         )
         for skip_name in (
+            "runtime_artifact_sweep",
             "product_planning", "designer_critique", "planner_revision",
             "designer_final_review", "design_spec", "pm_decision",
             "build_app", "build_control", "syntax_check",
@@ -9981,6 +10523,20 @@ def main() -> int:
         state.progress = 100
         _write_state(state)
         return 1
+
+    # Runtime artifact sweep — runs ONCE per cycle right after Claude
+    # CLI preflight succeeds, BEFORE the apply-only retry hydrator
+    # (which would otherwise pick up a stale-run implementation_ticket
+    # from disk) and BEFORE product_planning. The sweep moves any
+    # cross-run .runtime/ artifact into .runtime/stale_artifacts/ so
+    # later stages — design_spec, implementation_ticket,
+    # claude_propose — cannot read a previous cycle's output as
+    # current. Same-run artifacts are kept so the apply-only retry
+    # path keeps working.
+    run_stage(
+        "runtime_artifact_sweep",
+        lambda: stage_runtime_artifact_sweep(state),
+    )
 
     # Apply-only retry path. Triggered by autopilot when the previous
     # cycle's claude_apply hit a retryable CLI failure but the planner /
@@ -10050,6 +10606,31 @@ def main() -> int:
             state.selected_feature = prior.get("selected_feature")
             state.selected_feature_id = prior.get("selected_feature_id")
             state.selected_feature_source = prior.get("selected_feature_source")
+            # Rehydrate the canonical source-of-truth so the apply-only
+            # retry path can run validate_source_of_truth_contract
+            # against the prior cycle's locked feature_id without
+            # re-running planner_revision.
+            state.source_of_truth_feature = prior.get(
+                "source_of_truth_feature"
+            )
+            state.source_of_truth_feature_id = prior.get(
+                "source_of_truth_feature_id"
+            )
+            state.source_of_truth_stage = prior.get(
+                "source_of_truth_stage"
+            )
+            state.source_of_truth_locked_at = prior.get(
+                "source_of_truth_locked_at"
+            )
+            state.source_of_truth_contract_status = prior.get(
+                "source_of_truth_contract_status"
+            )
+            state.source_of_truth_contract_reason = prior.get(
+                "source_of_truth_contract_reason"
+            )
+            state.claude_proposal_feature_id = prior.get(
+                "claude_proposal_feature_id"
+            )
             try:
                 state.claude_executor_retry_count = int(
                     prior.get("claude_executor_retry_count") or 0
