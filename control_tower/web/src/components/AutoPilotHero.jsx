@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { fmtTime as sharedFmtTime, fmtElapsedFrom as sharedFmtElapsed } from "../utils/time.js";
 
 // AutoPilotHero — top-of-page hero block.
 //
@@ -31,35 +32,10 @@ function pickAutopilot(runners = []) {
   return null;
 }
 
-function fmtElapsed(startedIso, endedIso, isRunning) {
-  if (!startedIso) return "—";
-  try {
-    const start = new Date(startedIso).getTime();
-    const end = isRunning
-      ? Date.now()
-      : (endedIso ? new Date(endedIso).getTime() : Date.now());
-    const sec = Math.max(0, Math.floor((end - start) / 1000));
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
-  } catch {
-    return "—";
-  }
-}
-
-function fmtIso(iso) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
-    return d.toLocaleTimeString("ko-KR", { hour12: false });
-  } catch {
-    return iso;
-  }
-}
+// Defer to the shared formatters so the hero's elapsed counter and
+// the "STARTED HH:MM:SS" chip match SystemLog to the second.
+const fmtElapsed = sharedFmtElapsed;
+const fmtIso = sharedFmtTime;
 
 function StatChip({ label, value, color }) {
   return (

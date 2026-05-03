@@ -330,7 +330,7 @@ export default function ControlTowerPage() {
 
       {/* Operations row: SystemLog (left) + OperatorCommandPanel (right) */}
       <section className="grid flex-none gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(380px,400px)] control-tower-right-rail">
-        <SystemLogPanel events={combinedEvents} />
+        <SystemLogPanel events={combinedEvents} runners={runners} />
         <OperatorCommandPanel runners={runners} onSent={tick} />
       </section>
 

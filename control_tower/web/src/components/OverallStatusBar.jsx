@@ -1,3 +1,5 @@
+import { fmtTime as formatLocalTime } from "../utils/time.js";
+
 // Overall Status Bar — single source of truth at the top of the page.
 //
 // Reads runner heartbeat metadata.local_factory.control_state (written
@@ -274,7 +276,10 @@ export default function OverallStatusBar({ runners = [] }) {
           </span>
         )}
         <span className="ml-auto text-[9.5px] text-slate-500">
-          {cs.updated_at ? cs.updated_at.slice(11, 19) : "—"}
+          {/* Use the shared formatter so this matches every other
+              timestamp on the page (previously a raw UTC substring
+              slice was flipping KST 10:51 to 01:51). */}
+          {cs.updated_at ? formatLocalTime(cs.updated_at) : "—"}
         </span>
       </div>
     </section>

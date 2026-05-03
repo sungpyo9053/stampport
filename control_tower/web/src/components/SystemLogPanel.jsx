@@ -3,6 +3,8 @@ import {
   SYSTEM_LOG_CATEGORIES,
   buildSystemLogEntries,
 } from "../utils/eventClassifier.js";
+import { fmtTime, isAfterStart, parseUtcIso } from "../utils/time.js";
+import { pickAutopilot } from "../utils/autopilotPhase.js";
 
 // SystemLogPanel — the operator's "what's happening on the runner /
 // what just broke" feed. Distinct from EventFeed (general timeline)
@@ -64,15 +66,8 @@ const HIGHLIGHT_PATTERNS = [
   /production\s+health|health\s*check/i,
 ];
 
-function fmtTime(iso) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString([], { hour12: false });
-  } catch {
-    return String(iso).slice(0, 19);
-  }
-}
+// fmtTime now imported from utils/time.js — naive ISO strings are
+// treated as UTC so the timestamp matches AutoPilotPanel STARTED.
 
 function isHeartbeatEvent(ev) {
   return ev?.type === "local_runner_heartbeat";
@@ -195,9 +190,19 @@ function LogRow({ entry }) {
   );
 }
 
-export default function SystemLogPanel({ events = [] }) {
+export default function SystemLogPanel({ events = [], runners = [] }) {
   const [filter, setFilter] = useState("All");
   const [showHeartbeat, setShowHeartbeat] = useState(false);
+  const [showOlder, setShowOlder] = useState(false);
+
+  // Auto Pilot started_at — when present and the loop is running we
+  // default to "current run only" so a previous start_autopilot
+  // failure doesn't masquerade as a fresh error. Older events are
+  // collapsed under a "이전 명령 로그 보기" toggle.
+  const autopilot = useMemo(() => pickAutopilot(runners), [runners]);
+  const runStartIso = autopilot?.started_at;
+  const isAutopilotRunning = String(autopilot?.status || "").toLowerCase() === "running";
+  const filterCurrentRun = isAutopilotRunning && !!runStartIso;
 
   // Build classified entries once per `events` change. Cap to
   // MAX_ENTRIES so a long-running session doesn't render thousands
@@ -220,8 +225,29 @@ export default function SystemLogPanel({ events = [] }) {
     return { last, count };
   }, [events]);
 
+  // Split entries into current-run vs older. When autopilot is
+  // running we default to the current-run partition; the operator
+  // can flip `showOlder` to expand the prior log. When autopilot is
+  // idle/stopped the partition is identity (all entries fall in
+  // "current") so the chip filters work as before.
+  const partitioned = useMemo(() => {
+    if (!filterCurrentRun) {
+      return { current: allEntries, older: [] };
+    }
+    const current = [];
+    const older = [];
+    for (const entry of allEntries) {
+      if (isAfterStart(entry.ev?.created_at, runStartIso)) current.push(entry);
+      else older.push(entry);
+    }
+    return { current, older };
+  }, [allEntries, filterCurrentRun, runStartIso]);
+
   const filtered = useMemo(() => {
-    let visible = allEntries;
+    const base = filterCurrentRun
+      ? (showOlder ? allEntries : partitioned.current)
+      : allEntries;
+    let visible = base;
     if (!showHeartbeat) {
       visible = visible.filter((e) => !isHeartbeatEvent(e.ev));
     }
@@ -229,7 +255,7 @@ export default function SystemLogPanel({ events = [] }) {
       visible = visible.filter((e) => e.category === filter);
     }
     return visible.slice(0, MAX_ENTRIES);
-  }, [allEntries, filter, showHeartbeat]);
+  }, [allEntries, partitioned, filter, showHeartbeat, showOlder, filterCurrentRun]);
 
   // Per-category counts for the chip badges (always exclude heartbeat
   // unless the toggle is on, so the chip numbers reflect what's
@@ -275,8 +301,13 @@ export default function SystemLogPanel({ events = [] }) {
             autopilot · cycle · git · deploy · errors
           </span>
         </div>
-        <span className="text-[10px] tracking-widest text-slate-500">
-          {filtered.length} / {allEntries.length}
+        <span
+          className="text-[10px] tracking-widest text-slate-500"
+          data-testid="system-log-counts"
+        >
+          {filterCurrentRun
+            ? `현재 run ${partitioned.current.length} / 전체 ${allEntries.length}`
+            : `${filtered.length} / ${allEntries.length}`}
         </span>
       </div>
 
@@ -299,10 +330,31 @@ export default function SystemLogPanel({ events = [] }) {
           }}
         />
         <span>{heartbeatLabel}</span>
+        {filterCurrentRun && (
+          <button
+            type="button"
+            onClick={() => setShowOlder((v) => !v)}
+            className="ml-auto rounded px-2 py-0.5 text-[9px] font-bold tracking-widest transition"
+            style={{
+              color: showOlder ? "#0a1228" : "#94a3b8",
+              backgroundColor: showOlder ? "#94a3b8" : "#0a1228",
+              border: "1px solid #94a3b855",
+              cursor: "pointer",
+            }}
+            data-testid="system-log-older-toggle"
+          >
+            {showOlder
+              ? `이전 명령 로그 숨기기 (${partitioned.older.length})`
+              : `이전 명령 로그 보기 (${partitioned.older.length})`}
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setShowHeartbeat((v) => !v)}
-          className="ml-auto rounded px-2 py-0.5 text-[9px] font-bold tracking-widest transition"
+          className={
+            "rounded px-2 py-0.5 text-[9px] font-bold tracking-widest transition " +
+            (filterCurrentRun ? "" : "ml-auto")
+          }
           style={{
             color: showHeartbeat ? "#0a1228" : "#94a3b8",
             backgroundColor: showHeartbeat ? "#d4a843" : "#0a1228",

@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { buildSystemLogEntries } from "../utils/eventClassifier.js";
+import { fmtTime } from "../utils/time.js";
 import {
   FRESHNESS_LABEL,
   derivePhase,
@@ -238,14 +239,9 @@ function findLastCommand(agentId, events) {
   return m || null;
 }
 
-function fmtTime(iso) {
-  if (!iso) return "—";
-  try {
-    return new Date(iso).toLocaleTimeString([], { hour12: false });
-  } catch {
-    return String(iso).slice(0, 19);
-  }
-}
+// fmtTime imported from utils/time.js — same naive-ISO-as-UTC parser
+// the AutoPilot panel uses, so timestamps in this drawer match every
+// other surface to the second.
 
 function Section({ title, source, children }) {
   return (

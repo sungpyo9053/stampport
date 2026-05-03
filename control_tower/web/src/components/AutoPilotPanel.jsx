@@ -9,6 +9,7 @@ import {
   isRunningPhase,
   pickRunnerMeta,
 } from "../utils/autopilotPhase.js";
+import { fmtDateTime as sharedFmtDateTime, fmtElapsedFrom as sharedFmtElapsed } from "../utils/time.js";
 
 // Auto Pilot Publish panel — 3-section operator surface:
 //
@@ -51,34 +52,12 @@ function saveDraft(draft) {
   }
 }
 
-function fmtIso(iso) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
-    return d.toLocaleString("ko-KR", { hour12: false });
-  } catch {
-    return iso;
-  }
-}
-
-function fmtElapsed(startedIso, isRunning) {
-  if (!startedIso) return "—";
-  try {
-    const start = new Date(startedIso).getTime();
-    const end = isRunning ? Date.now() : start;
-    const sec = Math.max(0, Math.floor((end - start) / 1000));
-    if (sec === 0 && !isRunning) return "—";
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
-  } catch {
-    return "—";
-  }
-}
+// Delegate to the shared formatters so STARTED in this panel matches
+// the SystemLog timestamps to the second. Local aliases keep the
+// existing call sites (`fmtIso`, `fmtElapsed`) unchanged.
+const fmtIso = sharedFmtDateTime;
+const fmtElapsed = (startedIso, isRunning) =>
+  sharedFmtElapsed(startedIso, null, isRunning);
 
 function StatRow({ label, value, mono, ellipsis }) {
   const cls = [

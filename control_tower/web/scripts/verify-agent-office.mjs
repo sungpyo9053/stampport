@@ -315,6 +315,48 @@ const REQUIRED_BEHAVIORS = [
     const scene = docs.find((d) => d.path.endsWith("AgentOfficeScene.jsx"));
     return scene && scene.body.includes("office-headline");
   }],
+  // Polish round
+  ["unified time util exports", () => {
+    return searchAny("export function parseUtcIso").length > 0
+      && searchAny("export function fmtTime").length > 0
+      && searchAny("export function fmtDateTime").length > 0
+      && searchAny("export function isAfterStart").length > 0;
+  }],
+  ["AutoPilotPanel uses shared time util", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    return panel && panel.body.includes('from "../utils/time.js"');
+  }],
+  ["SystemLogPanel uses shared time util", () => {
+    const sl = docs.find((d) => d.path.endsWith("SystemLogPanel.jsx"));
+    return sl && sl.body.includes('from "../utils/time.js"');
+  }],
+  ["OverallStatusBar slice(11,19) bug removed", () => {
+    const bar = docs.find((d) => d.path.endsWith("OverallStatusBar.jsx"));
+    return bar && !bar.body.includes("slice(11, 19)") && bar.body.includes("formatLocalTime");
+  }],
+  ["SystemLogPanel current-run filter", () => {
+    const sl = docs.find((d) => d.path.endsWith("SystemLogPanel.jsx"));
+    return sl
+      && sl.body.includes("filterCurrentRun")
+      && sl.body.includes("이전 명령 로그")
+      && sl.body.includes("system-log-older-toggle");
+  }],
+  ["bubble tail + tone glow CSS", () => {
+    return searchAny(".agent-speech-bubble::after").length > 0
+      && searchAny('agent-speech-bubble[data-tone="running"]').length > 0
+      && searchAny('agent-speech-bubble[data-tone="rework"]').length > 0
+      && searchAny('agent-speech-bubble[data-tone="passed"]').length > 0;
+  }],
+  ["active slot pulse keyframe", () =>
+    searchAny("agent-slot-active-pulse").length > 0],
+  ["pass green check on nameplate", () =>
+    searchAny(".agent-slot-passed .agent-slot-nameplate::after").length > 0],
+  ["rework purple warning dot", () =>
+    searchAny(".agent-slot-rework::before").length > 0],
+  ["bigger desktop figure (128px)", () =>
+    searchAny("height: 128px").length > 0],
+  ["bigger mobile figure (92px)", () =>
+    searchAny("height: 92px").length > 0],
 ];
 
 for (const propClass of REQUIRED_PROP_CLASSES) {
