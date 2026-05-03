@@ -219,6 +219,25 @@ class CycleRecord:
     health_status: str | None = None   # passed | failed | skipped
     render_status: str | None = None   # passed | failed | skipped
     note: str | None = None
+    # HOLD loop breaker telemetry — every cycle records the per-stage
+    # gate evidence so the autopilot report can show *why* a HOLD cycle
+    # didn't reach claude_apply, instead of forcing the operator to
+    # grep three different artifacts. These fields are mirrored from
+    # factory_smoke_state.json + factory_state.json at record time.
+    selected_feature: str | None = None
+    pm_verdict: str | None = None              # SHIP | HOLD | —
+    hold_type: str | None = None               # soft | hard | None
+    hold_type_reason: str | None = None
+    design_spec_status: str | None = None
+    design_spec_acceptance_passed: bool | None = None
+    stale_design_spec_detected: bool = False
+    implementation_ticket_status: str | None = None
+    claude_propose_status: str | None = None
+    claude_apply_status: str | None = None
+    code_changed: bool = False
+    active_rework_feature: str | None = None
+    active_rework_hold_count: int = 0
+    planner_feature_drift_detected: bool = False
 
 
 @dataclass
@@ -469,6 +488,131 @@ def _run_smoke_cycle(timeout_sec: int) -> dict:
 READY_VERDICTS = frozenset({"READY_TO_REVIEW", "READY_TO_PUBLISH", "PASS"})
 HOLD_VERDICTS = frozenset({"HOLD"})
 FAIL_VERDICTS = frozenset({"FAIL"})
+
+# After this many consecutive HOLD cycles with code_changed=False, the
+# autopilot loop terminates with failure_code=no_change_hold_loop. The
+# operator should inspect why the rework loop is unable to ship — usually
+# the planner or design_spec stage is mis-classifying soft HOLD inputs
+# as hard.
+NO_CHANGE_HOLD_STOP_THRESHOLD = 3
+# The threshold past which we WARN (force the locked feature, force
+# design_spec, force implementation_ticket) but do NOT yet stop. Lives
+# in cycle.py via _save_active_rework_feature; the autopilot just
+# tracks the same number for the report.
+NO_CHANGE_HOLD_WARN_THRESHOLD = 2
+
+
+def _populate_cycle_record_from_state(
+    rec: CycleRecord, smoke: dict, factory_state: dict
+) -> None:
+    """Fill the CycleRecord HOLD-loop telemetry from the latest smoke +
+    factory_state. Idempotent — the loop calls this whenever a smoke
+    cycle returns so the stop-on-loop classifier has fresh data."""
+    fs = factory_state or {}
+    sm = smoke or {}
+    rec.selected_feature = (
+        fs.get("selected_feature")
+        or fs.get("planner_revision_selected_feature")
+        or fs.get("product_planner_selected_feature")
+        or sm.get("selected_feature")
+    )
+    pm_ship = fs.get("pm_decision_ship_ready")
+    if pm_ship is True:
+        rec.pm_verdict = "SHIP"
+    elif pm_ship is False:
+        rec.pm_verdict = "HOLD"
+    else:
+        rec.pm_verdict = None
+    rec.hold_type = fs.get("pm_hold_type") or sm.get("pm_hold_type")
+    rec.hold_type_reason = (
+        fs.get("pm_hold_type_reason") or sm.get("pm_hold_type_reason")
+    )
+    rec.design_spec_status = fs.get("design_spec_status") or sm.get(
+        "design_spec_status"
+    )
+    dsap = fs.get("design_spec_acceptance_passed")
+    if dsap is None:
+        dsap = sm.get("design_spec_acceptance_passed")
+    if dsap is not None:
+        rec.design_spec_acceptance_passed = bool(dsap)
+    rec.stale_design_spec_detected = bool(
+        fs.get("stale_design_spec_detected")
+        or sm.get("stale_design_spec_detected")
+    )
+    rec.implementation_ticket_status = fs.get(
+        "implementation_ticket_status"
+    ) or sm.get("ticket_status")
+    rec.claude_propose_status = fs.get("claude_proposal_status")
+    rec.claude_apply_status = fs.get("claude_apply_status") or sm.get(
+        "claude_apply_status"
+    )
+    rec.code_changed = bool(
+        fs.get("code_changed")
+        or sm.get("code_changed")
+        or len(fs.get("claude_apply_changed_files") or []) > 0
+    )
+    rec.active_rework_feature = fs.get("active_rework_feature") or sm.get(
+        "active_rework_feature"
+    )
+    arwc = fs.get("active_rework_hold_count")
+    if not isinstance(arwc, int):
+        arwc = sm.get("active_rework_hold_count") or 0
+    try:
+        rec.active_rework_hold_count = int(arwc)
+    except (TypeError, ValueError):
+        rec.active_rework_hold_count = 0
+    rec.planner_feature_drift_detected = bool(
+        fs.get("planner_feature_drift_detected")
+        or sm.get("planner_feature_drift_detected")
+    )
+
+
+def _consecutive_no_change_holds(history: list[dict]) -> int:
+    """Walk the history backwards and count consecutive HOLD cycles
+    whose code_changed flag is False. Stops at the first cycle that is
+    NOT a HOLD-no-change (READY/SHIP, FAIL, or HOLD with code_changed
+    True)."""
+    count = 0
+    for h in reversed(history or []):
+        verdict = (h.get("verdict") or "").upper()
+        code_changed = bool(h.get("code_changed"))
+        if verdict == "HOLD" and not code_changed:
+            count += 1
+            continue
+        break
+    return count
+
+
+def _max_cycles_boundary_classification(
+    history: list[dict], max_cycles: int
+) -> str | None:
+    """Decide whether reaching max_cycles should terminate the loop as
+    `no_change_hold_loop` instead of a benign `max_cycles reached` stop.
+
+    Policy (intentionally narrower than the in-loop trigger so a single
+    HOLD on a max_cycles=1 manual probe is NOT treated as a broken
+    rework loop):
+
+      * `max_cycles >= NO_CHANGE_HOLD_STOP_THRESHOLD` (>= 3) — short
+        runs are operator probes, not loop diagnostics.
+      * `len(history) >= NO_CHANGE_HOLD_STOP_THRESHOLD` — the run
+        actually executed enough cycles to assess.
+      * The last `NO_CHANGE_HOLD_STOP_THRESHOLD` cycles must ALL be
+        `HOLD` with `code_changed=False`.
+
+    Returns "no_change_hold_loop" when the policy fires, else None.
+    """
+    if max_cycles < NO_CHANGE_HOLD_STOP_THRESHOLD:
+        return None
+    if len(history) < NO_CHANGE_HOLD_STOP_THRESHOLD:
+        return None
+    last = history[-NO_CHANGE_HOLD_STOP_THRESHOLD:]
+    all_hold_no_change = all(
+        (h.get("verdict") or "").upper() == "HOLD"
+        and not bool(h.get("code_changed"))
+        for h in last
+    )
+    return "no_change_hold_loop" if all_hold_no_change else None
 
 
 def _git_status_porcelain() -> str:
@@ -943,17 +1087,43 @@ def _hold_loop_root_cause(state: AutopilotState) -> list[str]:
     """
     history = list(state.history or [])
     stop_reason = (state.stop_reason or "").lower()
-    if not history or "max_cycles" not in stop_reason:
+    failure_code = (state.last_failure_code or "").lower()
+    is_max_cycles = "max_cycles" in stop_reason
+    is_explicit_loop = "no_change_hold_loop" in stop_reason or failure_code == "no_change_hold_loop"
+    if not history or not (is_max_cycles or is_explicit_loop):
         return []
     verdicts = {(h.get("verdict") or "").upper() for h in history}
-    if verdicts and verdicts != {"HOLD"}:
+    if is_max_cycles and verdicts and verdicts != {"HOLD"}:
         return []
 
-    lines: list[str] = ["", "## HOLD 반복 종료 (root cause)", ""]
-    lines.append(
-        f"- {len(history)}개 cycle 모두 HOLD 로 종료. claude_apply 가 한 번도 실행되지 않아 "
-        f"commit/push 가 발생할 수 없었습니다."
+    heading = (
+        "## HOLD 반복 종료 (no_change_hold_loop)"
+        if is_explicit_loop
+        else "## HOLD 반복 종료 (root cause)"
     )
+    lines: list[str] = ["", heading, ""]
+    code_changed_count = sum(1 for h in history if h.get("code_changed"))
+    lines.append(
+        f"- 총 {len(history)}개 cycle 중 code_changed=true: {code_changed_count}개. "
+        f"claude_apply 가 한 번도 실제 코드 변경을 만들지 못해 commit/push 가 발생할 수 없었습니다."
+    )
+    # Per-cycle skip diagnosis — show why each cycle didn't reach apply.
+    lines.append("")
+    lines.append("### Cycle별 skip 단계")
+    lines.append("")
+    lines.append("| # | hold_type | design_spec | impl_ticket | claude_propose | claude_apply | code_changed |")
+    lines.append("|---|-----------|-------------|-------------|-----------------|---------------|--------------|")
+    for h in history:
+        lines.append(
+            f"| {h.get('cycle')} "
+            f"| {h.get('hold_type') or '—'} "
+            f"| {h.get('design_spec_status') or '—'} "
+            f"| {h.get('implementation_ticket_status') or '—'} "
+            f"| {h.get('claude_propose_status') or '—'} "
+            f"| {h.get('claude_apply_status') or '—'} "
+            f"| {h.get('code_changed')} |"
+        )
+    lines.append("")
 
     fs_path = _factory_state_path()
     fs: dict = {}
@@ -1038,6 +1208,40 @@ def _format_report(state: AutopilotState) -> str:
             f"| {h.get('render_status') or '—'} "
             f"| {h.get('health_status') or '—'} |"
         )
+
+    # HOLD-loop diagnostic table — surfaces hold_type / design_spec /
+    # impl_ticket / claude_propose / claude_apply / code_changed for
+    # every recorded cycle. Stays empty when there are no cycles to
+    # report, but otherwise always renders so the operator can see the
+    # per-stage gate evidence even when the run finishes successfully.
+    if state.history:
+        lines += [
+            "",
+            "## HOLD loop telemetry",
+            "",
+            "| # | selected_feature | pm_verdict | hold_type | design_spec | "
+            "ds_acceptance | stale_ds | impl_ticket | claude_propose | "
+            "claude_apply | code_changed |",
+            "|---|------------------|------------|-----------|-------------|"
+            "---------------|----------|-------------|-----------------|"
+            "---------------|--------------|",
+        ]
+        for h in state.history:
+            sf = (h.get("selected_feature") or "—")
+            sf = sf if len(sf) <= 28 else sf[:25] + "…"
+            lines.append(
+                f"| {h.get('cycle')} "
+                f"| {sf} "
+                f"| {h.get('pm_verdict') or '—'} "
+                f"| {h.get('hold_type') or '—'} "
+                f"| {h.get('design_spec_status') or '—'} "
+                f"| {h.get('design_spec_acceptance_passed')} "
+                f"| {h.get('stale_design_spec_detected')} "
+                f"| {h.get('implementation_ticket_status') or '—'} "
+                f"| {h.get('claude_propose_status') or '—'} "
+                f"| {h.get('claude_apply_status') or '—'} "
+                f"| {h.get('code_changed')} |"
+            )
 
     lines.extend(_hold_loop_root_cause(state))
 
@@ -1142,6 +1346,29 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
     try:
         while not stop_event.is_set():
             if cycle >= config.max_cycles:
+                # max_cycles boundary — surface a specific
+                # no_change_hold_loop failure ONLY when the policy in
+                # `_max_cycles_boundary_classification` actually fires
+                # (>= 3 cycles in history, >= 3 max_cycles, last 3 all
+                # HOLD+code_changed=false). Short runs (max_cycles=1/2)
+                # — typically manual probes — fall through to the
+                # benign `max_cycles reached` stop so a single
+                # legitimate HOLD isn't reported as a broken loop.
+                classification = _max_cycles_boundary_classification(
+                    _STATE.history or [], config.max_cycles,
+                )
+                if classification == "no_change_hold_loop":
+                    ncl = _consecutive_no_change_holds(_STATE.history or [])
+                    _STATE.last_failure_code = classification
+                    _stop(
+                        f"no_change_hold_loop: {ncl} consecutive HOLD "
+                        f"cycles with code_changed=false (reached "
+                        f"max_cycles={config.max_cycles}) — "
+                        f"implementation never reached. Inspect "
+                        f"autopilot_report.md cycle table.",
+                        status="failed",
+                    )
+                    return
                 _stop(f"max_cycles reached ({config.max_cycles})")
                 return
             if time.time() >= deadline:
@@ -1216,6 +1443,7 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
             rec.changed_files_count = int(smoke.get("changed_files_count") or 0)
 
             factory_state = _read_json(_factory_state_path())
+            _populate_cycle_record_from_state(rec, smoke, factory_state)
 
             # FAIL / TIMEOUT / scope_mismatch — immediate stop.
             failure_norm = _classify_failure(verdict, smoke)
@@ -1249,9 +1477,27 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
                     _record_cycle(rec)
                     _stop("HOLD (stop_on_hold=true)", status="stopped")
                     return
-                rec.note = "HOLD → carry rework prompt to next cycle"
+                # No-change HOLD loop breaker: if the rework loop has
+                # produced N consecutive HOLD cycles WITHOUT any
+                # claude_apply touching files, force a stop with a
+                # specific failure_code. Without this, max_cycles
+                # finishes "successfully" while shipping nothing.
                 rec.finished_at = _utc_now()
                 _record_cycle(rec)
+                ncl = _consecutive_no_change_holds(_STATE.history or [])
+                _log(
+                    f"HOLD cycle {rec.cycle} consecutive_no_change_holds={ncl} "
+                    f"hold_type={rec.hold_type}"
+                )
+                if ncl >= NO_CHANGE_HOLD_STOP_THRESHOLD:
+                    _STATE.last_failure_code = "no_change_hold_loop"
+                    _stop(
+                        f"no_change_hold_loop: {ncl} consecutive HOLD cycles "
+                        f"with code_changed=false — implementation never "
+                        f"reached. Inspect autopilot_report.md cycle table.",
+                        status="failed",
+                    )
+                    return
                 continue
 
             # READY / PASS — apply the gate.
@@ -1518,7 +1764,7 @@ def _self_test_with_smoke(
         cfg = AutopilotConfig(
             autopilot_enabled=True,
             autopilot_mode=config.autopilot_mode,
-            max_cycles=1,
+            max_cycles=config.max_cycles or 1,
             max_hours=config.max_hours,
             stop_on_hold=config.stop_on_hold,
             require_scope_consistency=config.require_scope_consistency,
@@ -1656,7 +1902,9 @@ def self_test() -> tuple[int, int, list[str]]:
                 f"status={result.get('status')} render={last.get('render_status')}"
             )
 
-        # --- D. HOLD + stop_on_hold=false → continue (no stop_reason) ----
+        # --- D1. max_cycles=1 + 1 HOLD+no-change → benign max_cycles
+        # reached stop. Single-cycle manual probes must NOT be flagged
+        # as no_change_hold_loop — that's only a multi-cycle pattern.
         total += 1
         hold_smoke = {"verdict": "HOLD", "failure_code": None,
                       "factory_status": "hold_for_rework",
@@ -1673,18 +1921,93 @@ def self_test() -> tuple[int, int, list[str]]:
             ),
             git_dirty_override=False,
         )
-        # max_cycles=1 means we'll naturally stop after one HOLD cycle —
-        # but the stop reason should be `max_cycles reached` (loop fell
-        # through to next iteration), NOT a HOLD-specific halt.
         if (
             result.get("status") == "stopped"
             and "max_cycles" in (result.get("stop_reason") or "")
+            and (result.get("last_failure_code") or "")
+                != "no_change_hold_loop"
         ):
             passed += 1
         else:
             failures.append(
-                f"D: expected continue-on-HOLD then max_cycles — got "
-                f"status={result.get('status')} reason={result.get('stop_reason')}"
+                f"D1: max_cycles=1 + 1 HOLD must be benign max_cycles "
+                f"stop — got status={result.get('status')} "
+                f"reason={result.get('stop_reason')} "
+                f"code={result.get('last_failure_code')}"
+            )
+
+        # --- D2. max_cycles=3 + 3 HOLD+no-change cycles → failed /
+        # no_change_hold_loop (the in-loop threshold trigger fires at
+        # the third cycle).
+        total += 1
+        result = _self_test_with_smoke(
+            hold_smoke, hold_factory,
+            config=AutopilotConfig(
+                autopilot_mode="auto_publish", max_cycles=3, max_hours=0.1,
+                stop_on_hold=False, require_scope_consistency=True,
+                require_render_check=True, require_api_health=False,
+            ),
+            git_dirty_override=False,
+        )
+        hist_d2 = result.get("history") or []
+        if (
+            result.get("status") == "failed"
+            and (result.get("last_failure_code") or "")
+                == "no_change_hold_loop"
+            and "no_change_hold_loop" in (result.get("stop_reason") or "")
+            and len(hist_d2) == 3
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"D2: max_cycles=3 + 3xHOLD must classify as "
+                f"no_change_hold_loop — got status={result.get('status')} "
+                f"code={result.get('last_failure_code')} "
+                f"history_len={len(hist_d2)}"
+            )
+
+        # --- D3. Mixed history (HOLD + READY/PASS) must NOT classify
+        # as no_change_hold_loop. Test the helpers directly because
+        # _self_test_with_smoke uses a single fixture across all cycles.
+        total += 1
+        history_d3 = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "READY_TO_REVIEW", "code_changed": True},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        n_d3 = _consecutive_no_change_holds(history_d3)
+        cls_d3 = _max_cycles_boundary_classification(history_d3, max_cycles=3)
+        if (
+            n_d3 == 1  # only the trailing HOLD counts
+            and n_d3 < NO_CHANGE_HOLD_STOP_THRESHOLD
+            and cls_d3 is None
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"D3: mixed HOLD+READY history must not trip the loop "
+                f"breaker — n={n_d3} cls={cls_d3!r}"
+            )
+
+        # --- D4. 3 HOLD cycles where ANY had code_changed=true must
+        # NOT classify as no_change_hold_loop.
+        total += 1
+        history_d4 = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": True},  # the saving cycle
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        n_d4 = _consecutive_no_change_holds(history_d4)
+        cls_d4 = _max_cycles_boundary_classification(history_d4, max_cycles=3)
+        if (
+            n_d4 == 1  # the trailing HOLD only
+            and cls_d4 is None
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"D4: HOLD-with-code-change must reset the loop counter "
+                f"— n={n_d4} cls={cls_d4!r}"
             )
 
         # --- E. HOLD + git dirty → stopped --------------------------------
@@ -1832,6 +2155,180 @@ def self_test() -> tuple[int, int, list[str]]:
             failures.append(
                 "K: load_state missing required keys "
                 f"(got {list(snap.keys())[:8]})"
+            )
+
+        # --- L. _consecutive_no_change_holds counts only HOLD+no-change.
+        total += 1
+        history_l = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        n_l = _consecutive_no_change_holds(history_l)
+        history_l_break = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "READY_TO_REVIEW", "code_changed": True},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        n_l_break = _consecutive_no_change_holds(history_l_break)
+        history_l_apply = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": True},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        n_l_apply = _consecutive_no_change_holds(history_l_apply)
+        if n_l == 3 and n_l_break == 1 and n_l_apply == 1:
+            passed += 1
+        else:
+            failures.append(
+                f"L: consecutive_no_change_holds — n={n_l} "
+                f"break={n_l_break} apply={n_l_apply}"
+            )
+
+        # --- M. _populate_cycle_record_from_state mirrors hold telemetry.
+        total += 1
+        rec_m = CycleRecord(cycle=1, started_at=_utc_now())
+        smoke_m = {
+            "verdict": "HOLD",
+            "pm_hold_type": "soft",
+            "design_spec_status": "generated",
+            "design_spec_acceptance_passed": True,
+            "stale_design_spec_detected": False,
+            "active_rework_feature": "TitleSeal",
+            "active_rework_hold_count": 2,
+        }
+        fs_m = {
+            "claude_apply_changed_files": ["app/web/src/foo.jsx"],
+            "claude_apply_status": "applied",
+            "claude_proposal_status": "generated",
+            "implementation_ticket_status": "generated",
+            "selected_feature": "TitleSeal 컴포넌트",
+            "pm_decision_ship_ready": False,
+            "pm_hold_type": "soft",
+            "code_changed": True,
+        }
+        _populate_cycle_record_from_state(rec_m, smoke_m, fs_m)
+        if (
+            rec_m.hold_type == "soft"
+            and rec_m.design_spec_status == "generated"
+            and rec_m.implementation_ticket_status == "generated"
+            and rec_m.claude_apply_status == "applied"
+            and rec_m.code_changed is True
+            and rec_m.active_rework_feature == "TitleSeal"
+            and rec_m.active_rework_hold_count == 2
+            and rec_m.pm_verdict == "HOLD"
+            and rec_m.selected_feature == "TitleSeal 컴포넌트"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"M: populate_cycle_record — hold_type={rec_m.hold_type!r} "
+                f"design_spec={rec_m.design_spec_status!r} "
+                f"impl_ticket={rec_m.implementation_ticket_status!r} "
+                f"apply={rec_m.claude_apply_status!r} "
+                f"code_changed={rec_m.code_changed} "
+                f"feature={rec_m.selected_feature!r}"
+            )
+
+        # --- N. _hold_loop_root_cause renders telemetry table when the
+        # run terminated via no_change_hold_loop.
+        total += 1
+        st_n = AutopilotState()
+        st_n.stop_reason = (
+            "no_change_hold_loop: 3 consecutive HOLD cycles with "
+            "code_changed=false — implementation never reached."
+        )
+        st_n.last_failure_code = "no_change_hold_loop"
+        st_n.history = [
+            {
+                "cycle": i, "verdict": "HOLD", "code_changed": False,
+                "hold_type": "soft" if i % 2 else "hard",
+                "design_spec_status": "skipped",
+                "implementation_ticket_status": "skipped_hold",
+                "claude_propose_status": "skipped",
+                "claude_apply_status": "skipped",
+            }
+            for i in range(1, 4)
+        ]
+        out_n = _hold_loop_root_cause(st_n)
+        joined_n = "\n".join(out_n)
+        if (
+            "no_change_hold_loop" in joined_n
+            and "Cycle별 skip 단계" in joined_n
+            and "skipped_hold" in joined_n
+            and "soft" in joined_n
+            and "hard" in joined_n
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"N: hold_loop_root_cause for no_change_hold_loop — "
+                f"snippet={joined_n[:300]!r}"
+            )
+
+        # --- O. _max_cycles_boundary_classification policy fires only
+        # for max_cycles >= 3 + history >= 3 + last 3 all
+        # HOLD+code_changed=false. Verifies the explicit boundary
+        # helper end-to-end (the integration path is exercised by D1
+        # / D2; this is the unit test for the boundary policy).
+        total += 1
+        all_hold_no_change = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        # max_cycles too small → policy declines.
+        cls_o_small = _max_cycles_boundary_classification(
+            all_hold_no_change, max_cycles=2,
+        )
+        # history too short → policy declines.
+        cls_o_short = _max_cycles_boundary_classification(
+            all_hold_no_change[:2], max_cycles=3,
+        )
+        # full match → policy fires.
+        cls_o_full = _max_cycles_boundary_classification(
+            all_hold_no_change, max_cycles=3,
+        )
+        # mixed history → declines.
+        cls_o_mixed = _max_cycles_boundary_classification(
+            [
+                {"verdict": "HOLD", "code_changed": False},
+                {"verdict": "READY_TO_REVIEW", "code_changed": True},
+                {"verdict": "HOLD", "code_changed": False},
+            ],
+            max_cycles=3,
+        )
+        if (
+            cls_o_small is None
+            and cls_o_short is None
+            and cls_o_full == "no_change_hold_loop"
+            and cls_o_mixed is None
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"O: boundary classifier policy — small={cls_o_small!r} "
+                f"short={cls_o_short!r} full={cls_o_full!r} "
+                f"mixed={cls_o_mixed!r}"
+            )
+
+        # --- P. _consecutive_no_change_holds threshold: 3 consecutive
+        # HOLD+no-change cycles must hit the in-loop trigger (verifies
+        # the existing threshold-based path is not broken by the new
+        # boundary classifier).
+        total += 1
+        history_p = [
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+            {"verdict": "HOLD", "code_changed": False},
+        ]
+        if _consecutive_no_change_holds(history_p) >= NO_CHANGE_HOLD_STOP_THRESHOLD:
+            passed += 1
+        else:
+            failures.append(
+                f"P: 3xHOLD+no-change must hit "
+                f"NO_CHANGE_HOLD_STOP_THRESHOLD (got n="
+                f"{_consecutive_no_change_holds(history_p)})"
             )
 
     # Restore env.

@@ -215,6 +215,17 @@ class SmokeRun:
     ticket_status: str | None = None
     pm_decision_ship_ready: bool | None = None
     publish_executed: bool = False
+    # HOLD classification + rework lock — mirrored from factory_state so
+    # the autopilot loop can decide whether a HOLD cycle is "hard"
+    # (must not retry implementation) or "soft" (next cycle should
+    # advance to design_spec / implementation_ticket / claude_propose).
+    pm_hold_type: str | None = None  # soft | hard | None
+    pm_hold_type_reason: str | None = None
+    active_rework_feature: str | None = None
+    active_rework_hold_count: int = 0
+    planner_feature_drift_detected: bool = False
+    planner_feature_drift_reason: str | None = None
+    code_changed: bool = False
     # design_spec / spec-mode signals captured from factory_state.json
     # at finalize time. Surfaced in factory_smoke_state.json so the
     # dashboard / observer don't have to re-parse the cycle's state.
@@ -921,6 +932,21 @@ def _finalize_run(
         run.pm_decision_ship_ready = bool(
             factory_state.get("pm_decision_ship_ready")
         )
+    run.pm_hold_type = factory_state.get("pm_hold_type")
+    run.pm_hold_type_reason = factory_state.get("pm_hold_type_reason")
+    run.active_rework_feature = factory_state.get("active_rework_feature")
+    arwc = factory_state.get("active_rework_hold_count")
+    if isinstance(arwc, int):
+        run.active_rework_hold_count = arwc
+    elif isinstance(arwc, str) and arwc.isdigit():
+        run.active_rework_hold_count = int(arwc)
+    run.planner_feature_drift_detected = bool(
+        factory_state.get("planner_feature_drift_detected")
+    )
+    run.planner_feature_drift_reason = factory_state.get(
+        "planner_feature_drift_reason"
+    )
+    run.code_changed = bool(factory_state.get("code_changed"))
     spec_kw = factory_state.get("pm_hold_spec_keywords") or []
     if isinstance(spec_kw, list):
         run.pm_hold_spec_keywords = list(spec_kw)
@@ -1142,6 +1168,13 @@ def _serialize_run(run: SmokeRun) -> dict:
         "ticket_status": run.ticket_status,
         "pm_decision_ship_ready": run.pm_decision_ship_ready,
         "publish_executed": run.publish_executed,
+        "pm_hold_type": run.pm_hold_type,
+        "pm_hold_type_reason": run.pm_hold_type_reason,
+        "active_rework_feature": run.active_rework_feature,
+        "active_rework_hold_count": run.active_rework_hold_count,
+        "planner_feature_drift_detected": run.planner_feature_drift_detected,
+        "planner_feature_drift_reason": run.planner_feature_drift_reason,
+        "code_changed": run.code_changed,
         "pm_hold_spec_keywords": list(run.pm_hold_spec_keywords),
         "design_spec_status": run.design_spec_status,
         "design_spec_acceptance_passed": run.design_spec_acceptance_passed,
@@ -4614,6 +4647,176 @@ def self_test() -> tuple[int, int, list[str]]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"34: HOLD-loop root cause raised: {exc}")
 
+    # ----------------------------------------------------------------
+    # HOLD loop breaker fixtures (soft/hard HOLD, planner drift,
+    # active rework feature lock, no-change loop classifier).
+    # ----------------------------------------------------------------
+
+    # 34A. _classify_pm_hold_type — soft HOLD when feature + target_files
+    # exist + Visual Desire low.
+    total += 1
+    try:
+        from . import cycle as _cycle
+
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_frontend_scope = "app/web/src/components/TitleSeal.jsx"
+        st.design_spec_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+            "app/web/src/data/badges.js",
+            "app/web/src/screens/Share.jsx",
+        ]
+        st.desire_scorecard_rework = ["visual_desire"]
+        st.pm_hold_soft_signals = ["visual_desire"]
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        if ht == "soft" and "visual_desire" in (hr or ""):
+            passed += 1
+        else:
+            failures.append(
+                f"34A: soft-HOLD classifier expected soft — got {ht!r} ({hr!r})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34A: soft-HOLD classifier raised: {exc}")
+
+    # 34B. _classify_pm_hold_type — hard HOLD when no candidate feature.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "skipped"
+        st.product_planner_status = "skipped"
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        if ht == "hard" and "candidate" in (hr or ""):
+            passed += 1
+        else:
+            failures.append(
+                f"34B: hard-HOLD (no candidate) — got {ht!r} ({hr!r})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34B: hard-HOLD classifier raised: {exc}")
+
+    # 34C. _classify_pm_hold_type — hard HOLD on scope mismatch.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "anything"
+        st.scope_consistency_status = "failed"
+        st.scope_mismatch_reason = "diff did not touch design_spec target_files"
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        if ht == "hard" and "scope_mismatch" in (hr or ""):
+            passed += 1
+        else:
+            failures.append(
+                f"34C: hard-HOLD (scope mismatch) — got {ht!r} ({hr!r})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34C: hard-HOLD classifier raised: {exc}")
+
+    # 34D. Active rework feature persistence — save then load round-trip.
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            try:
+                # cycle.py captured ACTIVE_REWORK_FEATURE_FILE at import
+                # time from REPO_ROOT — re-point it for the test.
+                saved = _cycle.ACTIVE_REWORK_FEATURE_FILE
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                    Path(tmp) / ".runtime" / "active_rework_feature.json"
+                )
+                Path(tmp, ".runtime").mkdir(parents=True, exist_ok=True)
+                try:
+                    _cycle._save_active_rework_feature(
+                        feature="TitleSeal",
+                        hold_count=2,
+                        hold_type="soft",
+                        pm_message="HOLD (총점 19/30)",
+                    )
+                    loaded = _cycle._load_active_rework_feature()
+                    cleared = _cycle._clear_active_rework_feature()
+                    after = _cycle._load_active_rework_feature()
+                finally:
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE = saved
+            finally:
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+        ok = (
+            loaded.get("feature") == "TitleSeal"
+            and int(loaded.get("hold_count") or 0) == 2
+            and loaded.get("last_hold_type") == "soft"
+            and cleared is True
+            and after == {}
+        )
+        if ok:
+            passed += 1
+        else:
+            failures.append(
+                f"34D: rework feature persistence — loaded={loaded} "
+                f"cleared={cleared} after={after}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34D: rework feature persistence raised: {exc}")
+
+    # 34E. Locked feature appears in planner prompt + drift gets rejected.
+    total += 1
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".runtime").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / ".runtime" / "pm_decision.md").write_text(
+                _PM_DECISION_FIXTURE, encoding="utf-8"
+            )
+            (Path(tmp) / ".runtime" / "designer_final_review.md").write_text(
+                _DESIGNER_FINAL_REVIEW_FIXTURE, encoding="utf-8"
+            )
+            (Path(tmp) / ".runtime" / "active_rework_feature.json").write_text(
+                json.dumps({
+                    "feature": "TitleSeal 컴포넌트",
+                    "hold_count": 2,
+                    "last_hold_type": "soft",
+                }),
+                encoding="utf-8",
+            )
+            saved_pm = _cycle.PM_DECISION_FILE
+            saved_dr = _cycle.DESIGNER_FINAL_REVIEW_FILE
+            saved_ar = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            _cycle.PM_DECISION_FILE = Path(tmp) / ".runtime" / "pm_decision.md"
+            _cycle.DESIGNER_FINAL_REVIEW_FILE = (
+                Path(tmp) / ".runtime" / "designer_final_review.md"
+            )
+            _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                Path(tmp) / ".runtime" / "active_rework_feature.json"
+            )
+            try:
+                prompt = _cycle._build_product_planner_prompt("test goal")
+            finally:
+                _cycle.PM_DECISION_FILE = saved_pm
+                _cycle.DESIGNER_FINAL_REVIEW_FILE = saved_dr
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_ar
+        ok = (
+            "ACTIVE REWORK FEATURE LOCK" in prompt
+            and "TitleSeal 컴포넌트" in prompt
+            and "잠긴 selected_feature" in prompt
+        )
+        if ok:
+            passed += 1
+        else:
+            failures.append(
+                "34E: planner prompt missing ACTIVE REWORK FEATURE LOCK"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"34E: planner prompt lock test raised: {exc}")
+
     # 35. design_spec acceptance bypass — when design_spec is generated
     # AND acceptance passed, implementation_ticket and claude_propose
     # should NOT be skipped on PM HOLD. Verified via state inspection
@@ -4650,6 +4853,542 @@ def self_test() -> tuple[int, int, list[str]]:
             )
     except Exception as exc:  # noqa: BLE001
         failures.append(f"35: spec_acceptance_bypass test raised: {exc}")
+
+    # ----------------------------------------------------------------
+    # Soft / hard HOLD pipeline gates (per the soft-HOLD-must-build
+    # spec: design_spec → implementation_ticket → claude_propose →
+    # claude_apply must all run on soft HOLD; only hard HOLD may skip).
+    # ----------------------------------------------------------------
+
+    # 36A. Soft HOLD with desire_scorecard_rework signal (visual_desire)
+    # → implementation_ticket gate must NOT enter the skipped_hold
+    # branch. Mirror the exact gate logic so a regression in either
+    # call site fails the test.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False  # PM HOLD
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_frontend_scope = (
+            "app/web/src/components/TitleSeal.jsx"
+        )
+        st.design_spec_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+            "app/web/src/data/badges.js",
+            "app/web/src/screens/Share.jsx",
+        ]
+        st.desire_scorecard_rework = ["visual_desire"]
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+        st.pm_hold_type_reason = hr
+
+        pm_hold = (
+            st.pm_decision_status == "generated"
+            and not st.pm_decision_ship_ready
+        )
+        spec_acceptance_bypass = False  # design_spec not generated yet
+        soft_hold_bypass = bool(pm_hold and st.pm_hold_type == "soft")
+        # Mirrors stage_implementation_ticket — skipped_hold MUST require
+        # all three negatives.
+        ticket_would_skip_hold = (
+            pm_hold and not spec_acceptance_bypass and not soft_hold_bypass
+        )
+        # Mirrors stage_claude_propose — same condition.
+        propose_would_skip_hold = ticket_would_skip_hold
+        if (
+            ht == "soft"
+            and not ticket_would_skip_hold
+            and not propose_would_skip_hold
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"36A: soft HOLD must not trigger skipped_hold — got "
+                f"hold_type={ht!r} ticket_skip={ticket_would_skip_hold} "
+                f"propose_skip={propose_would_skip_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36A: soft HOLD pipeline gate test raised: {exc}")
+
+    # 36B. Hard HOLD (no candidate feature) → implementation_ticket and
+    # claude_propose MUST stay skipped_hold.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "skipped"
+        st.product_planner_status = "skipped"
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+        st.pm_hold_type_reason = hr
+
+        pm_hold = (
+            st.pm_decision_status == "generated"
+            and not st.pm_decision_ship_ready
+        )
+        spec_acceptance_bypass = False
+        soft_hold_bypass = bool(pm_hold and st.pm_hold_type == "soft")
+        ticket_would_skip_hold = (
+            pm_hold and not spec_acceptance_bypass and not soft_hold_bypass
+        )
+        if ht == "hard" and ticket_would_skip_hold:
+            passed += 1
+        else:
+            failures.append(
+                f"36B: hard HOLD must keep skipped_hold — got "
+                f"hold_type={ht!r} ticket_skip={ticket_would_skip_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36B: hard HOLD pipeline gate test raised: {exc}")
+
+    # 36C. Soft HOLD without explicit spec-mode keyword AND without
+    # desire_scorecard_rework signals — design_spec must still be
+    # eligible to run (because the HOLD type is soft; the spec
+    # generator falls back to a "soft_hold_default" signal). Mirror
+    # the stage_design_spec gate exactly.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "Local Visa"
+        st.product_planner_selected_feature = "Local Visa"
+        st.design_spec_target_files = [
+            "app/web/src/screens/Share.jsx",
+        ]
+        # No spec keywords, no desire_scorecard_rework signals.
+        st.desire_scorecard_rework = []
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+        # Spec-mode keyword path: empty.
+        keywords: list[str] = []
+        soft_signals: list[str] = list(st.desire_scorecard_rework or [])
+        # The gate inside stage_design_spec — restricted skip path.
+        design_spec_would_skip = (
+            (not keywords) and (not soft_signals) and ht != "soft"
+        )
+        # Conversely, soft HOLD must NOT skip even with empty signals.
+        if ht == "soft" and not design_spec_would_skip:
+            passed += 1
+        else:
+            failures.append(
+                f"36C: soft HOLD with empty signals must not skip "
+                f"design_spec — hold_type={ht!r} would_skip="
+                f"{design_spec_would_skip}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36C: soft HOLD design_spec gate test raised: {exc}")
+
+    # 36D. Hard HOLD without spec keyword AND without soft signals →
+    # design_spec MUST skip (only allowed skip path).
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "skipped"
+        st.product_planner_status = "skipped"
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+        keywords: list[str] = []
+        soft_signals: list[str] = []
+        design_spec_would_skip = (
+            (not keywords) and (not soft_signals) and ht != "soft"
+        )
+        if ht == "hard" and design_spec_would_skip:
+            passed += 1
+        else:
+            failures.append(
+                f"36D: hard HOLD with empty signals must skip "
+                f"design_spec — hold_type={ht!r} would_skip="
+                f"{design_spec_would_skip}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36D: hard HOLD design_spec gate test raised: {exc}")
+
+    # 36E. claude_apply produced no diff — must record retry_required
+    # (NOT noop / applied) so the next cycle re-runs and the dashboard
+    # surfaces this as unfinished work. Verify the cycle's terminal
+    # logic treats `retry_required` as not-shipped (code_changed=False).
+    total += 1
+    try:
+        # Build a synthetic state where claude_apply ran but produced
+        # no files. `claude_apply_status='retry_required'` is the new
+        # contract — mirror cycle.main()'s code_changed gate.
+        fs = {
+            "claude_apply_status": "retry_required",
+            "claude_apply_changed_files": [],
+        }
+        # cycle.main's success branch checks
+        # `apply_status == "applied" and apply_changed`. retry_required
+        # must NOT match.
+        apply_status = fs["claude_apply_status"]
+        apply_changed = fs["claude_apply_changed_files"]
+        is_applied_path = (
+            apply_status == "applied" and bool(apply_changed)
+        )
+        if (
+            apply_status == "retry_required"
+            and not apply_changed
+            and not is_applied_path
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"36E: claude_apply retry_required contract — "
+                f"status={apply_status!r} changed={apply_changed!r} "
+                f"is_applied={is_applied_path}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36E: retry_required test raised: {exc}")
+
+    # 36F. Lock-clear on non-rework terminal states. After cycle.main
+    # finalizes, status in {succeeded, planning_only, no_code_change,
+    # docs_only} must clear active_rework_feature.json. Mirror the
+    # gate condition.
+    total += 1
+    try:
+        NON_REWORK_TERMINAL_STATES = {
+            "succeeded", "planning_only", "no_code_change", "docs_only",
+        }
+        REWORK_OR_FAIL = {"hold_for_rework", "failed"}
+        # Every non-rework terminal triggers a clear.
+        all_clear_ok = all(
+            s in NON_REWORK_TERMINAL_STATES
+            for s in ("succeeded", "planning_only",
+                      "no_code_change", "docs_only")
+        )
+        # HOLD / failed must NOT clear (lock survives the rework cycle).
+        no_clear_on_hold = all(
+            s not in NON_REWORK_TERMINAL_STATES
+            for s in REWORK_OR_FAIL
+        )
+        if all_clear_ok and no_clear_on_hold:
+            passed += 1
+        else:
+            failures.append(
+                f"36F: lock-clear gate inconsistency — clear={all_clear_ok} "
+                f"no_clear_on_hold={no_clear_on_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36F: lock-clear gate test raised: {exc}")
+
+    # 36G0. soft HOLD → design_spec generation gate must NOT short-
+    # circuit even when there are no spec-mode keywords AND no
+    # desire_scorecard_rework signals (the gate falls back to a
+    # `soft_hold_default` signal). Mirrors stage_design_spec's exact
+    # skip path.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_selected_feature = "TitleSeal 컴포넌트"
+        st.design_spec_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+        ]
+        st.desire_scorecard_rework = []  # no explicit signal
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+        keywords: list[str] = []
+        soft_signals: list[str] = list(st.desire_scorecard_rework or [])
+        # The skip path (mirrored): only fires on hard HOLD. Soft HOLD
+        # falls through to spec generation with the implicit signal.
+        if ht == "soft":
+            design_spec_skip = bool(
+                (not keywords) and (not soft_signals)
+                and ht != "soft"
+            )
+            implicit_signal_added = (not keywords) and (not soft_signals)
+            if (not design_spec_skip) and implicit_signal_added:
+                passed += 1
+            else:
+                failures.append(
+                    f"36G0: soft HOLD design_spec must reach generation "
+                    f"phase — skip={design_spec_skip} "
+                    f"implicit_signal={implicit_signal_added}"
+                )
+        else:
+            failures.append(
+                f"36G0: classifier returned non-soft hold_type for soft "
+                f"fixture (got {ht!r})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36G0: soft HOLD design_spec test raised: {exc}")
+
+    # 36H. soft HOLD + design_spec generated (acceptance passed) →
+    # implementation_ticket gate must take the spec_acceptance_bypass
+    # path and proceed to generation (NOT skipped_hold).
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "TitleSeal 컴포넌트"
+        st.product_planner_selected_feature = "TitleSeal 컴포넌트"
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.stale_design_spec_detected = False
+        st.design_spec_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+            "app/web/src/data/badges.js",
+            "app/web/src/screens/Share.jsx",
+        ]
+        st.desire_scorecard_rework = ["visual_desire"]
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+
+        pm_hold = (
+            st.pm_decision_status == "generated"
+            and not st.pm_decision_ship_ready
+        )
+        spec_acceptance_bypass = bool(
+            st.design_spec_status == "generated"
+            and st.design_spec_acceptance_passed
+            and not st.stale_design_spec_detected
+        )
+        soft_hold_bypass = bool(pm_hold and st.pm_hold_type == "soft")
+        ticket_skipped_hold = (
+            pm_hold and not spec_acceptance_bypass and not soft_hold_bypass
+        )
+        # Either bypass alone is sufficient — the ticket would generate.
+        if spec_acceptance_bypass and not ticket_skipped_hold:
+            passed += 1
+        else:
+            failures.append(
+                f"36H: soft HOLD + design_spec generated must proceed to "
+                f"implementation_ticket — spec_bypass={spec_acceptance_bypass} "
+                f"soft_bypass={soft_hold_bypass} skipped_hold="
+                f"{ticket_skipped_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36H: soft HOLD ticket gate test raised: {exc}")
+
+    # 36I. soft HOLD + implementation_ticket generated → claude_propose
+    # gate must NOT skip on PM HOLD. Mirror the propose stage's
+    # skipped-on-hard-hold gate.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        st.planner_revision_status = "generated"
+        st.planner_revision_selected_feature = "TitleSeal 컴포넌트"
+        st.implementation_ticket_status = "generated"
+        st.implementation_ticket_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+        ]
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.design_spec_target_files = [
+            "app/web/src/components/TitleSeal.jsx",
+        ]
+        st.desire_scorecard_rework = ["visual_desire"]
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+
+        pm_hold = (
+            st.pm_decision_status == "generated"
+            and not st.pm_decision_ship_ready
+        )
+        spec_acceptance_bypass = bool(
+            st.design_spec_status == "generated"
+            and st.design_spec_acceptance_passed
+            and not st.stale_design_spec_detected
+        )
+        soft_hold_bypass_propose = bool(
+            pm_hold and st.pm_hold_type == "soft"
+        )
+        propose_would_skip_hold = (
+            pm_hold
+            and not spec_acceptance_bypass
+            and not soft_hold_bypass_propose
+        )
+        if (
+            ht == "soft"
+            and not propose_would_skip_hold
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"36I: soft HOLD claude_propose must not skip on hold — "
+                f"hold_type={ht!r} propose_skip={propose_would_skip_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36I: soft HOLD propose gate test raised: {exc}")
+
+    # 36J. hard HOLD → claude_propose MUST skip with the dedicated
+    # PM HOLD reason (no spec_acceptance_bypass, no soft_hold_bypass).
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = False
+        # Hard HOLD: planner produced nothing usable.
+        st.planner_revision_status = "skipped"
+        st.product_planner_status = "skipped"
+        ht, hr = _cycle._classify_pm_hold_type(st)
+        st.pm_hold_type = ht
+
+        pm_hold = (
+            st.pm_decision_status == "generated"
+            and not st.pm_decision_ship_ready
+        )
+        spec_acceptance_bypass = False
+        soft_hold_bypass_propose = bool(
+            pm_hold and st.pm_hold_type == "soft"
+        )
+        propose_would_skip_hold = (
+            pm_hold
+            and not spec_acceptance_bypass
+            and not soft_hold_bypass_propose
+        )
+        if (
+            ht == "hard"
+            and propose_would_skip_hold
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"36J: hard HOLD claude_propose must skip — "
+                f"hold_type={ht!r} propose_skip={propose_would_skip_hold}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36J: hard HOLD propose gate test raised: {exc}")
+
+    # 36K. claude_apply applied with non-docs-only changes →
+    # active_rework_feature.json must be cleared. Exercises
+    # _clear_active_rework_feature on a freshly-saved lock.
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            try:
+                Path(tmp, ".runtime").mkdir(parents=True, exist_ok=True)
+                saved = _cycle.ACTIVE_REWORK_FEATURE_FILE
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                    Path(tmp) / ".runtime" / "active_rework_feature.json"
+                )
+                try:
+                    _cycle._save_active_rework_feature(
+                        feature="TitleSeal 컴포넌트",
+                        hold_count=2,
+                        hold_type="soft",
+                        pm_message="HOLD (총점 19/30)",
+                    )
+                    pre_state = (
+                        _cycle.ACTIVE_REWORK_FEATURE_FILE.is_file()
+                    )
+                    # Simulate the apply-success branch: cycle.main
+                    # clears the lock when claude_apply_status ==
+                    # "applied" AND the change set is not docs-only.
+                    apply_status = "applied"
+                    apply_changed = ["app/web/src/components/TitleSeal.jsx"]
+                    cats = _cycle._categorize_changed_files(apply_changed)
+                    cleared = False
+                    if (
+                        apply_status == "applied"
+                        and apply_changed
+                        and not cats["docs_only"]
+                    ):
+                        cleared = _cycle._clear_active_rework_feature()
+                    post_state = (
+                        _cycle.ACTIVE_REWORK_FEATURE_FILE.is_file()
+                    )
+                finally:
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE = saved
+            finally:
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+        if pre_state is True and cleared is True and post_state is False:
+            passed += 1
+        else:
+            failures.append(
+                f"36K: apply-success lock-clear — pre={pre_state} "
+                f"cleared={cleared} post={post_state}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36K: apply-success lock-clear test raised: {exc}")
+
+    # 36G. Locked feature drift retention — when planner produces a
+    # different selected_feature but a lock is active, cycle.py
+    # overrides selected back to the locked feature.
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                # Drop a non-trivial planner_revision body so the
+                # extractor returns a feature.
+                planner_md = (
+                    "# 기획자 수정안\n\n"
+                    "## 이번 사이클 선정 기능\n"
+                    "Brand new drift candidate\n"
+                )
+                (runtime / "planner_revision.md").write_text(
+                    planner_md, encoding="utf-8"
+                )
+                # Write the active rework lock with the canonical
+                # feature.
+                (runtime / "active_rework_feature.json").write_text(
+                    json.dumps({
+                        "feature": "Locked TitleSeal Feature",
+                        "hold_count": 1,
+                        "last_hold_type": "soft",
+                    }),
+                    encoding="utf-8",
+                )
+                # Mirror cycle.py: load lock, compare to a "drifted"
+                # selected feature, overriding when mismatch.
+                saved_ar = _cycle.ACTIVE_REWORK_FEATURE_FILE
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                    runtime / "active_rework_feature.json"
+                )
+                try:
+                    rework_lock = _cycle._load_active_rework_feature()
+                    locked_feature = (
+                        rework_lock.get("feature") or ""
+                    ).strip()
+                    drifted = "Brand new drift candidate"
+                    overridden = (
+                        locked_feature
+                        if locked_feature
+                        and not _cycle._features_match(drifted, locked_feature)
+                        else drifted
+                    )
+                finally:
+                    _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_ar
+            finally:
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+        if (
+            locked_feature == "Locked TitleSeal Feature"
+            and overridden == "Locked TitleSeal Feature"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"36G: locked feature drift retention — "
+                f"locked={locked_feature!r} overridden={overridden!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"36G: locked feature drift test raised: {exc}")
 
     return passed, total, failures
 

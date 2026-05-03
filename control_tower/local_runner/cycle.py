@@ -86,6 +86,13 @@ DESIGN_SPEC_FILE            = RUNTIME / "design_spec.md"
 # claude_apply. claude_apply refuses to run if the ticket is missing
 # or has no concrete target files. See stage_implementation_ticket.
 IMPLEMENTATION_TICKET_FILE  = RUNTIME / "implementation_ticket.md"
+# Active rework feature lock — when PM HOLD is observed at the end of
+# a cycle, we persist the canonical selected_feature here so the next
+# cycle's planner is forced to keep working on the same feature instead
+# of proposing 3 brand-new candidates and starving the rework loop.
+# Cleared automatically after claude_apply succeeds (real code change
+# shipped) or when the operator deletes the file.
+ACTIVE_REWORK_FEATURE_FILE = RUNTIME / "active_rework_feature.json"
 # QA Gatekeeper artifacts. qa_report.md is always (re)written by
 # stage_qa_gate; qa_feedback.md is written ONLY when a check fails so
 # the next cycle's qa_fix_propose stage has a precise repro/instruction
@@ -506,6 +513,23 @@ class CycleState:
     pm_decision_message: str | None = None
     pm_decision_skipped_reason: str | None = None
     pm_decision_ship_ready: bool = False
+    # Hold classification — set in stage_implementation_ticket when
+    # PM HOLD is observed. soft = "selected_feature + target_files exist
+    # so the cycle can still build something to fix the HOLD"; hard =
+    # "no candidate / no target_files / scope mismatch / domain
+    # violation — implementation must not run". Soft HOLD allows
+    # design_spec / implementation_ticket / claude_propose to proceed.
+    pm_hold_type: str | None = None  # soft | hard | None
+    pm_hold_type_reason: str | None = None
+    pm_hold_soft_signals: list[str] = field(default_factory=list)
+    # Active rework feature lock — populated when the previous cycle
+    # ended in PM HOLD and saved a canonical feature name so the
+    # current cycle's planner cannot drift to a new candidate. Carries
+    # over until claude_apply succeeds or operator clears it.
+    active_rework_feature: str | None = None
+    active_rework_hold_count: int = 0
+    planner_feature_drift_detected: bool = False
+    planner_feature_drift_reason: str | None = None
     # design_spec stage: only runs when prior PM HOLD has spec-mode
     # keywords. status moves through skipped|generated|failed|insufficient.
     # pm_hold_spec_mode_active reflects whether *this* cycle was forced
@@ -701,6 +725,13 @@ class CycleState:
             "pm_decision_message": self.pm_decision_message,
             "pm_decision_skipped_reason": self.pm_decision_skipped_reason,
             "pm_decision_ship_ready": self.pm_decision_ship_ready,
+            "pm_hold_type": self.pm_hold_type,
+            "pm_hold_type_reason": self.pm_hold_type_reason,
+            "pm_hold_soft_signals": list(self.pm_hold_soft_signals),
+            "active_rework_feature": self.active_rework_feature,
+            "active_rework_hold_count": self.active_rework_hold_count,
+            "planner_feature_drift_detected": self.planner_feature_drift_detected,
+            "planner_feature_drift_reason": self.planner_feature_drift_reason,
             "pm_hold_spec_mode_active": self.pm_hold_spec_mode_active,
             "pm_hold_spec_keywords": list(self.pm_hold_spec_keywords),
             "design_spec_status": self.design_spec_status,
@@ -2320,7 +2351,10 @@ def _load_pm_hold_rework_context(*, return_spec_mode: bool = False):
     spec-confirmation, not new ideation).
     """
     pm_md, designer_md, hold_active = _read_pm_hold_artifacts()
-    if not hold_active:
+    rework_lock = _load_active_rework_feature()
+    locked_feature = (rework_lock.get("feature") or "").strip()
+    locked_hold_count = int(rework_lock.get("hold_count") or 0)
+    if not hold_active and not locked_feature:
         if return_spec_mode:
             return "", False, []
         return ""
@@ -2408,6 +2442,31 @@ def _load_pm_hold_rework_context(*, return_spec_mode: bool = False):
         " PM 의 implementation_ticket validator 가 이 목록을 그대로 사용한다.",
         "- 직전 HOLD 사유 자체를 후보 1개의 \"사용자 문제\" 로 그대로 옮겨 적어라."
         " HOLD 를 우회하는 새 아이디어는 다음 cycle 도 HOLD 한다.",
+    ]
+    if locked_feature:
+        pieces += [
+            "",
+            "## 🔒 ACTIVE REWORK FEATURE LOCK (필수)",
+            (
+                f"직전 사이클의 selected_feature 가 ship 되지 못하고 HOLD 로 종료되어, "
+                f"이번 사이클은 동일 기능을 재작업하는 cycle 로 강제됩니다."
+            ),
+            f"- 잠긴 selected_feature: **{locked_feature}**",
+            f"- 누적 HOLD 횟수: {locked_hold_count}",
+            (
+                "- 새 후보 3개를 무작위로 제안하지 마세요. 후보 3개를 채울 때도 위 잠긴 기능을 "
+                "이번 사이클의 `이번 사이클 선정 기능` 으로 그대로 사용해야 합니다."
+            ),
+            (
+                "- `이번 사이클 선정 기능` 헤더에 위 잠긴 이름과 다른 단어를 적으면 product_planning "
+                "단계에서 reject 되고 fallback 보고서로 강등됩니다 — 그러면 이번 cycle 도 HOLD 입니다."
+            ),
+            (
+                "- 잠금을 풀 수 있는 유일한 방법은 이번 사이클에서 잠긴 기능을 ship (claude_apply 적용) "
+                "시키는 것입니다."
+            ),
+        ]
+    pieces += [
         "=== END Previous PM HOLD ===",
         "",
     ]
@@ -3115,6 +3174,34 @@ def stage_product_planning(state: CycleState) -> StageResult:
     )
     n_candidates = _count_candidate_rows(body)
 
+    # Active rework feature lock — when the previous cycle ended in HOLD
+    # and saved a canonical feature, the planner here is REQUIRED to
+    # keep that same feature. If the LLM drifted (no token overlap with
+    # the locked feature), force the locked name back so all downstream
+    # stages (designer/PM/ticket) work on the same target. Without this,
+    # every HOLD cycle proposes a brand-new feature, the design_spec is
+    # always stale, and implementation never runs — the exact symptom
+    # the operator reported.
+    rework_lock = _load_active_rework_feature()
+    locked_feature = (rework_lock.get("feature") or "").strip()
+    if locked_feature:
+        state.active_rework_feature = locked_feature
+        state.active_rework_hold_count = int(rework_lock.get("hold_count") or 0)
+        if selected and not _features_match(selected, locked_feature):
+            state.planner_feature_drift_detected = True
+            state.planner_feature_drift_reason = (
+                f"planner proposed '{selected}' but rework lock requires "
+                f"'{locked_feature}' — overriding to keep rework on the "
+                "same feature"
+            )
+            _emit_cycle_log(
+                state, "planner_feature_drift_rejected",
+                state.planner_feature_drift_reason,
+                locked_feature=locked_feature,
+                proposed_feature=selected,
+            )
+            selected = locked_feature
+
     state.product_planner_status = "generated"
     state.product_planner_path = str(PRODUCT_PLANNER_FILE)
     state.product_planner_at = utc_now_iso()
@@ -3480,9 +3567,32 @@ def stage_planner_revision(state: CycleState) -> StageResult:
     state.planner_revision_status = "generated"
     state.planner_revision_path = str(PLANNER_REVISION_FILE)
     state.planner_revision_at = utc_now_iso()
-    state.planner_revision_selected_feature = _first_meaningful_line(
+    revision_selected = _first_meaningful_line(
         _extract_md_section(body, "선정 후보"), max_chars=120,
     ) or None
+    # Re-apply the rework feature lock here so a planner_revision that
+    # drifted away from the locked feature still gets pinned back. The
+    # design_spec / PM stages key off planner_revision_selected_feature
+    # via current_feature, so without this clamp a drift here would
+    # still cause stale_design_spec_detected on the next cycle.
+    locked_for_revision = (state.active_rework_feature or "").strip()
+    if locked_for_revision and revision_selected and not _features_match(
+        revision_selected, locked_for_revision,
+    ):
+        state.planner_feature_drift_detected = True
+        state.planner_feature_drift_reason = (
+            (state.planner_feature_drift_reason or "")
+            + f" | revision drift: '{revision_selected}' → '{locked_for_revision}'"
+        ).strip(" |")
+        _emit_cycle_log(
+            state, "planner_revision_feature_drift_rejected",
+            f"planner_revision proposed '{revision_selected}' but rework lock "
+            f"requires '{locked_for_revision}' — overriding",
+            locked_feature=locked_for_revision,
+            proposed_feature=revision_selected,
+        )
+        revision_selected = locked_for_revision
+    state.planner_revision_selected_feature = revision_selected
     state.planner_revision_message = state.planner_revision_selected_feature or "수정안 생성"
     sr.status = "passed"
     sr.message = (
@@ -4067,6 +4177,69 @@ def _features_match(a: str | None, b: str | None) -> bool:
     return len(toks_a & toks_b) >= 2
 
 
+# ---------------------------------------------------------------------------
+# Active rework feature lock
+#
+# When a cycle ends with `hold_for_rework`, we persist the canonical
+# selected_feature into .runtime/active_rework_feature.json. The next
+# cycle's planner stage reads it and refuses to drift to a new candidate
+# — without this, every HOLD cycle proposes 3 brand-new ideas, the
+# design_spec is always "stale" (different feature than current), and
+# implementation never runs. The file is cleared automatically after
+# claude_apply succeeds with a real code change.
+# ---------------------------------------------------------------------------
+
+
+def _load_active_rework_feature() -> dict:
+    """Return the persisted rework lock or an empty dict.
+
+    Shape: {"feature": str, "hold_count": int, "last_hold_at": iso,
+             "last_hold_type": "soft"|"hard"|None}
+    """
+    try:
+        if not ACTIVE_REWORK_FEATURE_FILE.is_file():
+            return {}
+        data = json.loads(
+            ACTIVE_REWORK_FEATURE_FILE.read_text(encoding="utf-8")
+        ) or {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_active_rework_feature(
+    *,
+    feature: str | None,
+    hold_count: int,
+    hold_type: str | None,
+    pm_message: str | None = None,
+) -> None:
+    """Persist the rework lock. A blank feature still writes the file
+    (zero-feature lock has no effect downstream but keeps history)."""
+    payload = {
+        "feature": (feature or "").strip(),
+        "hold_count": int(hold_count),
+        "last_hold_at": utc_now_iso(),
+        "last_hold_type": hold_type,
+        "pm_message": pm_message,
+    }
+    safe_write_json(ACTIVE_REWORK_FEATURE_FILE, payload)
+
+
+def _clear_active_rework_feature() -> bool:
+    """Remove the rework lock file. Returns True when something was
+    deleted (used by tests + the cycle's success path)."""
+    try:
+        if ACTIVE_REWORK_FEATURE_FILE.is_file():
+            ACTIVE_REWORK_FEATURE_FILE.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _classify_design_spec_freshness(
     *,
     current_cycle_id: int,
@@ -4360,9 +4533,56 @@ def stage_design_spec(state: CycleState) -> StageResult:
 
     keywords = _detect_spec_mode_keywords(pm_reason, weaknesses, next_owners, final)
     state.pm_hold_spec_keywords = list(keywords)
-    if not keywords:
-        state.pm_hold_spec_mode_active = False
-        return _skip("PM HOLD 사유에 spec-mode keyword 없음 — design_spec 미필요")
+    # Soft-HOLD signals (rework axes from the desire scorecard) also
+    # warrant a design_spec — UI/감성/공유/재방문 점수 미달은 추상 기획
+    # 문제가 아니라 시각/구현 명세가 필요한 케이스다. Without this, a
+    # PM HOLD that fires only because Visual Desire == 3 leaves the
+    # cycle stuck (no spec, no implementation) for every subsequent
+    # iteration.
+    soft_signals: list[str] = list(state.desire_scorecard_rework or [])
+    soft_blob = (
+        (pm_reason or "") + "\n" + (weaknesses or "") + "\n" + (final or "")
+    )
+    SOFT_HOLD_TRIGGER_TOKENS = (
+        "visual_desire", "Visual Desire",
+        "share", "Share",
+        "revisit", "Revisit",
+        "rarity", "Rarity",
+        "total_below_24",
+        "공유 카드", "재방문", "시각", "감성", "약점",
+    )
+    if not soft_signals:
+        for tok in SOFT_HOLD_TRIGGER_TOKENS:
+            if tok in soft_blob and tok not in soft_signals:
+                soft_signals.append(tok)
+    state.pm_hold_soft_signals = list(soft_signals)
+
+    # Classify the HOLD type up-front so the skip-when-no-signal short-
+    # circuit can be restricted to hard HOLD. Soft HOLD (selected_feature
+    # + target_files exist; PM said hold for visual_desire/share/revisit
+    # /total_below_24 etc.) MUST still produce a design_spec so the
+    # rework cycle has something concrete to ship — without this, every
+    # soft HOLD with no embedded spec-keyword loops forever.
+    if not state.pm_hold_type:
+        ht_ds, hr_ds = _classify_pm_hold_type(state)
+        state.pm_hold_type = ht_ds
+        state.pm_hold_type_reason = hr_ds
+
+    if not keywords and not soft_signals:
+        if state.pm_hold_type == "soft":
+            # Soft HOLD without explicit signals — still proceed. Mark
+            # an implicit signal so spec_mode gating downstream knows
+            # the spec was generated to break the loop, not because a
+            # spec-keyword was matched.
+            soft_signals = ["soft_hold_default"]
+            state.pm_hold_soft_signals = list(soft_signals)
+        else:
+            state.pm_hold_spec_mode_active = False
+            return _skip(
+                "PM HOLD (hard) — design_spec 미필요 "
+                f"(spec-mode keyword / soft-hold 신호 없음, "
+                f"hold_reason={state.pm_hold_type_reason or '—'})"
+            )
     state.pm_hold_spec_mode_active = True
 
     claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
@@ -4882,15 +5102,32 @@ def stage_claude_propose(state: CycleState) -> StageResult:
         and state.design_spec_acceptance_passed
         and not state.stale_design_spec_detected
     )
-    if (
+    pm_hold = (
         state.pm_decision_status == "generated"
         and not state.pm_decision_ship_ready
+    )
+    # claude_propose only skips on hard HOLD. Soft HOLD (selected_feature
+    # and target_files exist) is allowed to advance — without this the
+    # propose / apply pipeline never runs and the rework loop spins
+    # forever on the same HOLD. We classify here too because
+    # claude_propose runs BEFORE implementation_ticket in the pipeline.
+    if pm_hold and not state.pm_hold_type:
+        ht, hr = _classify_pm_hold_type(state)
+        state.pm_hold_type = ht
+        state.pm_hold_type_reason = hr
+    soft_hold_bypass_propose = bool(pm_hold and state.pm_hold_type == "soft")
+    if (
+        pm_hold
         and not spec_acceptance_bypass
+        and not soft_hold_bypass_propose
         and not _factory_flag_enabled(
             "FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT", default_on=False,
         )
     ):
-        return _skip("PM HOLD — 재작업 사이클이라 Claude 제안 건너뜀")
+        return _skip(
+            f"PM HOLD (hard) — 재작업 사이클이라 Claude 제안 건너뜀 "
+            f"(사유: {state.pm_hold_type_reason or '—'})"
+        )
 
     # Pre-condition 2: don't ask Claude to propose changes when the
     # working tree is leaking secrets / build artifacts.
@@ -5342,6 +5579,103 @@ def _build_apply_input_from_design_spec(
     )
 
 
+def _classify_pm_hold_type(state: "CycleState") -> tuple[str, str]:
+    """Decide whether a PM HOLD is `soft` (we still have enough info to
+    build something on the same feature) or `hard` (no candidate / no
+    target_files / scope mismatch / domain violation — must not run
+    implementation).
+
+    Returns (hold_type, reason). hold_type is one of "soft", "hard".
+    Caller is responsible for short-circuiting only when status is
+    actually a HOLD; this helper just classifies whatever inputs it is
+    given.
+    """
+    # Hard signals — anything in this list forces hard.
+    hard_reasons: list[str] = []
+    if (state.scope_consistency_status or "") == "failed":
+        hard_reasons.append(
+            f"scope_mismatch: {state.scope_mismatch_reason or '(no reason)'}"
+        )
+    if state.publish_blocked:
+        hard_reasons.append("publish_blocked (secret/conflict)")
+    planner_status = state.planner_revision_status
+    pp_status = state.product_planner_status
+    if (
+        planner_status not in {"generated", "fallback_generated"}
+        and pp_status not in {"generated", "fallback_generated"}
+    ):
+        hard_reasons.append(
+            f"planner output invalid (planner_revision_status={planner_status}, "
+            f"product_planner_status={pp_status})"
+        )
+
+    # selected_feature evidence — the rework lock counts even if the
+    # current cycle's planner produced nothing usable.
+    feature_candidates = [
+        state.planner_revision_selected_feature,
+        state.product_planner_selected_feature,
+        state.selected_feature,
+        state.active_rework_feature,
+    ]
+    has_feature = any(
+        bool((f or "").strip()) for f in feature_candidates
+    )
+    if not has_feature:
+        hard_reasons.append("no candidate feature (planner produced nothing)")
+
+    # target_files evidence — pull from any source we'd consult while
+    # composing a ticket. If none exist, we cannot build code.
+    target_evidence: list[str] = []
+    spec_files = list(state.design_spec_target_files or [])
+    if spec_files:
+        target_evidence.append(f"design_spec_target_files={len(spec_files)}")
+    pm_md = ""
+    proposal_md = ""
+    planner_md = ""
+    try:
+        if PM_DECISION_FILE.is_file():
+            pm_md = PM_DECISION_FILE.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        if PROPOSAL_FILE.is_file():
+            proposal_md = PROPOSAL_FILE.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        if PLANNER_REVISION_FILE.is_file():
+            planner_md = PLANNER_REVISION_FILE.read_text(encoding="utf-8")
+        elif PRODUCT_PLANNER_FILE.is_file():
+            planner_md = PRODUCT_PLANNER_FILE.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    for label, src in (
+        ("proposal", proposal_md),
+        ("pm", pm_md),
+        ("planner", planner_md),
+    ):
+        files = _parse_target_files_from_md(src) if src else []
+        if files:
+            target_evidence.append(f"{label}={len(files)}")
+    # Frontend scope hint also counts — many soft HOLDs have a planner
+    # report whose "프론트 변경 범위" lists the exact files.
+    if state.product_planner_frontend_scope:
+        target_evidence.append("planner_frontend_scope")
+
+    if not target_evidence:
+        hard_reasons.append("no target_files in any source")
+
+    if hard_reasons:
+        return "hard", "; ".join(hard_reasons[:3])
+    soft_signals = list(state.pm_hold_soft_signals or [])
+    soft_signals += list(state.desire_scorecard_rework or [])
+    return (
+        "soft",
+        f"feature={'/'.join(t for t in target_evidence)} "
+        f"signals={','.join(sorted(set(soft_signals)))[:80] or 'none'}",
+    )
+
+
 def stage_implementation_ticket(state: CycleState) -> StageResult:
     """Compose .runtime/implementation_ticket.md from the cycle's
     upstream artifacts. Marks the ticket "missing" when no concrete
@@ -5379,19 +5713,37 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         and state.design_spec_acceptance_passed
         and not state.stale_design_spec_detected
     )
-    if (
+    # Classify the HOLD type so soft HOLD (we still have feature + target
+    # files) can advance to implementation. Hard HOLD (no candidate, no
+    # target_files, scope mismatch, planner invalid, publish blocker)
+    # MUST keep the legacy skipped_hold behaviour.
+    pm_hold = (
         state.pm_decision_status == "generated"
         and not state.pm_decision_ship_ready
+    )
+    if pm_hold:
+        hold_type, hold_reason = _classify_pm_hold_type(state)
+        state.pm_hold_type = hold_type
+        state.pm_hold_type_reason = hold_reason
+    soft_hold_bypass = bool(pm_hold and state.pm_hold_type == "soft")
+    if (
+        pm_hold
         and not spec_acceptance_bypass
+        and not soft_hold_bypass
         and not _factory_flag_enabled(
             "FACTORY_ALLOW_PM_HOLD_TO_IMPLEMENT", default_on=False,
         )
     ):
         sr.status = "skipped"
-        sr.message = "PM HOLD — 이번 사이클은 재작업 (hold_for_rework) 입니다."
+        sr.message = (
+            "PM HOLD (hard) — 이번 사이클은 재작업 (hold_for_rework) 입니다."
+            f" 사유: {state.pm_hold_type_reason or '—'}"
+        )
         sr.duration_sec = round(time.time() - t0, 3)
         state.implementation_ticket_status = "skipped_hold"
-        state.implementation_ticket_skipped_reason = "pm_hold_for_rework"
+        state.implementation_ticket_skipped_reason = (
+            f"pm_hold_for_rework_hard: {state.pm_hold_type_reason or 'no detail'}"
+        )
         state.implementation_ticket_target_files = []
         state.implementation_ticket_target_screens = []
         state.implementation_ticket_message = sr.message
@@ -5409,9 +5761,19 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             )
         _emit_cycle_log(
             state, "implementation_ticket_skipped_hold",
-            "implementation_ticket skipped — PM HOLD (재작업 사이클)",
+            f"implementation_ticket skipped — PM HOLD (hard): {hold_reason}",
+            hold_type="hard",
+            hold_reason=hold_reason,
         )
         return sr
+    if soft_hold_bypass:
+        _emit_cycle_log(
+            state, "implementation_ticket_soft_hold_bypass",
+            "PM HOLD (soft) — selected_feature 와 target_files 가 살아 있어 "
+            "implementation_ticket 을 계속 만든다.",
+            hold_type="soft",
+            hold_reason=state.pm_hold_type_reason or "",
+        )
 
     pm_md = ""
     planner_md = ""
@@ -6170,18 +6532,26 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
 
-    # Claude succeeded but didn't actually touch anything — that's fine,
-    # treat as a no-op.
+    # Claude succeeded but didn't actually touch anything. Previously
+    # we recorded this as `noop` (a passing terminal state) — that
+    # masked a real failure mode where soft HOLD cycles produce
+    # design_spec → ticket → propose but never an actual diff. We now
+    # mark the apply as `retry_required` so the next cycle picks this
+    # up as unfinished work. Stage status stays `skipped` so we don't
+    # cascade into a hard cycle failure on a self-recoverable condition.
     if not changed_tracked and not new_untracked:
         sr.status = "skipped"
-        sr.message = "claude가 어떤 파일도 변경하지 않음"
+        sr.message = (
+            "claude가 어떤 파일도 변경하지 않음 — retry_required (soft HOLD에서는 "
+            "다음 사이클이 같은 ticket 으로 재시도)"
+        )
         sr.detail = (apply_out or "")[-800:]
-        state.claude_apply_status = "noop"
-        state.claude_apply_skipped_reason = "claude no-op"
+        state.claude_apply_status = "retry_required"
+        state.claude_apply_skipped_reason = "claude_apply produced no diff"
         state.claude_apply_message = sr.message
         _emit_cycle_log(
-            state, "claude_apply_no_changes",
-            "claude apply no changes — Claude가 working tree를 건드리지 않음",
+            state, "claude_apply_retry_required",
+            "claude apply produced no diff — marking retry_required",
         )
         sr.duration_sec = round(time.time() - t0, 3)
         return sr
@@ -7570,6 +7940,12 @@ def main() -> int:
     state.current_task = "사이클 준비"
     state.last_message = "자동 점검 사이클 시작"
     state.started_at = utc_now_iso()
+    # Hydrate the rework lock at start so downstream stages see the
+    # locked feature even before stage_product_planning runs.
+    _rl_init = _load_active_rework_feature()
+    if _rl_init.get("feature"):
+        state.active_rework_feature = (_rl_init.get("feature") or "").strip() or None
+        state.active_rework_hold_count = int(_rl_init.get("hold_count") or 0)
     _log(f"cycle #{state.cycle} start (goal={state.goal[:40]}…)")
     # Persist the initial state immediately so even an instant crash
     # below leaves the dashboard with a valid factory_state.json.
@@ -7768,6 +8144,20 @@ def main() -> int:
         state.backend_changed = bool(cats["backend"])
         state.control_tower_changed = bool(cats["control_tower"])
         state.docs_only = bool(cats["docs_only"])
+        # Real code change shipped — clear the active rework feature
+        # lock so the next cycle is free to ideate again. We clear here
+        # rather than at git_push because cycle.py never pushes; the
+        # apply event itself is the success boundary.
+        if not cats["docs_only"]:
+            cleared = _clear_active_rework_feature()
+            state.active_rework_feature = None
+            state.active_rework_hold_count = 0
+            if cleared:
+                _emit_cycle_log(
+                    state, "active_rework_feature_cleared",
+                    "active rework feature lock cleared — code change applied",
+                    changed_files_count=len(apply_changed),
+                )
         if cats["docs_only"]:
             # Files changed, but none of them are product code — treat
             # this as docs_only so the dashboard doesn't claim a
@@ -7860,10 +8250,39 @@ def main() -> int:
             state.suggested_action = (
                 "기획자/디자이너 단계의 rework 항목을 반영해 다음 사이클을 진행하세요."
             )
+            # Active rework feature lock — save the canonical feature so
+            # the next cycle's planner cannot drift to a brand-new
+            # candidate. This is the file that breaks the HOLD loop:
+            # without it, every HOLD cycle proposes 3 new ideas, the
+            # design_spec is always stale, and implementation never runs.
+            if not state.pm_hold_type:
+                ht_final, hr_final = _classify_pm_hold_type(state)
+                state.pm_hold_type = ht_final
+                state.pm_hold_type_reason = hr_final
+            canonical_feature = (
+                state.planner_revision_selected_feature
+                or state.product_planner_selected_feature
+                or state.selected_feature
+                or state.active_rework_feature
+                or ""
+            )
+            new_hold_count = int(state.active_rework_hold_count or 0) + 1
+            _save_active_rework_feature(
+                feature=canonical_feature,
+                hold_count=new_hold_count,
+                hold_type=state.pm_hold_type,
+                pm_message=state.pm_decision_message,
+            )
+            state.active_rework_feature = (canonical_feature or "").strip() or None
+            state.active_rework_hold_count = new_hold_count
             _emit_cycle_log(
                 state, "cycle_hold_for_rework",
                 "cycle hold_for_rework — PM 결정 HOLD (재작업)",
                 pm_decision=state.pm_decision_message or "HOLD",
+                hold_type=state.pm_hold_type,
+                hold_reason=state.pm_hold_type_reason,
+                active_rework_feature=state.active_rework_feature,
+                active_rework_hold_count=state.active_rework_hold_count,
             )
             # Skip the planning_only / no_code_change branches below.
             planner_generated = False  # short-circuit
@@ -8003,6 +8422,34 @@ def main() -> int:
             blocking_agent=sup_blocking,
             meaningful_change=sup_meaningful,
         )
+
+    # Active rework feature lock — extended clear conditions. Beyond
+    # the apply-success path that already cleared at line ~8121, ANY
+    # terminal status that isn't HOLD or hard failure should also
+    # clear the lock. The smoke verdict for these states resolves to
+    # READY_TO_REVIEW / READY_TO_PUBLISH (succeeded path) or PASS
+    # (planning_only / no_code_change / docs_only) — none of those
+    # represent an active rework loop, so a stale lock would only
+    # prevent the next cycle from picking a fresh candidate. Without
+    # this, the lock outlives its useful lifetime whenever a rework
+    # cycle drops to planning_only instead of either shipping code or
+    # explicitly HOLDing again.
+    NON_REWORK_TERMINAL_STATES = {
+        "succeeded", "planning_only", "no_code_change", "docs_only",
+    }
+    if state.status in NON_REWORK_TERMINAL_STATES and (
+        state.active_rework_feature
+        or ACTIVE_REWORK_FEATURE_FILE.is_file()
+    ):
+        if _clear_active_rework_feature():
+            _emit_cycle_log(
+                state, "active_rework_feature_cleared",
+                f"active rework feature lock cleared — terminal status="
+                f"{state.status}",
+                terminal_status=state.status,
+            )
+        state.active_rework_feature = None
+        state.active_rework_hold_count = 0
 
     # Unattended e2e closure — write the auto-publish marker when the
     # cycle finished with real shipped code + qa passed + a ticket. The

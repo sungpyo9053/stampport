@@ -1763,7 +1763,7 @@ ACCEPTANCE_TEMPLATE_BY_CODE: dict[str, str] = {
     ),
     "build_app_after_apply_failed": (
         "- 다음 cycle 에서 factory_state.failed_stage != 'claude_apply'\n"
-        "- claude_apply_status in {applied, noop} (rolled_back 아님)\n"
+        "- claude_apply_status == 'applied' (rolled_back / retry_required 아님)\n"
         "- _revalidate_after_apply 의 build_app 게이트 통과\n"
         "- `cd app/web && npm run build` 가 로컬에서 0 exit"
     ),
