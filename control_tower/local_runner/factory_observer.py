@@ -729,6 +729,7 @@ PIPELINE_BLOCKING_CODE_TO_DIAGNOSTIC: dict[str, str] = {
     "claude_cli_timeout": "claude_cli_timeout",
     "claude_cli_auth_failed": "claude_cli_auth_failed",
     "claude_cli_rate_limited": "claude_cli_rate_limited",
+    "claude_cli_budget_exceeded": "claude_cli_budget_exceeded",
     "claude_cli_exit_nonzero": "claude_cli_exit_nonzero",
     "claude_cli_no_output": "claude_cli_no_output",
     "claude_cli_unknown_failure": "claude_cli_unknown_failure",

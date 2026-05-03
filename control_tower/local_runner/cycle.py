@@ -499,6 +499,9 @@ class CycleState:
     claude_executor_retryable: bool = False
     claude_executor_retry_count: int = 0
     claude_executor_last_run_at: str | None = None
+    claude_executor_max_cost_usd: str | None = None
+    claude_executor_cost_budget_source: str | None = None
+    claude_executor_exceeded_budget: bool = False
     # Claude proposal status (so the dashboard knows whether the
     # claude_propose stage actually wrote a file or just skipped).
     claude_proposal_status: str = "skipped"   # generated | skipped | failed
@@ -833,6 +836,9 @@ class CycleState:
             "claude_executor_retryable": self.claude_executor_retryable,
             "claude_executor_retry_count": self.claude_executor_retry_count,
             "claude_executor_last_run_at": self.claude_executor_last_run_at,
+            "claude_executor_max_cost_usd": self.claude_executor_max_cost_usd,
+            "claude_executor_cost_budget_source": self.claude_executor_cost_budget_source,
+            "claude_executor_exceeded_budget": self.claude_executor_exceeded_budget,
             "claude_proposal_status": self.claude_proposal_status,
             "claude_proposal_path": self.claude_proposal_path,
             "claude_proposal_at": self.claude_proposal_at,
@@ -5447,7 +5453,10 @@ def stage_claude_propose(state: CycleState) -> StageResult:
     # so Claude never has filesystem write access.
     prompt = _build_claude_proposal_prompt(state.goal, planner=planner_md)
     model = os.environ.get("FACTORY_CLAUDE_MODEL", "sonnet").strip() or "sonnet"
-    budget_usd = os.environ.get("FACTORY_CLAUDE_BUDGET_USD", "1.0").strip() or "1.0"
+    # Stage-aware budget — claude_propose uses CLAUDE_PROPOSE_MAX_COST_USD
+    # (default 1.00). FACTORY_CLAUDE_BUDGET_USD remains a fallback so
+    # operators with the legacy env var keep working.
+    budget_usd, _budget_source = get_claude_budget_usd("claude_propose")
     timeout_sec = float(os.environ.get("FACTORY_CLAUDE_TIMEOUT_SEC", "600"))
 
     argv = [
@@ -6499,6 +6508,9 @@ def build_pipeline_decision(state) -> dict:
         "claude_executor_retry_count": s.get("claude_executor_retry_count"),
         "claude_executor_stdout_path": s.get("claude_executor_stdout_path"),
         "claude_executor_stderr_path": s.get("claude_executor_stderr_path"),
+        "claude_executor_max_cost_usd": s.get("claude_executor_max_cost_usd"),
+        "claude_executor_cost_budget_source": s.get("claude_executor_cost_budget_source"),
+        "claude_executor_exceeded_budget": s.get("claude_executor_exceeded_budget"),
     }
 
     return {
@@ -7007,6 +7019,7 @@ CLAUDE_FAILURE_CODES = (
     "claude_cli_timeout",
     "claude_cli_auth_failed",
     "claude_cli_rate_limited",
+    "claude_cli_budget_exceeded",
     "claude_cli_no_output",
     "claude_cli_exit_nonzero",
     "claude_apply_no_diff",
@@ -7015,10 +7028,13 @@ CLAUDE_FAILURE_CODES = (
 )
 
 # Codes that should NOT trigger an immediate retry — fixing them
-# requires operator action (install the binary, re-authenticate, etc.).
+# requires operator action (install the binary, re-authenticate, raise
+# the budget cap, etc.). budget_exceeded sits here because retrying
+# the same prompt under the same cap produces the same error.
 CLAUDE_NON_RETRYABLE_CODES = frozenset({
     "claude_cli_missing",
     "claude_cli_auth_failed",
+    "claude_cli_budget_exceeded",
 })
 
 
@@ -7058,14 +7074,18 @@ def classify_claude_failure(
     )
     if any(sig in blob for sig in auth_signals):
         return "claude_cli_auth_failed"
+    # Budget exceeded must be checked BEFORE the rate-limit signals
+    # because the CLI's wording ("Exceeded USD budget", "max-budget-usd")
+    # overlaps and the budget code is non-retryable while rate_limited
+    # is retryable. Misclassifying as rate_limited would loop forever.
+    if _is_budget_exceeded(stdout or "", stderr or ""):
+        return "claude_cli_budget_exceeded"
     rate_signals = (
         "rate limit",
         "rate-limited",
         "too many requests",
         "429",
         "quota",
-        "budget exceeded",
-        "max-budget",
     )
     if any(sig in blob for sig in rate_signals):
         return "claude_cli_rate_limited"
@@ -7102,6 +7122,9 @@ def _write_claude_executor_state(
     stderr_path: str | None,
     retryable: bool,
     retry_count: int,
+    max_cost_usd: str | None = None,
+    cost_budget_source: str | None = None,
+    exceeded_budget: bool | None = None,
 ) -> dict:
     """Persist the executor verdict to claude_executor_state.json and
     claude_apply_command.json. Returns the dict that was written so
@@ -7126,6 +7149,23 @@ def _write_claude_executor_state(
     )
     executable = argv[0] if argv else None
     extra_args = list(argv[1:]) if argv else []
+    # Resolve budget metadata: callers may pass it explicitly; otherwise
+    # we look it up from the stage so a `claude_apply` write that didn't
+    # supply max_cost_usd still records the cap that was actually
+    # applied to the subprocess.
+    if max_cost_usd is None or cost_budget_source is None:
+        try:
+            inferred_amount, inferred_source = get_claude_budget_usd(stage)
+        except Exception:  # noqa: BLE001
+            inferred_amount, inferred_source = (
+                CLAUDE_BUDGET_LEGACY_DEFAULT, "legacy_default",
+            )
+        if max_cost_usd is None:
+            max_cost_usd = inferred_amount
+        if cost_budget_source is None:
+            cost_budget_source = inferred_source
+    if exceeded_budget is None:
+        exceeded_budget = (failure_code == "claude_cli_budget_exceeded")
     payload = {
         "status": status,
         "stage": stage,
@@ -7139,6 +7179,9 @@ def _write_claude_executor_state(
         "stderr_path": stderr_path,
         "retryable": bool(retryable),
         "retry_count": int(retry_count or 0),
+        "max_cost_usd": max_cost_usd,
+        "cost_budget_source": cost_budget_source,
+        "exceeded_budget": bool(exceeded_budget),
         "updated_at": utc_now_iso(),
     }
     try:
@@ -7183,6 +7226,9 @@ def _apply_executor_state_to_cycle_state(state: "CycleState", payload: dict) -> 
     state.claude_executor_retryable = bool(payload.get("retryable"))
     state.claude_executor_retry_count = int(payload.get("retry_count") or 0)
     state.claude_executor_last_run_at = payload.get("updated_at")
+    state.claude_executor_max_cost_usd = payload.get("max_cost_usd")
+    state.claude_executor_cost_budget_source = payload.get("cost_budget_source")
+    state.claude_executor_exceeded_budget = bool(payload.get("exceeded_budget"))
 
 
 def _run_claude_capture(
@@ -7358,6 +7404,85 @@ def _resolve_claude_command() -> dict:
     }
 
 
+# Stage-aware budget defaults (USD). Preflight runs a tiny smoke
+# prompt — 0.25 leaves enough headroom for `claude --version` plus a
+# single token reply without tripping the budget limit. Propose is a
+# planning/critique pass (1.00 ≈ legacy default). Apply is the
+# expensive code-edit pass (3.00 covers multi-file diffs).
+CLAUDE_STAGE_BUDGET_DEFAULTS: dict[str, str] = {
+    "claude_preflight": "0.25",
+    "claude_propose": "1.00",
+    "claude_apply": "3.00",
+}
+
+# Per-stage override env var. Operators set these to raise the cap
+# for a specific stage without bumping every Claude call.
+CLAUDE_STAGE_BUDGET_ENV: dict[str, str] = {
+    "claude_preflight": "CLAUDE_PREFLIGHT_MAX_COST_USD",
+    "claude_propose": "CLAUDE_PROPOSE_MAX_COST_USD",
+    "claude_apply": "CLAUDE_APPLY_MAX_COST_USD",
+}
+
+# Legacy global cap. FACTORY_CLAUDE_BUDGET_USD still works as a
+# fallback for stages other than preflight (preflight has its own tiny
+# default — a 1.00 cap is overkill for `claude --version`).
+CLAUDE_BUDGET_LEGACY_ENV = "FACTORY_CLAUDE_BUDGET_USD"
+CLAUDE_BUDGET_LEGACY_DEFAULT = "1.00"
+
+
+def get_claude_budget_usd(stage: str) -> tuple[str, str]:
+    """Return (amount, source) for the given Claude stage.
+
+    Resolution order:
+      1. Stage-specific override env var (CLAUDE_<STAGE>_MAX_COST_USD).
+      2. Legacy FACTORY_CLAUDE_BUDGET_USD — except for preflight, which
+         deliberately ignores the global cap so a 0.25 smoke prompt
+         doesn't inherit a 3.00 apply-stage budget by accident.
+      3. Stage default from CLAUDE_STAGE_BUDGET_DEFAULTS.
+      4. CLAUDE_BUDGET_LEGACY_DEFAULT for unrecognized stages.
+
+    `source` is one of: stage_env / legacy_env / stage_default /
+    legacy_default — surfaced into claude_executor_state.json so the
+    operator can see why a particular cap was chosen.
+    """
+    stage = (stage or "").strip().lower()
+    stage_env = CLAUDE_STAGE_BUDGET_ENV.get(stage)
+    if stage_env:
+        v = (os.environ.get(stage_env) or "").strip()
+        if v:
+            return v, "stage_env"
+    # Preflight intentionally bypasses the legacy global cap. The
+    # legacy cap is sized for full-cycle work; applying it to a 30s
+    # smoke probe would waste tokens and obscure budget bugs.
+    if stage != "claude_preflight":
+        v = (os.environ.get(CLAUDE_BUDGET_LEGACY_ENV) or "").strip()
+        if v:
+            return v, "legacy_env"
+    if stage in CLAUDE_STAGE_BUDGET_DEFAULTS:
+        return CLAUDE_STAGE_BUDGET_DEFAULTS[stage], "stage_default"
+    return CLAUDE_BUDGET_LEGACY_DEFAULT, "legacy_default"
+
+
+_BUDGET_EXCEEDED_PATTERNS: tuple[str, ...] = (
+    "exceeded usd budget",
+    "exceeded budget",
+    "max-budget-usd",
+    "budget exceeded",
+)
+
+
+def _is_budget_exceeded(stdout: str, stderr: str) -> bool:
+    """Detect Claude CLI's budget-exceeded error message.
+
+    Matched substrings (case-insensitive): "Exceeded USD budget",
+    "exceeded budget", "max-budget-usd", "budget exceeded". The first
+    one is what the CLI actually emits today; the rest catch
+    plausible reword variants so we don't misclassify the next
+    release as claude_cli_exit_nonzero."""
+    blob = ((stderr or "") + "\n" + (stdout or "")).lower()
+    return any(p in blob for p in _BUDGET_EXCEEDED_PATTERNS)
+
+
 _DSP_FLAG = "--dangerously-skip-permissions"
 
 
@@ -7458,13 +7583,19 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
         return _record(payload, sr_status="failed", message="claude CLI 미설치 — preflight 실패")
 
     # Step 2: Smoke prompt. We ask claude to print a single token so a
-    # broken auth / rate-limit / hung process is caught fast.
+    # broken auth / rate-limit / hung process is caught fast. Budget
+    # is sourced from get_claude_budget_usd("claude_preflight") so a
+    # too-tight legacy default (the original 0.05 hardcode that
+    # produced "Exceeded USD budget (0.05)") never reappears.
+    preflight_budget, preflight_budget_source = get_claude_budget_usd(
+        "claude_preflight",
+    )
     smoke_argv = _claude_argv_with(
         base_argv,
         [
             "-p", "Reply with exactly: STAMPPORT_OK",
             "--output-format", "text",
-            "--max-budget-usd", "0.05",
+            "--max-budget-usd", preflight_budget,
         ],
     )
     smoke_result = _run_claude_capture(
@@ -7489,6 +7620,9 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
             stderr_path=None,
             retryable=False,
             retry_count=0,
+            max_cost_usd=preflight_budget,
+            cost_budget_source=preflight_budget_source,
+            exceeded_budget=False,
         )
         return _record(
             payload,
@@ -7519,6 +7653,9 @@ def stage_claude_preflight(state: CycleState) -> StageResult:
         stderr_path=None,
         retryable=retryable,
         retry_count=0,
+        max_cost_usd=preflight_budget,
+        cost_budget_source=preflight_budget_source,
+        exceeded_budget=(code == "claude_cli_budget_exceeded"),
     )
     state.failed_stage = "claude_preflight"
     state.failed_reason = (
@@ -8129,7 +8266,11 @@ def stage_claude_apply(state: CycleState) -> StageResult:
 
     prompt = _build_claude_apply_prompt(proposal_text)
     model = os.environ.get("FACTORY_CLAUDE_MODEL", "sonnet").strip() or "sonnet"
-    budget_usd = os.environ.get("FACTORY_CLAUDE_BUDGET_USD", "1.0").strip() or "1.0"
+    # Stage-aware budget — claude_apply gets the largest cap (3.00 by
+    # default) because multi-file diffs cost the most. CLAUDE_APPLY_
+    # MAX_COST_USD overrides; FACTORY_CLAUDE_BUDGET_USD remains a
+    # fallback for backwards compatibility.
+    budget_usd, budget_source = get_claude_budget_usd("claude_apply")
     timeout_sec = float(os.environ.get("FACTORY_CLAUDE_APPLY_TIMEOUT_SEC", "900"))
 
     argv = _claude_argv_with(
@@ -8157,6 +8298,8 @@ def stage_claude_apply(state: CycleState) -> StageResult:
                     "extra_args": list(argv[1:]),
                     "source": spec["source"],
                     "command": " ".join(shlex.quote(a) for a in argv),
+                    "max_cost_usd": budget_usd,
+                    "cost_budget_source": budget_source,
                 },
                 ensure_ascii=False, indent=2,
             ),
@@ -8235,6 +8378,9 @@ def stage_claude_apply(state: CycleState) -> StageResult:
             stderr_path=capture["stderr_path"],
             retryable=retryable,
             retry_count=int(state.claude_executor_retry_count or 0),
+            max_cost_usd=budget_usd,
+            cost_budget_source=budget_source,
+            exceeded_budget=(failure_code == "claude_cli_budget_exceeded"),
         )
         _apply_executor_state_to_cycle_state(state, payload)
         sr.status = "failed"
@@ -8457,6 +8603,9 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         stderr_path=capture["stderr_path"],
         retryable=False,
         retry_count=int(state.claude_executor_retry_count or 0),
+        max_cost_usd=budget_usd,
+        cost_budget_source=budget_source,
+        exceeded_budget=False,
     )
     _apply_executor_state_to_cycle_state(state, success_payload)
 

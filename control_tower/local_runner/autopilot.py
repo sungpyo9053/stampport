@@ -1421,7 +1421,12 @@ def _format_report(state: AutopilotState) -> str:
     if exec_status == "passed":
         next_action = "정상 — claude_apply 정상 실행"
     elif _is_executor_failure_code(exec_code):
-        if executor.get("retryable"):
+        if exec_code == "claude_cli_budget_exceeded":
+            next_action = (
+                "increase CLAUDE_*_MAX_COST_USD or reduce prompt scope — "
+                "재시도해도 같은 cap에서 또 초과됨"
+            )
+        elif executor.get("retryable"):
             next_action = (
                 "retryable 실패 — autopilot이 apply_retry_only 1회 재시도를 자동 수행"
             )
@@ -1441,6 +1446,9 @@ def _format_report(state: AutopilotState) -> str:
         f"- duration_sec: `{executor.get('duration_sec') or '—'}`",
         f"- exit_code: `{executor.get('exit_code')}`",
         f"- timed_out: `{bool(executor.get('timed_out'))}`",
+        f"- max_cost_usd: `{executor.get('max_cost_usd') or '—'}`",
+        f"- cost_budget_source: `{executor.get('cost_budget_source') or '—'}`",
+        f"- exceeded_budget: `{bool(executor.get('exceeded_budget'))}`",
         f"- stdout_path: `{executor.get('stdout_path') or '—'}`",
         f"- stderr_path: `{executor.get('stderr_path') or '—'}`",
         f"- failure_reason: {(executor.get('failure_reason') or '—')[:300]}",

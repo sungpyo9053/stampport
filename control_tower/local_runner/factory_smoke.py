@@ -6300,6 +6300,158 @@ def self_test() -> tuple[int, int, list[str]]:
             _cycle.CLAUDE_APPLY_COMMAND_FILE = cmd_save
             _cycle.CLAUDE_EXECUTOR_STATE_FILE = state_save
 
+    # ----------------------------------------------------------------
+    # Stage-aware budget regression tests (Budget-A..F from the bug
+    # report: a 0.05 hardcode in claude_preflight produced
+    # "Exceeded USD budget (0.05)" instead of a real CLI verdict).
+    # All env vars are saved/restored around each test so the suite
+    # stays order-independent.
+    # ----------------------------------------------------------------
+    _budget_envs = (
+        "CLAUDE_PREFLIGHT_MAX_COST_USD",
+        "CLAUDE_PROPOSE_MAX_COST_USD",
+        "CLAUDE_APPLY_MAX_COST_USD",
+        "FACTORY_CLAUDE_BUDGET_USD",
+    )
+
+    def _budget_env_snapshot():
+        return {k: os.environ.get(k) for k in _budget_envs}
+
+    def _budget_env_restore(snap):
+        for k, v in snap.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _budget_env_clear():
+        for k in _budget_envs:
+            os.environ.pop(k, None)
+
+    # Budget-A. Default preflight budget is "0.25" with source
+    # stage_default — the original 0.05 hardcode that triggered
+    # "Exceeded USD budget (0.05)" must never come back.
+    total += 1
+    _snap = _budget_env_snapshot()
+    try:
+        _budget_env_clear()
+        amount, source = _cycle.get_claude_budget_usd("claude_preflight")
+        if amount == "0.25" and source == "stage_default":
+            passed += 1
+        else:
+            failures.append(
+                f"Budget-A: preflight default must be 0.25 / stage_default — "
+                f"got {amount!r} / {source!r}"
+            )
+    finally:
+        _budget_env_restore(_snap)
+
+    # Budget-B. Default apply budget is "3.00" with source
+    # stage_default. Multi-file diffs need the largest cap.
+    total += 1
+    _snap = _budget_env_snapshot()
+    try:
+        _budget_env_clear()
+        amount, source = _cycle.get_claude_budget_usd("claude_apply")
+        if amount == "3.00" and source == "stage_default":
+            passed += 1
+        else:
+            failures.append(
+                f"Budget-B: apply default must be 3.00 / stage_default — "
+                f"got {amount!r} / {source!r}"
+            )
+    finally:
+        _budget_env_restore(_snap)
+
+    # Budget-C. CLAUDE_APPLY_MAX_COST_USD overrides
+    # FACTORY_CLAUDE_BUDGET_USD even when both are set; preflight
+    # ignores the legacy global cap entirely (stays on 0.25 unless
+    # CLAUDE_PREFLIGHT_MAX_COST_USD is set).
+    total += 1
+    _snap = _budget_env_snapshot()
+    try:
+        _budget_env_clear()
+        os.environ["FACTORY_CLAUDE_BUDGET_USD"] = "5.00"
+        os.environ["CLAUDE_APPLY_MAX_COST_USD"] = "7.50"
+        apply_amount, apply_source = _cycle.get_claude_budget_usd("claude_apply")
+        pre_amount, pre_source = _cycle.get_claude_budget_usd("claude_preflight")
+        # And legacy alone (no per-stage override) must surface as legacy_env.
+        os.environ.pop("CLAUDE_APPLY_MAX_COST_USD", None)
+        legacy_amount, legacy_source = _cycle.get_claude_budget_usd("claude_apply")
+        if (
+            apply_amount == "7.50" and apply_source == "stage_env"
+            and pre_amount == "0.25" and pre_source == "stage_default"
+            and legacy_amount == "5.00" and legacy_source == "legacy_env"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"Budget-C: override priority — apply={apply_amount}/{apply_source} "
+                f"preflight={pre_amount}/{pre_source} "
+                f"legacy={legacy_amount}/{legacy_source}"
+            )
+    finally:
+        _budget_env_restore(_snap)
+
+    # Budget-D. The "Exceeded USD budget (0.05)" stderr classifies as
+    # claude_cli_budget_exceeded — NOT claude_cli_rate_limited (which
+    # is retryable) and NOT claude_cli_exit_nonzero (which is generic).
+    total += 1
+    code = _cycle.classify_claude_failure(
+        exit_code=1, timed_out=False, missing_bin=False,
+        stdout="",
+        stderr="Error: Exceeded USD budget (0.05)",
+    )
+    if code == "claude_cli_budget_exceeded":
+        passed += 1
+    else:
+        failures.append(
+            f"Budget-D: 'Exceeded USD budget' must classify "
+            f"claude_cli_budget_exceeded — got {code!r}"
+        )
+
+    # Budget-E. claude_cli_budget_exceeded is non-retryable. Re-running
+    # the same prompt under the same cap would just hit the same
+    # error — autopilot must stop and surface "raise the cap".
+    total += 1
+    if not _cycle._is_retryable_claude_failure("claude_cli_budget_exceeded"):
+        passed += 1
+    else:
+        failures.append(
+            "Budget-E: claude_cli_budget_exceeded must NOT be retryable"
+        )
+
+    # Budget-F. pipeline_decision: budget_exceeded → can_publish=false,
+    # blocking_code=claude_cli_budget_exceeded, pipeline_status=blocked,
+    # checks.apply=failed. Operator-facing report must show the precise
+    # reason instead of a generic stage_failed.
+    total += 1
+    decision = _cycle.build_pipeline_decision({
+        "status": "failed",
+        "implementation_ticket_status": "generated",
+        "claude_apply_status": "cli_failed",
+        "qa_status": "skipped",
+        "apply_preflight_status": "passed",
+        "claude_apply_changed_files": [],
+        "claude_executor_status": "failed",
+        "claude_executor_failure_code": "claude_cli_budget_exceeded",
+        "claude_executor_failure_reason": "Exceeded USD budget (0.05)",
+        "claude_executor_retryable": False,
+        "claude_executor_exceeded_budget": True,
+    })
+    if (
+        decision.get("can_publish") is False
+        and decision.get("blocking_code") == "claude_cli_budget_exceeded"
+        and decision.get("pipeline_status") == "blocked"
+        and (decision.get("checks") or {}).get("apply") == "failed"
+    ):
+        passed += 1
+    else:
+        failures.append(
+            f"Budget-F: pipeline_decision must block on budget_exceeded — "
+            f"got {decision}"
+        )
+
     # H. Preflight success path leaves the existing pipeline contract
     # unchanged — claude_executor_status=passed and no failure_code
     # must NOT block can_publish, and the checks/blocking_code stay
