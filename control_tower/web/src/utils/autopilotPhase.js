@@ -323,7 +323,12 @@ export function resolveCurrentCycleNumber(ap) {
   return null;
 }
 
-export function freshnessOf({ artifactCycleId, artifactAt, autopilot }) {
+export function freshnessOf({
+  artifactCycleId,
+  artifactAt,
+  artifactRunId = null,
+  autopilot,
+}) {
   const ap = autopilot || {};
   const apStarted = ap.started_at ? Date.parse(ap.started_at) : null;
   const status = String(ap.status || "").toLowerCase();
@@ -331,11 +336,24 @@ export function freshnessOf({ artifactCycleId, artifactAt, autopilot }) {
     || status === "stopping" || status === "restarting";
   const currentCycle = resolveCurrentCycleNumber(ap);
   const apActive = ap.active_cycle_index != null ? Number(ap.active_cycle_index) : null;
+  const currentRunId = String(ap.current_run_id || "").trim();
+  const stampedRunId = String(artifactRunId || "").trim();
 
-  // Run-boundary check first — if the artifact predates the current
-  // autopilot run, it's stale regardless of cycle_id. cycle_id values
-  // are NOT globally unique across runs, so a previous run can leave
-  // a higher cycle_id on disk that would otherwise look "fresh".
+  // Run-boundary check #1 — explicit run_id mismatch is the strongest
+  // freshness signal. When the autopilot has an active run_id and the
+  // artifact carries a different one, the artifact belongs to a
+  // previous run regardless of cycle_id / timestamp. This is the
+  // primary kernel-contract gate; cycle_id and timestamp comparisons
+  // below are fallbacks for legacy artifacts that predate run_id.
+  if (currentRunId && stampedRunId && currentRunId !== stampedRunId) {
+    return "stale_artifact";
+  }
+
+  // Run-boundary check #2 — same-id-or-missing fallback: if the
+  // artifact predates the current autopilot run, it's stale
+  // regardless of cycle_id. cycle_id values are NOT globally unique
+  // across runs, so a previous run can leave a higher cycle_id on
+  // disk that would otherwise look "fresh".
   if (artifactAt && Number.isFinite(apStarted)) {
     const at = Date.parse(artifactAt);
     if (Number.isFinite(at) && at < apStarted) {
@@ -530,6 +548,15 @@ export function classifyAccountabilityFreshness(aa, runners = []) {
   const accAt = _pickAccountabilityTs(aa);
   const currentCycle = resolveCurrentCycleNumber(ap);
   const apActive = ap?.active_cycle_index != null ? Number(ap.active_cycle_index) : null;
+  const currentRunId = String(ap?.current_run_id || "").trim();
+  const accRunId = String(aa.run_id || "").trim();
+
+  // Run_id boundary — strongest freshness signal. When the supervisor
+  // blob carries a run_id different from the autopilot's current_run_id
+  // it is stale, no matter what cycle_id / timestamps say.
+  if (currentRunId && accRunId && currentRunId !== accRunId) {
+    return "stale";
+  }
 
   // Run-boundary check: if the supervisor blob predates the current
   // autopilot run, it's stale regardless of cycle numbers. cycle_id

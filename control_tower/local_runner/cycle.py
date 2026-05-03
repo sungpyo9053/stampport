@@ -650,10 +650,30 @@ class CycleState:
     # apply / diff. The factory_smoke report cross-checks these against
     # the design_spec acceptance gate.
     selected_feature: str | None = None
+    selected_feature_id: str | None = None
     selected_feature_source: str | None = None     # planner|design_spec|...
     implementation_ticket_source: str | None = None  # planner_proposal|design_spec
+    implementation_ticket_feature_id: str | None = None
     claude_apply_source: str | None = None         # claude_proposal|design_spec
     design_spec_feature: str | None = None
+    design_spec_feature_id: str | None = None
+    # run_id — the autopilot run identifier this cycle belongs to. Set
+    # at cycle start from FACTORY_RUN_ID / autopilot_state. Every
+    # artifact this cycle writes carries the same id, so the UI's
+    # freshness verdict (PREVIOUS RUN vs CURRENT CYCLE) is unambiguous
+    # even when cycle counters reset across runs.
+    run_id: str | None = None
+    # Pipeline contract validators — populated by run_stage_contract
+    # and surfaced in factory_state.json so smoke / observer / dashboard
+    # can render the table without re-deriving. Each entry:
+    #   {"name", "ok", "code", "message"}
+    contract_results: list[dict] = field(default_factory=list)
+    # Apply preflight outcome (set by stage_claude_apply before it
+    # spends Claude budget). One of: passed | scope_mismatch_preflight |
+    # stale_artifact_preflight | missing_ticket_contract |
+    # feature_lock_conflict | None (preflight didn't run).
+    apply_preflight_status: str | None = None
+    apply_preflight_reason: str | None = None
     # Scope-consistency QA gate — set by claude_apply when the diff is
     # checked against design_spec target_files + keywords on spec_bypass
     # cycles. failed → verdict downgrades to FAIL (factory_smoke surfaces
@@ -814,10 +834,17 @@ class CycleState:
             "selected_feature": self.selected_feature
                 or self.implementation_ticket_selected_feature
                 or self.product_planner_selected_feature,
+            "selected_feature_id": self.selected_feature_id,
             "selected_feature_source": self.selected_feature_source,
             "implementation_ticket_source": self.implementation_ticket_source,
+            "implementation_ticket_feature_id": self.implementation_ticket_feature_id,
             "claude_apply_source": self.claude_apply_source,
             "design_spec_feature": self.design_spec_feature,
+            "design_spec_feature_id": self.design_spec_feature_id,
+            "run_id": self.run_id,
+            "contract_results": list(self.contract_results),
+            "apply_preflight_status": self.apply_preflight_status,
+            "apply_preflight_reason": self.apply_preflight_reason,
             "scope_consistency_status": self.scope_consistency_status,
             "scope_mismatch_reason": self.scope_mismatch_reason,
             "scope_consistency_keywords_matched": list(
@@ -918,13 +945,24 @@ def _artifact_header(
     stage: str,
     source_agent: str,
     extra: dict | None = None,
+    run_id: str | None = None,
+    feature_id: str | None = None,
 ) -> str:
+    """Compose the metadata block. `run_id` is sourced via
+    `_resolve_run_id()` when not passed, so every artifact written by
+    cycle.py / autopilot inherits the active run's identifier
+    automatically. Pass an explicit value when re-writing a stale
+    artifact under a different run."""
+    rid = run_id if run_id is not None else _resolve_run_id()
     fields = [
         f"cycle_id: {cycle_id if cycle_id is not None else '—'}",
+        f"run_id: {rid or '—'}",
         f"stage: {stage}",
         f"source_agent: {source_agent}",
         f"created_at: {utc_now_iso()}",
     ]
+    if feature_id:
+        fields.append(f"feature_id: {feature_id}")
     if extra:
         for k, v in extra.items():
             fields.append(f"{k}: {v}")
@@ -940,10 +978,18 @@ def safe_write_artifact(
     stage: str,
     source_agent: str,
     extra: dict | None = None,
+    run_id: str | None = None,
+    feature_id: str | None = None,
 ) -> bool:
-    """Atomic write of a markdown artifact with a metadata header."""
+    """Atomic write of a markdown artifact with a metadata header.
+
+    `run_id` and `feature_id` get embedded in the header so any
+    consumer (PM, smoke, observer, dashboard) can prove the artifact
+    belongs to the current factory run + feature without re-deriving.
+    """
     header = _artifact_header(
-        cycle_id=cycle_id, stage=stage, source_agent=source_agent, extra=extra,
+        cycle_id=cycle_id, stage=stage, source_agent=source_agent,
+        extra=extra, run_id=run_id, feature_id=feature_id,
     )
     payload = header + (body if body.endswith("\n") else body + "\n")
     return safe_write_text(path, payload)
@@ -3207,6 +3253,10 @@ def stage_product_planning(state: CycleState) -> StageResult:
     state.product_planner_at = utc_now_iso()
     state.product_planner_bottleneck = bottleneck or None
     state.product_planner_selected_feature = selected or None
+    if selected:
+        # Stamp the cycle-wide feature_id at planner time so every
+        # downstream stage can compare ids rather than fragile names.
+        state.selected_feature_id = state.selected_feature_id or _to_feature_id(selected)
     state.product_planner_solution_pattern = pattern or None
     state.product_planner_value_summary = value_summary or None
     state.product_planner_llm_needed = llm_needed or None
@@ -3593,6 +3643,10 @@ def stage_planner_revision(state: CycleState) -> StageResult:
         )
         revision_selected = locked_for_revision
     state.planner_revision_selected_feature = revision_selected
+    if revision_selected:
+        state.selected_feature_id = (
+            state.selected_feature_id or _to_feature_id(revision_selected)
+        )
     state.planner_revision_message = state.planner_revision_selected_feature or "수정안 생성"
     sr.status = "passed"
     sr.message = (
@@ -4178,6 +4232,123 @@ def _features_match(a: str | None, b: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# run_id / feature_id — deterministic identifiers for the factory pipeline
+#
+# run_id  : a value unique to one autopilot run. Every artifact written
+#           in that run records the same run_id. UI / smoke / observer
+#           use it as the primary freshness key — same cycle_id but
+#           different run_id means PREVIOUS RUN, not CURRENT CYCLE.
+#
+# feature_id : a stable slug derived from the human feature name. Stages
+#           compare feature_id rather than feature_name because PMs /
+#           planners often rephrase the same feature ("TitleSeal 컴포넌트"
+#           vs "TitleSeal seal component") between cycles. Sluggifying
+#           collapses trivial variations and refuses Korean punctuation
+#           drift.
+# ---------------------------------------------------------------------------
+
+_FEATURE_ID_KEEP_RE = re.compile(r"[^a-z0-9가-힣]+")
+
+
+def _to_feature_id(name: str | None) -> str:
+    """Convert a feature name to a deterministic identifier.
+
+    Lowercase, strip non-alphanumeric / non-hangul, collapse to a
+    single-hyphen-separated slug, truncate at 80 characters. Returns
+    "" when the input is empty or sluggifies to nothing.
+    """
+    if not name:
+        return ""
+    s = name.strip().lower()
+    s = _FEATURE_ID_KEEP_RE.sub("-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s[:80]
+
+
+def _feature_ids_match(a: str | None, b: str | None) -> bool:
+    """Strict-by-id feature comparison.
+
+    Unlike `_features_match` (which is intentionally loose for human
+    naming variation), this compares the slug-form ids exactly. Empty
+    on either side returns True so callers cannot turn an unknown
+    feature_id into a false-positive mismatch — combine with explicit
+    "neither side is empty" checks when you need a hard gate.
+    """
+    ia = _to_feature_id(a)
+    ib = _to_feature_id(b)
+    if not ia or not ib:
+        return True
+    return ia == ib
+
+
+def _resolve_run_id() -> str:
+    """Return the active run_id for this cycle process.
+
+    Resolution order:
+      1. `FACTORY_RUN_ID` env var — set by autopilot.run_loop when it
+         spawns factory_smoke / cycle.py. This is the authoritative
+         value for autopilot-driven runs.
+      2. autopilot_state.current_run_id (when present on disk and the
+         autopilot status is live).
+      3. A fresh local id derived from the cycle process's start time.
+         Used by manual cycle.py invocations / smoke probes.
+
+    The fresh local id format is `r-<epoch_us>-<rand4>` so it sorts
+    chronologically and is trivial to grep for in artifacts.
+    """
+    env_val = (os.environ.get("FACTORY_RUN_ID") or "").strip()
+    if env_val:
+        return env_val[:64]
+    try:
+        ap_state_path = RUNTIME / "autopilot_state.json"
+        if ap_state_path.is_file():
+            ap = json.loads(ap_state_path.read_text(encoding="utf-8"))
+            if isinstance(ap, dict):
+                live = (ap.get("status") or "").lower() in {
+                    "running", "starting", "stopping", "restarting",
+                }
+                rid = (ap.get("current_run_id") or "").strip()
+                if live and rid:
+                    return rid[:64]
+    except (json.JSONDecodeError, OSError):
+        pass
+    rand4 = "".join(
+        f"{b:02x}" for b in os.urandom(2)
+    )
+    return f"r-{int(time.time() * 1_000_000)}-{rand4}"
+
+
+_ARTIFACT_RUN_ID_RE = re.compile(r"run_id:\s*([A-Za-z0-9_\-]+)")
+_ARTIFACT_FEATURE_ID_RE = re.compile(r"feature_id:\s*([A-Za-z0-9_\-가-힣]+)")
+
+
+def _parse_artifact_run_id(body: str) -> str | None:
+    """Pull `run_id` out of the metadata header of a markdown artifact.
+
+    Returns None when absent — callers should treat that as "legacy
+    artifact written before run_id existed" and fall back to cycle_id /
+    timestamp comparisons.
+    """
+    if not body:
+        return None
+    head = body[:512]
+    m = _ARTIFACT_RUN_ID_RE.search(head)
+    if not m:
+        return None
+    return (m.group(1) or "").strip() or None
+
+
+def _parse_artifact_feature_id(body: str) -> str | None:
+    if not body:
+        return None
+    head = body[:512]
+    m = _ARTIFACT_FEATURE_ID_RE.search(head)
+    if not m:
+        return None
+    return (m.group(1) or "").strip() or None
+
+
+# ---------------------------------------------------------------------------
 # Active rework feature lock
 #
 # When a cycle ends with `hold_for_rework`, we persist the canonical
@@ -4193,8 +4364,9 @@ def _features_match(a: str | None, b: str | None) -> bool:
 def _load_active_rework_feature() -> dict:
     """Return the persisted rework lock or an empty dict.
 
-    Shape: {"feature": str, "hold_count": int, "last_hold_at": iso,
-             "last_hold_type": "soft"|"hard"|None}
+    Shape: {"feature": str, "feature_id": str, "run_id": str,
+            "hold_count": int, "last_hold_at": iso,
+            "last_hold_type": "soft"|"hard"|None}
     """
     try:
         if not ACTIVE_REWORK_FEATURE_FILE.is_file():
@@ -4215,11 +4387,20 @@ def _save_active_rework_feature(
     hold_count: int,
     hold_type: str | None,
     pm_message: str | None = None,
+    feature_id: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Persist the rework lock. A blank feature still writes the file
-    (zero-feature lock has no effect downstream but keeps history)."""
+    (zero-feature lock has no effect downstream but keeps history).
+
+    Includes `feature_id` (slug form) and `run_id` so the lock can be
+    invalidated cleanly when a fresh autopilot run starts or when the
+    accepted design_spec.feature_id diverges from the lock.
+    """
     payload = {
         "feature": (feature or "").strip(),
+        "feature_id": (feature_id or _to_feature_id(feature)),
+        "run_id": (run_id or _resolve_run_id()),
         "hold_count": int(hold_count),
         "last_hold_at": utc_now_iso(),
         "last_hold_type": hold_type,
@@ -4634,9 +4815,17 @@ def stage_design_spec(state: CycleState) -> StageResult:
     titlelabel_count = _extract_design_spec_titlelabel_count(body)
     svg_tiers = _extract_design_spec_svg_paths(body)
 
+    # Resolve the spec's canonical feature + feature_id BEFORE writing,
+    # so the artifact header carries the same id every downstream stage
+    # will see. This is the kernel-contract anchor: once design_spec is
+    # generated + accepted, this feature_id is the single source of
+    # truth for the rest of the cycle.
+    ds_feature_name = _extract_design_spec_feature(body)
+    ds_feature_id = _to_feature_id(ds_feature_name)
     safe_write_artifact(
         DESIGN_SPEC_FILE, body,
         cycle_id=state.cycle, stage="design_spec", source_agent="designer",
+        feature_id=ds_feature_id or None,
         extra={
             "spec_mode_keywords": ",".join(keywords)[:200],
             "acceptance": "passed" if not fails else "insufficient",
@@ -4649,6 +4838,8 @@ def stage_design_spec(state: CycleState) -> StageResult:
     state.design_spec_svg_paths = list(svg_tiers)
     state.design_spec_acceptance_passed = not fails
     state.design_spec_acceptance_failures = list(fails)
+    state.design_spec_feature = ds_feature_name or state.design_spec_feature
+    state.design_spec_feature_id = ds_feature_id or state.design_spec_feature_id
 
     if fails:
         state.design_spec_status = "insufficient"
@@ -5150,12 +5341,26 @@ def stage_claude_propose(state: CycleState) -> StageResult:
     if not claude_bin:
         return _skip("claude CLI 미설치 — 스킵")
 
-    # If Product Planner Mode produced a validated report this cycle,
-    # feed it into the proposal prompt. The planner-aware template
-    # constrains Claude to the selected feature's MVP scope so we
-    # don't drift back into "edit a button label" territory.
+    # When the design_spec is the cycle's source of truth (accepted +
+    # not stale), we feed the design_spec body itself into the proposal
+    # prompt instead of the product_planner output. This prevents an
+    # earlier planner candidate name (e.g. "Local Visa 배지") from
+    # leaking into the proposal when a different feature_id has already
+    # been signed off via design_spec — the bug behind every recent
+    # scope_mismatch rollback.
+    spec_for_propose = bool(
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+        and not state.stale_design_spec_detected
+        and DESIGN_SPEC_FILE.is_file()
+    )
     planner_md: str | None = None
-    if (
+    if spec_for_propose:
+        try:
+            planner_md = DESIGN_SPEC_FILE.read_text(encoding="utf-8")
+        except OSError:
+            planner_md = None
+    if planner_md is None and (
         state.product_planner_status in {"generated", "fallback_generated"}
         and PRODUCT_PLANNER_FILE.is_file()
     ):
@@ -5215,14 +5420,35 @@ def stage_claude_propose(state: CycleState) -> StageResult:
         return sr
     body = body[idx:].rstrip()
 
-    PROPOSAL_FILE.write_text(body + "\n", encoding="utf-8")
+    propose_feature_id = (
+        state.design_spec_feature_id
+        if spec_for_propose
+        else state.selected_feature_id
+    ) or _to_feature_id(
+        state.design_spec_feature
+        if spec_for_propose
+        else (
+            state.planner_revision_selected_feature
+            or state.product_planner_selected_feature
+        )
+    )
+    safe_write_artifact(
+        PROPOSAL_FILE, body,
+        cycle_id=state.cycle, stage="claude_propose",
+        source_agent="claude_propose",
+        feature_id=propose_feature_id or None,
+        extra={"spec_anchored": "true" if spec_for_propose else "false"},
+    )
     state.claude_proposal_status = "generated"
     state.claude_proposal_path = str(PROPOSAL_FILE)
     state.claude_proposal_at = utc_now_iso()
     state.claude_proposal_skipped_reason = None
 
     sr.status = "passed"
-    sr.message = f"제안 생성 ({len(body)} chars, model={model})"
+    sr.message = (
+        f"제안 생성 ({len(body)} chars, model={model}, "
+        f"feature_id={propose_feature_id or '—'})"
+    )
     return sr
 
 
@@ -5579,6 +5805,422 @@ def _build_apply_input_from_design_spec(
     )
 
 
+# ---------------------------------------------------------------------------
+# Pipeline contract validators
+#
+# Each validator is a pure function over CycleState (and optionally the
+# active rework lock + on-disk artifacts) and returns a result dict:
+#
+#   {
+#     "name":     <validator name>,
+#     "ok":       bool,
+#     "code":     short failure code (snake_case) | "passed",
+#     "message":  human-readable summary,
+#     "evidence": dict of fields useful for debug + report tables,
+#   }
+#
+# The dashboard / smoke / observer reports render these directly so a
+# stage contract failure is always traceable to a specific validator
+# code (scope_mismatch_preflight, missing_ticket_contract, …) rather
+# than a freeform string. This is the kernel-contract layer that turns
+# per-symptom HOLD-loop bandaids into a single deterministic gate.
+# ---------------------------------------------------------------------------
+
+
+def _validator_result(
+    name: str, ok: bool, code: str, message: str,
+    evidence: dict | None = None,
+) -> dict:
+    return {
+        "name": name,
+        "ok": bool(ok),
+        "code": code,
+        "message": message,
+        "evidence": dict(evidence or {}),
+    }
+
+
+def validate_planner_contract(state: "CycleState") -> dict:
+    """Planner output is "complete enough" to feed the rest of the
+    cycle: at least one of product_planner / planner_revision must be
+    `generated` AND yield a selected feature."""
+    pp_status = state.product_planner_status
+    pr_status = state.planner_revision_status
+    feature = (
+        state.planner_revision_selected_feature
+        or state.product_planner_selected_feature
+        or state.selected_feature
+        or ""
+    ).strip()
+    feature_id = state.selected_feature_id or _to_feature_id(feature)
+    has_planner = pp_status in {"generated", "fallback_generated"} or pr_status in {
+        "generated", "fallback_generated",
+    }
+    if not has_planner:
+        return _validator_result(
+            "planner_contract", False, "missing_planner",
+            f"planner output not generated (product_planner={pp_status}, "
+            f"planner_revision={pr_status})",
+            {
+                "product_planner_status": pp_status,
+                "planner_revision_status": pr_status,
+            },
+        )
+    if not feature:
+        return _validator_result(
+            "planner_contract", False, "missing_selected_feature",
+            "planner ran but did not yield a selected_feature",
+            {
+                "product_planner_status": pp_status,
+                "planner_revision_status": pr_status,
+            },
+        )
+    if not feature_id:
+        return _validator_result(
+            "planner_contract", False, "missing_feature_id",
+            f"selected_feature='{feature}' did not produce a slug feature_id",
+            {"feature": feature},
+        )
+    return _validator_result(
+        "planner_contract", True, "passed",
+        f"planner contract OK (feature_id={feature_id})",
+        {"feature": feature, "feature_id": feature_id},
+    )
+
+
+def validate_design_spec_contract(state: "CycleState") -> dict:
+    """When design_spec is generated + accepted, the spec must own the
+    feature_id for the rest of the cycle. Validator passes when:
+      * design_spec_status == "generated"
+      * design_spec_acceptance_passed
+      * not stale_design_spec_detected
+      * a non-empty feature_id was extracted from the spec body
+    Skipped (ok=True) when design_spec didn't run at all — the
+    implementation_ticket validator owns the planner-only path.
+    """
+    if state.design_spec_status not in {"generated", "insufficient", "failed"}:
+        return _validator_result(
+            "design_spec_contract", True, "skipped",
+            "design_spec did not run this cycle",
+            {"design_spec_status": state.design_spec_status},
+        )
+    if state.design_spec_status != "generated":
+        return _validator_result(
+            "design_spec_contract", False, "design_spec_not_accepted",
+            f"design_spec_status={state.design_spec_status}",
+            {"design_spec_status": state.design_spec_status},
+        )
+    if not state.design_spec_acceptance_passed:
+        return _validator_result(
+            "design_spec_contract", False, "design_spec_acceptance_failed",
+            "design_spec generated but acceptance gate failed",
+            {
+                "failures": list(
+                    state.design_spec_acceptance_failures or []
+                )[:6],
+            },
+        )
+    if state.stale_design_spec_detected:
+        return _validator_result(
+            "design_spec_contract", False, "design_spec_stale",
+            "design_spec belongs to a previous cycle / feature",
+            {
+                "stale_feature": state.stale_design_spec_feature,
+                "stale_cycle_id": state.stale_design_spec_cycle_id,
+            },
+        )
+    fid = state.design_spec_feature_id or _to_feature_id(state.design_spec_feature)
+    if not fid:
+        return _validator_result(
+            "design_spec_contract", False, "design_spec_missing_feature_id",
+            "design_spec accepted but no feature_id parsed from body",
+            {"design_spec_feature": state.design_spec_feature},
+        )
+    return _validator_result(
+        "design_spec_contract", True, "passed",
+        f"design_spec accepted (feature_id={fid})",
+        {
+            "feature": state.design_spec_feature,
+            "feature_id": fid,
+            "target_files_count": len(state.design_spec_target_files or []),
+        },
+    )
+
+
+def validate_implementation_ticket_contract(state: "CycleState") -> dict:
+    """The ticket must align with the cycle's source of truth.
+
+    When design_spec is the source (accepted + not stale), the ticket's
+    selected_feature_id MUST equal the design_spec_feature_id. When
+    design_spec didn't run, the ticket's feature_id must equal the
+    planner's selected feature_id. Either way, target_files must be
+    non-empty (otherwise claude_apply has nothing to do).
+    """
+    if state.implementation_ticket_status != "generated":
+        return _validator_result(
+            "implementation_ticket_contract", True, "skipped",
+            f"implementation_ticket status="
+            f"{state.implementation_ticket_status}",
+            {"status": state.implementation_ticket_status},
+        )
+    target_files = list(state.implementation_ticket_target_files or [])
+    if not target_files:
+        return _validator_result(
+            "implementation_ticket_contract", False, "missing_ticket_contract",
+            "ticket generated without any target_files — nothing to apply",
+            {},
+        )
+    ticket_feature = (
+        state.implementation_ticket_selected_feature
+        or state.selected_feature
+        or ""
+    ).strip()
+    ticket_fid = state.implementation_ticket_feature_id or _to_feature_id(
+        ticket_feature
+    )
+    spec_ok = (
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+        and not state.stale_design_spec_detected
+    )
+    if spec_ok:
+        spec_fid = state.design_spec_feature_id or _to_feature_id(
+            state.design_spec_feature
+        )
+        if spec_fid and ticket_fid and spec_fid != ticket_fid:
+            return _validator_result(
+                "implementation_ticket_contract", False,
+                "scope_mismatch_preflight",
+                f"ticket feature_id='{ticket_fid}' does not match "
+                f"design_spec feature_id='{spec_fid}'",
+                {
+                    "ticket_feature": ticket_feature,
+                    "ticket_feature_id": ticket_fid,
+                    "design_spec_feature": state.design_spec_feature,
+                    "design_spec_feature_id": spec_fid,
+                },
+            )
+    return _validator_result(
+        "implementation_ticket_contract", True, "passed",
+        f"ticket feature_id={ticket_fid} target_files={len(target_files)}",
+        {
+            "ticket_feature": ticket_feature,
+            "ticket_feature_id": ticket_fid,
+            "target_files_count": len(target_files),
+        },
+    )
+
+
+def validate_scope_contract(state: "CycleState") -> dict:
+    """Cross-stage feature_id consistency. Every populated stage that
+    carries a feature_id must agree:
+
+      planner.selected_feature_id ≡ ticket.feature_id ≡ design_spec.feature_id
+
+    When a stage hasn't run, its feature_id is ignored. The validator
+    passes when ≤1 distinct id is populated, fails otherwise.
+    """
+    spec_ok = (
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+        and not state.stale_design_spec_detected
+    )
+    spec_fid = (
+        state.design_spec_feature_id
+        or _to_feature_id(state.design_spec_feature)
+    ) if spec_ok else ""
+    ticket_fid = state.implementation_ticket_feature_id or _to_feature_id(
+        state.implementation_ticket_selected_feature
+    ) if state.implementation_ticket_status == "generated" else ""
+    planner_fid = state.selected_feature_id or _to_feature_id(
+        state.planner_revision_selected_feature
+        or state.product_planner_selected_feature
+    )
+    populated = {
+        ("design_spec", spec_fid),
+        ("implementation_ticket", ticket_fid),
+        ("planner", planner_fid),
+    }
+    populated = {(k, v) for (k, v) in populated if v}
+    distinct_ids = {fid for _, fid in populated}
+    if len(distinct_ids) <= 1:
+        return _validator_result(
+            "scope_contract", True, "passed",
+            f"scope contract OK (id={next(iter(distinct_ids), '—')})",
+            {"populated": sorted(populated)},
+        )
+    # When the design_spec is the source of truth and disagrees,
+    # surface that as the canonical mismatch reason.
+    if spec_fid and (
+        (ticket_fid and ticket_fid != spec_fid)
+        or (planner_fid and planner_fid != spec_fid)
+    ):
+        return _validator_result(
+            "scope_contract", False, "scope_mismatch_preflight",
+            f"design_spec feature_id='{spec_fid}' diverges from "
+            f"ticket='{ticket_fid or '—'}' / planner='{planner_fid or '—'}'",
+            {
+                "design_spec_feature_id": spec_fid,
+                "implementation_ticket_feature_id": ticket_fid,
+                "planner_feature_id": planner_fid,
+            },
+        )
+    return _validator_result(
+        "scope_contract", False, "scope_mismatch_preflight",
+        f"feature_ids disagree: {sorted(distinct_ids)}",
+        {"populated": sorted(populated)},
+    )
+
+
+def validate_apply_preflight(state: "CycleState") -> dict:
+    """Final gate before stage_claude_apply spends Claude budget.
+
+    Aggregate of:
+      * planner contract
+      * design_spec contract (when applicable)
+      * implementation_ticket contract
+      * scope contract
+      * active rework feature lock compatible with current run/feature
+      * non-stale design_spec / ticket artifacts (run_id check on disk)
+    """
+    # 1. Ticket present + has files.
+    ticket_check = validate_implementation_ticket_contract(state)
+    if not ticket_check["ok"]:
+        if ticket_check["code"] == "skipped":
+            return _validator_result(
+                "apply_preflight", False, "missing_ticket_contract",
+                "implementation_ticket not generated — apply blocked",
+                {"ticket_status": state.implementation_ticket_status},
+            )
+        return _validator_result(
+            "apply_preflight", False, ticket_check["code"],
+            ticket_check["message"], ticket_check["evidence"],
+        )
+
+    # 2. design_spec contract (only enforced when the spec ran).
+    if state.design_spec_status in {"generated", "insufficient", "failed"}:
+        spec_check = validate_design_spec_contract(state)
+        if not spec_check["ok"]:
+            return _validator_result(
+                "apply_preflight", False, spec_check["code"],
+                spec_check["message"], spec_check["evidence"],
+            )
+
+    # 3. Cross-stage scope contract.
+    scope_check = validate_scope_contract(state)
+    if not scope_check["ok"]:
+        return _validator_result(
+            "apply_preflight", False, scope_check["code"],
+            scope_check["message"], scope_check["evidence"],
+        )
+
+    # 4. Active rework feature lock cannot lock the cycle to a
+    # different feature_id when design_spec has already been accepted.
+    lock = _load_active_rework_feature()
+    lock_feature = (lock.get("feature") or "").strip()
+    lock_fid = (lock.get("feature_id") or _to_feature_id(lock_feature) or "").strip()
+    lock_run = (lock.get("run_id") or "").strip()
+    cur_run = state.run_id or _resolve_run_id()
+    if lock_run and cur_run and lock_run != cur_run:
+        return _validator_result(
+            "apply_preflight", False, "feature_lock_conflict",
+            "active rework feature lock belongs to a previous run "
+            f"(lock_run_id={lock_run}, current={cur_run})",
+            {"lock_run_id": lock_run, "current_run_id": cur_run,
+             "lock_feature": lock_feature},
+        )
+    spec_ok = (
+        state.design_spec_status == "generated"
+        and state.design_spec_acceptance_passed
+        and not state.stale_design_spec_detected
+    )
+    spec_fid = (
+        state.design_spec_feature_id
+        or _to_feature_id(state.design_spec_feature)
+    ) if spec_ok else ""
+    if spec_fid and lock_fid and lock_fid != spec_fid:
+        return _validator_result(
+            "apply_preflight", False, "feature_lock_conflict",
+            "active rework lock feature_id != accepted design_spec "
+            f"(lock={lock_fid}, design_spec={spec_fid})",
+            {"lock_feature_id": lock_fid, "design_spec_feature_id": spec_fid},
+        )
+
+    # 5. Stale-artifact preflight — design_spec.md / implementation_
+    # ticket.md must carry the current run_id when present.
+    stale = []
+    for path, label in (
+        (DESIGN_SPEC_FILE, "design_spec"),
+        (IMPLEMENTATION_TICKET_FILE, "implementation_ticket"),
+    ):
+        try:
+            if not path.is_file():
+                continue
+            head = path.read_text(encoding="utf-8")[:512]
+        except OSError:
+            continue
+        rid = _parse_artifact_run_id(head)
+        if rid and cur_run and rid != cur_run:
+            stale.append({"label": label, "artifact_run_id": rid})
+    if stale:
+        return _validator_result(
+            "apply_preflight", False, "stale_artifact_preflight",
+            f"stale artifact(s) carry a different run_id: "
+            f"{[s['label'] for s in stale]}",
+            {"stale": stale, "current_run_id": cur_run},
+        )
+
+    return _validator_result(
+        "apply_preflight", True, "passed",
+        f"apply preflight OK (feature_id={spec_fid or scope_check['evidence'].get('populated') or '—'})",
+        {
+            "design_spec_feature_id": spec_fid,
+            "ticket_feature_id":
+                state.implementation_ticket_feature_id
+                or _to_feature_id(state.implementation_ticket_selected_feature),
+            "current_run_id": cur_run,
+        },
+    )
+
+
+def classify_freshness_by_run_id(
+    *, current_run_id: str | None, artifact_run_id: str | None,
+    artifact_cycle_id: int | None, current_cycle_id: int | None,
+) -> str:
+    """Pure function shared by smoke / observer / dashboard report
+    builders. Returns one of:
+
+      "current_run"     — same run_id, same cycle (or no cycle yet)
+      "previous_cycle"  — same run_id, older cycle
+      "stale_run"       — different run_id (regardless of cycle)
+      "unknown"         — cannot prove freshness from inputs
+
+    cycle_id comparisons are only consulted when run_id agrees, which
+    is the kernel rule that prevents cross-run cycle-counter collisions
+    from looking fresh.
+    """
+    cur = (current_run_id or "").strip()
+    art = (artifact_run_id or "").strip()
+    if cur and art:
+        if cur != art:
+            return "stale_run"
+    elif art and not cur:
+        return "unknown"
+    elif cur and not art:
+        # legacy artifact without run_id — fall through to cycle_id
+        pass
+    if (
+        artifact_cycle_id is not None
+        and current_cycle_id is not None
+    ):
+        if artifact_cycle_id == current_cycle_id:
+            return "current_run"
+        if artifact_cycle_id < current_cycle_id:
+            return "previous_cycle"
+        return "unknown"
+    return "current_run"
+
+
 def _classify_pm_hold_type(state: "CycleState") -> tuple[str, str]:
     """Decide whether a PM HOLD is `soft` (we still have enough info to
     build something on the same feature) or `hard` (no candidate / no
@@ -5829,12 +6471,46 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         # from design_spec.md itself, NOT from prior planner state. This
         # is the gate that prevents an old "Local Visa" selected_feature
         # from contaminating a TitleSeal cycle's ticket.
-        ds_feature = _extract_design_spec_feature(design_spec_md)
+        ds_feature = (
+            state.design_spec_feature
+            or _extract_design_spec_feature(design_spec_md)
+        )
         feature = ds_feature or "(design_spec 기능명 미기재)"
         state.design_spec_feature = ds_feature
+        state.design_spec_feature_id = (
+            state.design_spec_feature_id or _to_feature_id(ds_feature)
+        )
+        # Reconcile the active rework feature lock with the accepted
+        # design_spec. The lock can only point at one feature at a time;
+        # a stale lock pointing at a previous feature would otherwise
+        # leak back into the next cycle's planner prompt.
+        lock = _load_active_rework_feature()
+        lock_fid = (
+            (lock.get("feature_id") or "").strip()
+            or _to_feature_id(lock.get("feature"))
+        )
+        ds_fid = state.design_spec_feature_id or _to_feature_id(ds_feature)
+        if lock and ds_fid and lock_fid and lock_fid != ds_fid:
+            _save_active_rework_feature(
+                feature=ds_feature,
+                feature_id=ds_fid,
+                hold_count=int(lock.get("hold_count") or 0),
+                hold_type=lock.get("last_hold_type"),
+                pm_message=lock.get("pm_message"),
+                run_id=state.run_id,
+            )
+            state.active_rework_feature = ds_feature
+            _emit_cycle_log(
+                state, "active_rework_feature_realigned",
+                f"active_rework_feature lock realigned to design_spec "
+                f"feature_id (was='{lock_fid}', now='{ds_fid}')",
+                lock_feature_id=lock_fid,
+                design_spec_feature_id=ds_fid,
+            )
     else:
         feature = _selected_feature_for_ticket(state)
     state.implementation_ticket_selected_feature = feature
+    state.implementation_ticket_feature_id = _to_feature_id(feature)
 
     if not target_files:
         # No concrete file targets → ticket is "missing". We still write
@@ -5898,6 +6574,13 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
             feature = ds_feature_for_body
             state.implementation_ticket_selected_feature = ds_feature_for_body
             state.design_spec_feature = ds_feature_for_body
+            state.design_spec_feature_id = (
+                state.design_spec_feature_id
+                or _to_feature_id(ds_feature_for_body)
+            )
+            state.implementation_ticket_feature_id = _to_feature_id(
+                ds_feature_for_body
+            )
     else:
         body = _build_ticket_markdown(
             state,
@@ -5918,6 +6601,7 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
         IMPLEMENTATION_TICKET_FILE, body,
         cycle_id=state.cycle, stage="implementation_ticket",
         source_agent="pm",
+        feature_id=state.implementation_ticket_feature_id or None,
         extra={
             "target_files_count": len(target_files),
             "selected_feature": feature or "—",
@@ -5939,6 +6623,10 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     state.implementation_ticket_target_screens = list(target_screens)
     state.implementation_ticket_source = ticket_source
     state.selected_feature = feature
+    state.selected_feature_id = (
+        state.implementation_ticket_feature_id
+        or _to_feature_id(feature)
+    )
     state.selected_feature_source = feature_source
     state.implementation_ticket_message = (
         f"Implementation Ticket 작성됨 — 대상 파일 {len(target_files)}개"
@@ -5946,10 +6634,20 @@ def stage_implementation_ticket(state: CycleState) -> StageResult:
     )
     _emit_cycle_log(
         state, "implementation_ticket_created",
-        f"implementation ticket created — 대상 파일 {len(target_files)}개",
+        f"implementation ticket created — 대상 파일 {len(target_files)}개 "
+        f"(feature_id={state.selected_feature_id or '—'}, "
+        f"source={feature_source})",
         feature=feature,
+        feature_id=state.selected_feature_id,
         target_files=target_files[:20],
     )
+    # Record the contract validator outcome on state so smoke / observer
+    # / dashboard can render the table without re-running validation.
+    contract = validate_implementation_ticket_contract(state)
+    state.contract_results = [
+        c for c in (state.contract_results or [])
+        if c.get("name") != "implementation_ticket_contract"
+    ] + [contract]
     sr.status = "passed"
     sr.message = state.implementation_ticket_message
     sr.duration_sec = round(time.time() - t0, 3)
@@ -6448,6 +7146,42 @@ def stage_claude_apply(state: CycleState) -> StageResult:
     if failed_prior:
         names = ", ".join(s.name for s in failed_prior)
         return _skip(f"이전 단계 실패({names}) — 적용 건너뜀")
+
+    # Pre-condition 4b: kernel-contract preflight. Run pure validators
+    # over the cycle state BEFORE spending Claude budget. Failures here
+    # short-circuit the stage with a specific code (scope_mismatch_
+    # preflight / stale_artifact_preflight / missing_ticket_contract /
+    # feature_lock_conflict) so the smoke / observer / dashboard report
+    # can pinpoint which contract was violated. Without this, mismatches
+    # were only detected AFTER the Claude apply when scope_consistency
+    # rolled back the diff — wasting budget on every cycle.
+    preflight = validate_apply_preflight(state)
+    state.contract_results = [
+        c for c in (state.contract_results or [])
+        if c.get("name") != "apply_preflight"
+    ] + [preflight]
+    state.apply_preflight_status = preflight["code"]
+    state.apply_preflight_reason = preflight["message"]
+    if not preflight["ok"]:
+        sr.status = "failed"
+        sr.message = preflight["message"]
+        sr.detail = json.dumps(preflight.get("evidence") or {}, ensure_ascii=False)
+        sr.duration_sec = round(time.time() - t0, 3)
+        state.claude_apply_status = preflight["code"]
+        state.claude_apply_skipped_reason = preflight["message"]
+        state.claude_apply_message = sr.message
+        state.scope_consistency_status = "failed"
+        state.scope_mismatch_reason = preflight["message"]
+        state.failed_stage = "claude_apply"
+        state.failed_reason = preflight["message"]
+        _emit_cycle_log(
+            state, "claude_apply_preflight_failed",
+            f"claude_apply preflight failed — {preflight['code']}: "
+            f"{preflight['message']}",
+            preflight_code=preflight["code"],
+            evidence=preflight.get("evidence") or {},
+        )
+        return sr
 
     # Pre-condition 5: tools + input source.
     claude_bin = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
@@ -7940,9 +8674,28 @@ def main() -> int:
     state.current_task = "사이클 준비"
     state.last_message = "자동 점검 사이클 시작"
     state.started_at = utc_now_iso()
+    # Resolve the active run_id and surface it on state. Every artifact
+    # this cycle writes inherits the same id (via safe_write_artifact),
+    # so freshness consumers (UI / smoke / observer) can compare against
+    # autopilot_state.current_run_id without re-deriving.
+    state.run_id = _resolve_run_id()
     # Hydrate the rework lock at start so downstream stages see the
-    # locked feature even before stage_product_planning runs.
+    # locked feature even before stage_product_planning runs. If the
+    # lock predates this run (different run_id), drop it — stale locks
+    # are exactly what produced the cross-run feature drift the kernel
+    # contract is designed to prevent.
     _rl_init = _load_active_rework_feature()
+    locked_run_id = (_rl_init.get("run_id") or "").strip()
+    if _rl_init.get("feature") and locked_run_id and locked_run_id != state.run_id:
+        _clear_active_rework_feature()
+        _emit_cycle_log(
+            state, "active_rework_feature_stale_run",
+            "active rework feature lock cleared — stale run_id "
+            f"(lock={locked_run_id}, current={state.run_id})",
+            lock_run_id=locked_run_id,
+            current_run_id=state.run_id,
+        )
+        _rl_init = {}
     if _rl_init.get("feature"):
         state.active_rework_feature = (_rl_init.get("feature") or "").strip() or None
         state.active_rework_hold_count = int(_rl_init.get("hold_count") or 0)

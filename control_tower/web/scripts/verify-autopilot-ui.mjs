@@ -670,6 +670,79 @@ const apB = { started_at: "2026-05-03T01:00:00Z", cycle_count: 0 };
     deriveDisplayCycle(meta).number === 1);
 }
 
+// I. run_id mismatch — same cycle_id but different run_id must be
+//    classified as stale_artifact / stale, not current_cycle. This is
+//    the kernel-contract freshness gate the dashboard relies on.
+{
+  const ap = {
+    status: "running",
+    started_at: "2026-05-03T10:00:00Z",
+    cycle_count: 1,
+    active_cycle_index: 1,
+    current_run_id: "r-current-abc",
+  };
+  const f = freshnessOf({
+    artifactCycleId: 1,
+    artifactRunId: "r-previous-xyz",
+    artifactAt: new Date().toISOString(),
+    autopilot: ap,
+  });
+  check("I: run_id mismatch (same cycle_id) → stale_artifact",
+    f === "stale_artifact");
+
+  const aa = {
+    available: true,
+    cycle_id: 1,
+    run_id: "r-previous-xyz",
+    evaluated_at: new Date().toISOString(),
+  };
+  const got = classifyAccountabilityFreshness(aa, { autopilot: ap });
+  check("I: classifyAccountabilityFreshness run_id mismatch → stale",
+    got === "stale");
+}
+
+// J. run_id match — explicit current run_id should keep the artifact
+//    in current_run/current_cycle even if timestamps would otherwise
+//    be borderline.
+{
+  const ap = {
+    status: "running",
+    started_at: new Date(Date.now() - 5_000).toISOString(),
+    cycle_count: 0,
+    active_cycle_index: 1,
+    current_run_id: "r-current-abc",
+  };
+  const f = freshnessOf({
+    artifactCycleId: 1,
+    artifactRunId: "r-current-abc",
+    artifactAt: new Date().toISOString(),
+    autopilot: ap,
+  });
+  check("J: run_id match → current_cycle / current_run",
+    f === "current_cycle" || f === "current_run");
+}
+
+// K. legacy artifact (no run_id stamped) should not be flagged as
+//    stale just because run_id is missing — fall through to cycle_id /
+//    timestamp heuristics.
+{
+  const ap = {
+    status: "running",
+    started_at: new Date(Date.now() - 5_000).toISOString(),
+    cycle_count: 1,
+    active_cycle_index: 1,
+    current_run_id: "r-current-abc",
+  };
+  const f = freshnessOf({
+    artifactCycleId: 1,
+    artifactRunId: null,
+    artifactAt: new Date().toISOString(),
+    autopilot: ap,
+  });
+  check("K: legacy artifact (no run_id) → current_cycle (cycle_id match)",
+    f === "current_cycle");
+}
+
 // ---------- Wrap up ----------
 
 const summary = {
@@ -695,7 +768,7 @@ if (failures.length > 0) {
 }
 console.log(
   `[autopilot-ui] ${passes.length} checks PASS across ${comboCount} (mode×bool³×cycles×hours) ` +
-  `payload combinations + 8 phase / 8 button / 7 freshness / 4 stuck / 4 race / 3 time fixtures — ` +
+  `payload combinations + 8 phase / 8 button / 11 freshness / 4 stuck / 4 race / 3 time fixtures — ` +
   `wrote .runtime/autopilot_ui_matrix.json`,
 );
 process.exit(0);

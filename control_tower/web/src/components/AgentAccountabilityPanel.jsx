@@ -166,14 +166,16 @@ export default function AgentAccountabilityPanel({ runners = [] }) {
               backgroundColor: "#0a1228",
             }}
           >
-            PREVIOUS CYCLE
+            {aa.run_id && aa.run_id !== (runners?.[0]?.metadata_json?.local_factory?.autopilot?.current_run_id || "")
+              ? "PREVIOUS RUN"
+              : "PREVIOUS CYCLE"}
           </span>
           <span className="text-[10px] tracking-widest text-slate-500">
-            cycle #{aa.cycle_id ?? "—"}
+            cycle #{aa.cycle_id ?? "—"} · run {aa.run_id ?? "—"}
           </span>
         </div>
         <div className="text-[11px] text-slate-400">
-          현재 Auto Pilot cycle과 다른 산출물입니다 — 이전 사이클 결과는 접혔습니다.
+          현재 Auto Pilot run/cycle과 다른 산출물입니다 — 이전 사이클 결과는 접혔습니다.
         </div>
         <details className="text-[11px] text-slate-400">
           <summary className="cursor-pointer hover:text-slate-200">

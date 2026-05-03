@@ -30,6 +30,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -225,6 +226,11 @@ class CycleRecord:
     # grep three different artifacts. These fields are mirrored from
     # factory_smoke_state.json + factory_state.json at record time.
     selected_feature: str | None = None
+    selected_feature_id: str | None = None
+    design_spec_feature_id: str | None = None
+    implementation_ticket_feature_id: str | None = None
+    apply_preflight_status: str | None = None
+    run_id: str | None = None
     pm_verdict: str | None = None              # SHIP | HOLD | —
     hold_type: str | None = None               # soft | hard | None
     hold_type_reason: str | None = None
@@ -292,6 +298,13 @@ class AutopilotState:
     active_cycle_index: int | None = None
     current_stage: str | None = None
     live_report_path: str | None = None
+    # current_run_id — unique identifier for the autopilot run that
+    # owns this state. Generated at run_loop start, propagated via the
+    # FACTORY_RUN_ID env var to every cycle.py / factory_smoke spawn,
+    # and recorded on every artifact those subprocesses write. Smoke /
+    # observer / dashboard use it as the primary freshness key — same
+    # cycle_id but different run_id == PREVIOUS RUN, never CURRENT.
+    current_run_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -429,7 +442,17 @@ def _run_smoke_cycle(timeout_sec: int) -> dict:
         "--timeout", str(int(timeout_sec)),
     ]
     repo = str(_repo_root())
-    _log(f"smoke spawn timeout={timeout_sec}s cmd={' '.join(cmd)}")
+    # Propagate the autopilot's run_id to factory_smoke / cycle.py so
+    # every artifact written during this smoke cycle carries the same
+    # id (and the freshness verdict survives cycle-counter collisions
+    # across runs). Falls back to a one-shot id if the autopilot didn't
+    # mint one — manual factory_smoke probes get their own per-process
+    # run_id this way.
+    env = os.environ.copy()
+    rid = (_STATE.current_run_id or "").strip() if _STATE else ""
+    if rid:
+        env["FACTORY_RUN_ID"] = rid
+    _log(f"smoke spawn timeout={timeout_sec}s run_id={env.get('FACTORY_RUN_ID') or '—'} cmd={' '.join(cmd)}")
     try:
         # Wall-clock cap = smoke timeout + 5min buffer. The smoke runner
         # has its own internal deadline; we don't want to kill it early.
@@ -439,6 +462,7 @@ def _run_smoke_cycle(timeout_sec: int) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout_sec + 300,
+            env=env,
         )
         rc = proc.returncode
         tail = (proc.stdout or "")[-400:] + (proc.stderr or "")[-400:]
@@ -490,7 +514,7 @@ HOLD_VERDICTS = frozenset({"HOLD"})
 FAIL_VERDICTS = frozenset({"FAIL"})
 
 # After this many consecutive HOLD cycles with code_changed=False, the
-# autopilot loop terminates with failure_code=no_change_hold_loop. The
+# autopilot loop terminates with failure_code=no_progress_hold_loop. The
 # operator should inspect why the rework loop is unable to ship — usually
 # the planner or design_spec stage is mis-classifying soft HOLD inputs
 # as hard.
@@ -516,6 +540,19 @@ def _populate_cycle_record_from_state(
         or fs.get("product_planner_selected_feature")
         or sm.get("selected_feature")
     )
+    rec.selected_feature_id = fs.get("selected_feature_id") or sm.get(
+        "selected_feature_id"
+    )
+    rec.design_spec_feature_id = fs.get("design_spec_feature_id") or sm.get(
+        "design_spec_feature_id"
+    )
+    rec.implementation_ticket_feature_id = fs.get(
+        "implementation_ticket_feature_id"
+    ) or sm.get("implementation_ticket_feature_id")
+    rec.apply_preflight_status = fs.get("apply_preflight_status") or sm.get(
+        "apply_preflight_status"
+    )
+    rec.run_id = fs.get("run_id") or sm.get("run_id")
     pm_ship = fs.get("pm_decision_ship_ready")
     if pm_ship is True:
         rec.pm_verdict = "SHIP"
@@ -587,7 +624,7 @@ def _max_cycles_boundary_classification(
     history: list[dict], max_cycles: int
 ) -> str | None:
     """Decide whether reaching max_cycles should terminate the loop as
-    `no_change_hold_loop` instead of a benign `max_cycles reached` stop.
+    `no_progress_hold_loop` instead of a benign `max_cycles reached` stop.
 
     Policy (intentionally narrower than the in-loop trigger so a single
     HOLD on a max_cycles=1 manual probe is NOT treated as a broken
@@ -600,7 +637,7 @@ def _max_cycles_boundary_classification(
       * The last `NO_CHANGE_HOLD_STOP_THRESHOLD` cycles must ALL be
         `HOLD` with `code_changed=False`.
 
-    Returns "no_change_hold_loop" when the policy fires, else None.
+    Returns "no_progress_hold_loop" when the policy fires, else None.
     """
     if max_cycles < NO_CHANGE_HOLD_STOP_THRESHOLD:
         return None
@@ -612,7 +649,7 @@ def _max_cycles_boundary_classification(
         and not bool(h.get("code_changed"))
         for h in last
     )
-    return "no_change_hold_loop" if all_hold_no_change else None
+    return "no_progress_hold_loop" if all_hold_no_change else None
 
 
 def _git_status_porcelain() -> str:
@@ -1089,7 +1126,7 @@ def _hold_loop_root_cause(state: AutopilotState) -> list[str]:
     stop_reason = (state.stop_reason or "").lower()
     failure_code = (state.last_failure_code or "").lower()
     is_max_cycles = "max_cycles" in stop_reason
-    is_explicit_loop = "no_change_hold_loop" in stop_reason or failure_code == "no_change_hold_loop"
+    is_explicit_loop = "no_progress_hold_loop" in stop_reason or failure_code == "no_progress_hold_loop"
     if not history or not (is_max_cycles or is_explicit_loop):
         return []
     verdicts = {(h.get("verdict") or "").upper() for h in history}
@@ -1097,7 +1134,7 @@ def _hold_loop_root_cause(state: AutopilotState) -> list[str]:
         return []
 
     heading = (
-        "## HOLD 반복 종료 (no_change_hold_loop)"
+        "## HOLD 반복 종료 (no_progress_hold_loop)"
         if is_explicit_loop
         else "## HOLD 반복 종료 (root cause)"
     )
@@ -1176,21 +1213,63 @@ def _hold_loop_root_cause(state: AutopilotState) -> list[str]:
 
 
 def _format_report(state: AutopilotState) -> str:
+    # Pull the latest factory_state for the contract / freshness panels.
+    fs = _read_json(_factory_state_path()) or {}
+    contract_results = fs.get("contract_results") or []
+    active_feature = (
+        fs.get("selected_feature")
+        or fs.get("implementation_ticket_selected_feature")
+        or fs.get("design_spec_feature")
+    )
+    active_feature_id = (
+        fs.get("selected_feature_id")
+        or fs.get("implementation_ticket_feature_id")
+        or fs.get("design_spec_feature_id")
+    )
     lines = [
         "# Stampport Auto Pilot Report",
         "",
+        f"- run_id: `{state.current_run_id or '—'}`",
         f"- 모드: `{state.mode}`",
         f"- 시작: `{state.started_at}`",
         f"- 종료: `{state.ended_at}`",
         f"- 종료 사유: `{state.stop_reason or '—'}`",
         f"- 실행한 cycle 수: `{state.cycle_count}` / 최대 `{state.max_cycles}`",
         f"- 최대 시간: `{state.max_hours}h`",
+        f"- 활성 feature: `{active_feature or '—'}` "
+        f"(feature_id=`{active_feature_id or '—'}`)",
+        f"- selected_feature_source: `{fs.get('selected_feature_source') or '—'}`",
+        f"- design_spec_feature: `{fs.get('design_spec_feature') or '—'}`",
+        f"- implementation_ticket_feature: "
+        f"`{fs.get('implementation_ticket_selected_feature') or '—'}`",
+        f"- scope_consistency_status: `{fs.get('scope_consistency_status') or '—'}`",
+        f"- apply_preflight_status: `{fs.get('apply_preflight_status') or '—'}`",
         f"- 마지막 verdict: `{state.last_verdict}` "
         f"({state.last_failure_code or '—'})",
         f"- 마지막 commit: `{state.last_commit_hash or '—'}`",
         f"- 마지막 push: `{state.last_push_status or '—'}`",
         f"- 마지막 health: `{state.last_health_status or '—'}`",
         f"- 마지막 render: `{state.last_render_status or '—'}`",
+    ]
+    if contract_results:
+        lines += [
+            "",
+            "## Stage contract table",
+            "",
+            "| validator | ok | code | message |",
+            "|-----------|----|------|---------|",
+        ]
+        for c in contract_results:
+            msg = (c.get("message") or "—").replace("|", "/")
+            if len(msg) > 80:
+                msg = msg[:77] + "…"
+            lines.append(
+                f"| {c.get('name') or '—'} "
+                f"| {'✅' if c.get('ok') else '❌'} "
+                f"| {c.get('code') or '—'} "
+                f"| {msg} |"
+            )
+    lines += [
         "",
         "## Cycle log",
         "",
@@ -1335,6 +1414,13 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
         _STATE.active_cycle_index = None
         _STATE.current_stage = None
         _STATE.live_report_path = None
+        # Allocate a fresh run_id for this autopilot run. Every
+        # downstream artifact (factory_smoke, cycle.py stages, autopilot
+        # report) records this id so the UI's freshness verdict survives
+        # cycle-counter resets across runs. The generator is uuid4 hex
+        # truncated to 12 chars + a "r-" prefix so it sorts and greps
+        # cleanly in artifact metadata.
+        _STATE.current_run_id = "r-" + uuid.uuid4().hex[:12]
         _save_state()
 
     _log(
@@ -1347,7 +1433,7 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             if cycle >= config.max_cycles:
                 # max_cycles boundary — surface a specific
-                # no_change_hold_loop failure ONLY when the policy in
+                # no_progress_hold_loop failure ONLY when the policy in
                 # `_max_cycles_boundary_classification` actually fires
                 # (>= 3 cycles in history, >= 3 max_cycles, last 3 all
                 # HOLD+code_changed=false). Short runs (max_cycles=1/2)
@@ -1357,11 +1443,11 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
                 classification = _max_cycles_boundary_classification(
                     _STATE.history or [], config.max_cycles,
                 )
-                if classification == "no_change_hold_loop":
+                if classification == "no_progress_hold_loop":
                     ncl = _consecutive_no_change_holds(_STATE.history or [])
                     _STATE.last_failure_code = classification
                     _stop(
-                        f"no_change_hold_loop: {ncl} consecutive HOLD "
+                        f"no_progress_hold_loop: {ncl} consecutive HOLD "
                         f"cycles with code_changed=false (reached "
                         f"max_cycles={config.max_cycles}) — "
                         f"implementation never reached. Inspect "
@@ -1490,9 +1576,9 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
                     f"hold_type={rec.hold_type}"
                 )
                 if ncl >= NO_CHANGE_HOLD_STOP_THRESHOLD:
-                    _STATE.last_failure_code = "no_change_hold_loop"
+                    _STATE.last_failure_code = "no_progress_hold_loop"
                     _stop(
-                        f"no_change_hold_loop: {ncl} consecutive HOLD cycles "
+                        f"no_progress_hold_loop: {ncl} consecutive HOLD cycles "
                         f"with code_changed=false — implementation never "
                         f"reached. Inspect autopilot_report.md cycle table.",
                         status="failed",
@@ -1904,7 +1990,7 @@ def self_test() -> tuple[int, int, list[str]]:
 
         # --- D1. max_cycles=1 + 1 HOLD+no-change → benign max_cycles
         # reached stop. Single-cycle manual probes must NOT be flagged
-        # as no_change_hold_loop — that's only a multi-cycle pattern.
+        # as no_progress_hold_loop — that's only a multi-cycle pattern.
         total += 1
         hold_smoke = {"verdict": "HOLD", "failure_code": None,
                       "factory_status": "hold_for_rework",
@@ -1925,7 +2011,7 @@ def self_test() -> tuple[int, int, list[str]]:
             result.get("status") == "stopped"
             and "max_cycles" in (result.get("stop_reason") or "")
             and (result.get("last_failure_code") or "")
-                != "no_change_hold_loop"
+                != "no_progress_hold_loop"
         ):
             passed += 1
         else:
@@ -1937,7 +2023,7 @@ def self_test() -> tuple[int, int, list[str]]:
             )
 
         # --- D2. max_cycles=3 + 3 HOLD+no-change cycles → failed /
-        # no_change_hold_loop (the in-loop threshold trigger fires at
+        # no_progress_hold_loop (the in-loop threshold trigger fires at
         # the third cycle).
         total += 1
         result = _self_test_with_smoke(
@@ -1953,21 +2039,21 @@ def self_test() -> tuple[int, int, list[str]]:
         if (
             result.get("status") == "failed"
             and (result.get("last_failure_code") or "")
-                == "no_change_hold_loop"
-            and "no_change_hold_loop" in (result.get("stop_reason") or "")
+                == "no_progress_hold_loop"
+            and "no_progress_hold_loop" in (result.get("stop_reason") or "")
             and len(hist_d2) == 3
         ):
             passed += 1
         else:
             failures.append(
                 f"D2: max_cycles=3 + 3xHOLD must classify as "
-                f"no_change_hold_loop — got status={result.get('status')} "
+                f"no_progress_hold_loop — got status={result.get('status')} "
                 f"code={result.get('last_failure_code')} "
                 f"history_len={len(hist_d2)}"
             )
 
         # --- D3. Mixed history (HOLD + READY/PASS) must NOT classify
-        # as no_change_hold_loop. Test the helpers directly because
+        # as no_progress_hold_loop. Test the helpers directly because
         # _self_test_with_smoke uses a single fixture across all cycles.
         total += 1
         history_d3 = [
@@ -1990,7 +2076,7 @@ def self_test() -> tuple[int, int, list[str]]:
             )
 
         # --- D4. 3 HOLD cycles where ANY had code_changed=true must
-        # NOT classify as no_change_hold_loop.
+        # NOT classify as no_progress_hold_loop.
         total += 1
         history_d4 = [
             {"verdict": "HOLD", "code_changed": False},
@@ -2231,14 +2317,14 @@ def self_test() -> tuple[int, int, list[str]]:
             )
 
         # --- N. _hold_loop_root_cause renders telemetry table when the
-        # run terminated via no_change_hold_loop.
+        # run terminated via no_progress_hold_loop.
         total += 1
         st_n = AutopilotState()
         st_n.stop_reason = (
-            "no_change_hold_loop: 3 consecutive HOLD cycles with "
+            "no_progress_hold_loop: 3 consecutive HOLD cycles with "
             "code_changed=false — implementation never reached."
         )
-        st_n.last_failure_code = "no_change_hold_loop"
+        st_n.last_failure_code = "no_progress_hold_loop"
         st_n.history = [
             {
                 "cycle": i, "verdict": "HOLD", "code_changed": False,
@@ -2253,7 +2339,7 @@ def self_test() -> tuple[int, int, list[str]]:
         out_n = _hold_loop_root_cause(st_n)
         joined_n = "\n".join(out_n)
         if (
-            "no_change_hold_loop" in joined_n
+            "no_progress_hold_loop" in joined_n
             and "Cycle별 skip 단계" in joined_n
             and "skipped_hold" in joined_n
             and "soft" in joined_n
@@ -2262,7 +2348,7 @@ def self_test() -> tuple[int, int, list[str]]:
             passed += 1
         else:
             failures.append(
-                f"N: hold_loop_root_cause for no_change_hold_loop — "
+                f"N: hold_loop_root_cause for no_progress_hold_loop — "
                 f"snippet={joined_n[:300]!r}"
             )
 
@@ -2301,7 +2387,7 @@ def self_test() -> tuple[int, int, list[str]]:
         if (
             cls_o_small is None
             and cls_o_short is None
-            and cls_o_full == "no_change_hold_loop"
+            and cls_o_full == "no_progress_hold_loop"
             and cls_o_mixed is None
         ):
             passed += 1

@@ -5390,6 +5390,380 @@ def self_test() -> tuple[int, int, list[str]]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"36G: locked feature drift test raised: {exc}")
 
+    # ----------------------------------------------------------------
+    # Kernel pipeline contract fixtures (run_id, feature_id, validators,
+    # apply preflight). Verifies the deterministic gates that turn
+    # per-symptom HOLD-loop bandaids into a single contract.
+    # ----------------------------------------------------------------
+
+    # 37A. _to_feature_id strips punctuation / whitespace, preserves
+    # hangul + ascii, and is idempotent.
+    total += 1
+    try:
+        a = _cycle._to_feature_id("PassportInkGrid (잉크 도장 그리드)")
+        b = _cycle._to_feature_id("PassportInkGrid (잉크 도장 그리드)")
+        c = _cycle._to_feature_id("Local Visa 배지")
+        if (
+            a == b
+            and a
+            and "passportinkgrid" in a
+            and "잉크" in a
+            and not _cycle._feature_ids_match(a, c)
+            and _cycle._feature_ids_match(a, _cycle._to_feature_id(a))
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37A: _to_feature_id — a={a!r} b={b!r} c={c!r} "
+                f"match_ac={_cycle._feature_ids_match(a, c)}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37A: feature_id helper raised: {exc}")
+
+    # 37B. design_spec accepted with a different feature_id from the
+    # planner fallback → ticket validator must surface
+    # scope_mismatch_preflight (NOT silently proceed). This is the
+    # exact bug the kernel-contract layer is designed to block before
+    # claude_apply spends Claude budget.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = True
+        st.product_planner_status = "generated"
+        st.product_planner_selected_feature = "Local Visa 배지"
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.stale_design_spec_detected = False
+        st.design_spec_feature = (
+            "PassportInkGrid (잉크 도장 그리드) + Share.jsx 접합부 설계"
+        )
+        st.design_spec_feature_id = _cycle._to_feature_id(
+            st.design_spec_feature
+        )
+        st.implementation_ticket_status = "generated"
+        st.implementation_ticket_target_files = [
+            "app/web/src/screens/Share.jsx",
+        ]
+        # Simulate the bug: ticket selected_feature still shows the
+        # stale planner fallback name.
+        st.implementation_ticket_selected_feature = "Local Visa 배지"
+        st.implementation_ticket_feature_id = _cycle._to_feature_id(
+            "Local Visa 배지"
+        )
+        ticket_check = _cycle.validate_implementation_ticket_contract(st)
+        scope_check = _cycle.validate_scope_contract(st)
+        if (
+            not ticket_check["ok"]
+            and ticket_check["code"] == "scope_mismatch_preflight"
+            and not scope_check["ok"]
+            and scope_check["code"] == "scope_mismatch_preflight"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37B: planner-fallback name in ticket should fail "
+                f"validators — ticket={ticket_check['code']} "
+                f"scope={scope_check['code']}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37B: validator scope_mismatch test raised: {exc}")
+
+    # 37C. design_spec accepted + ticket aligned to design_spec
+    # feature_id → all validators pass.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.pm_decision_status = "generated"
+        st.pm_decision_ship_ready = True
+        st.design_spec_status = "generated"
+        st.design_spec_acceptance_passed = True
+        st.stale_design_spec_detected = False
+        st.design_spec_feature = "PassportInkGrid"
+        st.design_spec_feature_id = "passportinkgrid"
+        st.implementation_ticket_status = "generated"
+        st.implementation_ticket_selected_feature = "PassportInkGrid"
+        st.implementation_ticket_feature_id = "passportinkgrid"
+        st.implementation_ticket_target_files = [
+            "app/web/src/screens/Share.jsx",
+        ]
+        st.selected_feature_id = "passportinkgrid"
+        ticket_check = _cycle.validate_implementation_ticket_contract(st)
+        spec_check = _cycle.validate_design_spec_contract(st)
+        scope_check = _cycle.validate_scope_contract(st)
+        if (
+            ticket_check["ok"]
+            and spec_check["ok"]
+            and scope_check["ok"]
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37C: aligned validators — "
+                f"ticket={ticket_check}, spec={spec_check}, "
+                f"scope={scope_check}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37C: aligned validator test raised: {exc}")
+
+    # 37D. validate_apply_preflight refuses when the active rework
+    # feature lock belongs to a different run_id (cross-run lock leak).
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            (Path(tmp) / ".runtime").mkdir(parents=True, exist_ok=True)
+            saved = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                Path(tmp) / ".runtime" / "active_rework_feature.json"
+            )
+            try:
+                _cycle._save_active_rework_feature(
+                    feature="StaleFeature", feature_id="stalefeature",
+                    hold_count=1, hold_type="soft",
+                    run_id="r-old-run",
+                )
+                st = _cycle.CycleState(cycle=1, goal="x")
+                st.run_id = "r-current-run"
+                st.product_planner_status = "generated"
+                st.product_planner_selected_feature = "PassportInkGrid"
+                st.design_spec_status = "generated"
+                st.design_spec_acceptance_passed = True
+                st.design_spec_feature = "PassportInkGrid"
+                st.design_spec_feature_id = "passportinkgrid"
+                st.implementation_ticket_status = "generated"
+                st.implementation_ticket_selected_feature = "PassportInkGrid"
+                st.implementation_ticket_feature_id = "passportinkgrid"
+                st.implementation_ticket_target_files = [
+                    "app/web/src/screens/Share.jsx",
+                ]
+                st.selected_feature_id = "passportinkgrid"
+                pf = _cycle.validate_apply_preflight(st)
+            finally:
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+        if not pf["ok"] and pf["code"] == "feature_lock_conflict":
+            passed += 1
+        else:
+            failures.append(
+                f"37D: cross-run lock must fail apply preflight — pf={pf}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37D: cross-run lock test raised: {exc}")
+
+    # 37E. classify_freshness_by_run_id — same run_id (cycle match) is
+    # current_run; different run_id is stale_run; absent run_id falls
+    # through to cycle comparison.
+    total += 1
+    try:
+        c1 = _cycle.classify_freshness_by_run_id(
+            current_run_id="r-A", artifact_run_id="r-A",
+            artifact_cycle_id=2, current_cycle_id=2,
+        )
+        c2 = _cycle.classify_freshness_by_run_id(
+            current_run_id="r-A", artifact_run_id="r-B",
+            artifact_cycle_id=2, current_cycle_id=2,
+        )
+        c3 = _cycle.classify_freshness_by_run_id(
+            current_run_id="r-A", artifact_run_id=None,
+            artifact_cycle_id=1, current_cycle_id=2,
+        )
+        c4 = _cycle.classify_freshness_by_run_id(
+            current_run_id=None, artifact_run_id=None,
+            artifact_cycle_id=None, current_cycle_id=None,
+        )
+        if (
+            c1 == "current_run"
+            and c2 == "stale_run"
+            and c3 == "previous_cycle"
+            and c4 == "current_run"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37E: run_id freshness classifier — same={c1!r} "
+                f"diff={c2!r} legacy_prev={c3!r} empty={c4!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37E: classify_freshness_by_run_id raised: {exc}")
+
+    # 37F. Stale-run lock cleared on cycle init — when the on-disk
+    # rework lock carries a run_id different from FACTORY_RUN_ID, the
+    # cycle's startup hydration must drop the lock.
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        env_prev = os.environ.get("FACTORY_RUN_ID")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            os.environ["FACTORY_RUN_ID"] = "r-current-cycle"
+            (Path(tmp) / ".runtime").mkdir(parents=True, exist_ok=True)
+            saved = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                Path(tmp) / ".runtime" / "active_rework_feature.json"
+            )
+            try:
+                _cycle._save_active_rework_feature(
+                    feature="OldFeature", feature_id="oldfeature",
+                    hold_count=1, hold_type="soft",
+                    run_id="r-old-run",
+                )
+                lock_pre = _cycle._load_active_rework_feature()
+                # Mirror the cycle.main bootstrap clear: when the lock
+                # carries a different run_id, drop it.
+                cur_run = _cycle._resolve_run_id()
+                cleared = False
+                if (
+                    (lock_pre.get("run_id") or "").strip()
+                    and (lock_pre.get("run_id") or "").strip() != cur_run
+                ):
+                    cleared = _cycle._clear_active_rework_feature()
+                lock_post = _cycle._load_active_rework_feature()
+            finally:
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+                if env_prev is not None:
+                    os.environ["FACTORY_RUN_ID"] = env_prev
+                else:
+                    os.environ.pop("FACTORY_RUN_ID", None)
+        if (
+            lock_pre.get("run_id") == "r-old-run"
+            and cur_run == "r-current-cycle"
+            and cleared is True
+            and lock_post == {}
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37F: stale-run lock clear — pre={lock_pre} "
+                f"cur={cur_run!r} cleared={cleared} post={lock_post}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37F: stale-run lock clear test raised: {exc}")
+
+    # 37G. Stale-artifact preflight: design_spec.md on disk carries
+    # a different run_id than current → preflight returns
+    # stale_artifact_preflight, NOT scope_mismatch.
+    total += 1
+    try:
+        repo_prev = os.environ.get("LOCAL_RUNNER_REPO")
+        env_prev = os.environ.get("FACTORY_RUN_ID")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["LOCAL_RUNNER_REPO"] = tmp
+            os.environ["FACTORY_RUN_ID"] = "r-current"
+            runtime = Path(tmp) / ".runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            saved_ds = _cycle.DESIGN_SPEC_FILE
+            saved_it = _cycle.IMPLEMENTATION_TICKET_FILE
+            saved_ar = _cycle.ACTIVE_REWORK_FEATURE_FILE
+            _cycle.DESIGN_SPEC_FILE = runtime / "design_spec.md"
+            _cycle.IMPLEMENTATION_TICKET_FILE = runtime / "implementation_ticket.md"
+            _cycle.ACTIVE_REWORK_FEATURE_FILE = (
+                runtime / "active_rework_feature.json"
+            )
+            try:
+                # Stale design_spec from a previous run.
+                stale_body = (
+                    "<!--\nstampport_artifact\n"
+                    "cycle_id: 7\nrun_id: r-old\n"
+                    "stage: design_spec\n"
+                    "source_agent: designer\n"
+                    "created_at: 2026-05-01T00:00:00Z\n-->\n\n"
+                    "# Stampport Design Implementation Spec\n"
+                )
+                _cycle.DESIGN_SPEC_FILE.write_text(
+                    stale_body, encoding="utf-8"
+                )
+                # Fresh ticket with run_id matching current.
+                fresh_ticket = (
+                    "<!--\nstampport_artifact\n"
+                    "cycle_id: 1\nrun_id: r-current\n"
+                    "stage: implementation_ticket\n"
+                    "source_agent: pm\n"
+                    "created_at: 2026-05-03T00:00:00Z\n-->\n\n"
+                    "# Implementation Ticket\n"
+                )
+                _cycle.IMPLEMENTATION_TICKET_FILE.write_text(
+                    fresh_ticket, encoding="utf-8"
+                )
+                st = _cycle.CycleState(cycle=1, goal="x")
+                st.run_id = "r-current"
+                st.design_spec_status = "generated"
+                st.design_spec_acceptance_passed = True
+                st.stale_design_spec_detected = False
+                st.design_spec_feature = "PassportInkGrid"
+                st.design_spec_feature_id = "passportinkgrid"
+                st.implementation_ticket_status = "generated"
+                st.implementation_ticket_selected_feature = "PassportInkGrid"
+                st.implementation_ticket_feature_id = "passportinkgrid"
+                st.implementation_ticket_target_files = [
+                    "app/web/src/screens/Share.jsx",
+                ]
+                st.selected_feature_id = "passportinkgrid"
+                pf = _cycle.validate_apply_preflight(st)
+            finally:
+                _cycle.DESIGN_SPEC_FILE = saved_ds
+                _cycle.IMPLEMENTATION_TICKET_FILE = saved_it
+                _cycle.ACTIVE_REWORK_FEATURE_FILE = saved_ar
+                if repo_prev is not None:
+                    os.environ["LOCAL_RUNNER_REPO"] = repo_prev
+                else:
+                    os.environ.pop("LOCAL_RUNNER_REPO", None)
+                if env_prev is not None:
+                    os.environ["FACTORY_RUN_ID"] = env_prev
+                else:
+                    os.environ.pop("FACTORY_RUN_ID", None)
+        if not pf["ok"] and pf["code"] == "stale_artifact_preflight":
+            passed += 1
+        else:
+            failures.append(
+                f"37G: stale design_spec must fail preflight as "
+                f"stale_artifact_preflight — pf={pf}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37G: stale-artifact preflight test raised: {exc}")
+
+    # 37H. validate_planner_contract — missing planner output fails
+    # with missing_planner; planner without selected_feature fails
+    # with missing_selected_feature.
+    total += 1
+    try:
+        st = _cycle.CycleState(cycle=1, goal="x")
+        st.product_planner_status = "skipped"
+        st.planner_revision_status = "skipped"
+        empty = _cycle.validate_planner_contract(st)
+        st2 = _cycle.CycleState(cycle=1, goal="x")
+        st2.product_planner_status = "generated"
+        st2.product_planner_selected_feature = ""
+        no_feature = _cycle.validate_planner_contract(st2)
+        st3 = _cycle.CycleState(cycle=1, goal="x")
+        st3.product_planner_status = "generated"
+        st3.product_planner_selected_feature = "PassportInkGrid"
+        st3.selected_feature_id = "passportinkgrid"
+        ok = _cycle.validate_planner_contract(st3)
+        if (
+            not empty["ok"]
+            and empty["code"] == "missing_planner"
+            and not no_feature["ok"]
+            and no_feature["code"] == "missing_selected_feature"
+            and ok["ok"]
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"37H: planner contract — empty={empty['code']} "
+                f"no_feature={no_feature['code']} ok={ok['code']}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"37H: planner contract test raised: {exc}")
+
     return passed, total, failures
 
 
