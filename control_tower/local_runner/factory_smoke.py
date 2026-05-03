@@ -280,6 +280,11 @@ class SmokeRun:
     changed_files: list[str] = field(default_factory=list)
     stale_artifacts_moved: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Unified pipeline decision contract — single source of truth for
+    # autopilot publish/commit/push gating. Mirrored from
+    # factory_state.pipeline_decision (or recomputed from the same
+    # factory_state when older runtime files lack the field).
+    pipeline_decision: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1112,8 @@ def _finalize_run(
                 prior = obs.name
         run.last_successful_stage = prior
 
+    run.pipeline_decision = _resolve_pipeline_decision(factory_state)
+
     write_outputs(run, factory_state, observer_classification)
     return run
 
@@ -1215,6 +1222,7 @@ def _serialize_run(run: SmokeRun) -> dict:
         "stale_artifacts_moved": list(run.stale_artifacts_moved),
         "stages": [_serialize_stage(s) for s in run.stages],
         "notes": list(run.notes),
+        "pipeline_decision": dict(run.pipeline_decision or {}),
     }
 
 
@@ -1264,6 +1272,7 @@ def _build_report(
         f"— commit/push 실행 여부: `{run.publish_executed}`",
     ]
 
+    lines.extend(_build_pipeline_decision_section(run, factory_state))
     lines.extend(_build_design_spec_section(run))
     lines.extend(_build_stale_design_spec_section(run))
     lines.extend(_build_scope_consistency_section(run))
@@ -1332,6 +1341,68 @@ def _build_report(
         lines += ["", "## Notes"]
         lines.extend(f"- {n}" for n in run.notes)
     return "\n".join(lines) + "\n"
+
+
+def _resolve_pipeline_decision(factory_state: dict | None) -> dict:
+    """Return the PipelineDecision contract for `factory_state`.
+
+    Prefers the dict cycle.py wrote into factory_state.json (so smoke
+    sees byte-identical numbers to the cycle that produced them) and
+    falls back to recomputing via cycle.build_pipeline_decision when
+    the contract field is missing — keeps older runtime files working
+    without forcing a rebuild.
+    """
+    factory_state = factory_state or {}
+    decision = factory_state.get("pipeline_decision")
+    if isinstance(decision, dict) and decision:
+        return decision
+    try:
+        from . import cycle as _cycle
+        return _cycle.build_pipeline_decision(factory_state)
+    except Exception:  # noqa: BLE001
+        return {
+            "pipeline_status": "blocked",
+            "can_commit": False,
+            "can_push": False,
+            "can_publish": False,
+            "blocking_code": "pipeline_decision_unavailable",
+            "blocking_reason": (
+                "factory_state.pipeline_decision missing and "
+                "build_pipeline_decision import failed"
+            ),
+            "checks": {},
+            "evidence": {},
+        }
+
+
+def _build_pipeline_decision_section(
+    run: SmokeRun, factory_state: dict | None
+) -> list[str]:
+    """Render the unified Pipeline Decision contract — the single source
+    of truth for autopilot publish/commit/push gating. Empty when the
+    decision is unavailable (legacy runtime file, broken import)."""
+    decision = _resolve_pipeline_decision(factory_state)
+    if not decision:
+        return []
+    out = ["", "## Pipeline Decision"]
+    out.append(f"- pipeline_status: `{decision.get('pipeline_status') or '—'}`")
+    out.append(f"- can_commit: `{decision.get('can_commit')}`")
+    out.append(f"- can_push: `{decision.get('can_push')}`")
+    out.append(f"- can_publish: `{decision.get('can_publish')}`")
+    out.append(f"- blocking_code: `{decision.get('blocking_code') or '—'}`")
+    reason = decision.get("blocking_reason") or "—"
+    if isinstance(reason, str) and len(reason) > 200:
+        reason = reason[:197] + "…"
+    out.append(f"- blocking_reason: {reason}")
+    checks = decision.get("checks") or {}
+    if checks:
+        out.extend(["", "| check | status |", "|-------|--------|"])
+        for name in (
+            "planner", "ticket", "apply", "qa", "scope", "meaningful_change"
+        ):
+            if name in checks:
+                out.append(f"| {name} | `{checks[name]}` |")
+    return out
 
 
 def _build_design_spec_section(run: SmokeRun) -> list[str]:

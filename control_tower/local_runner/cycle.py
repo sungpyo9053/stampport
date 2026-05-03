@@ -692,7 +692,7 @@ class CycleState:
     docs_only: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "status": self.status,
             "current_stage": self.current_stage,
             "current_task": self.current_task,
@@ -856,6 +856,24 @@ class CycleState:
             "control_tower_changed": self.control_tower_changed,
             "docs_only": self.docs_only,
         }
+        # Pipeline decision contract — the single source of truth for
+        # autopilot publish/commit/push gating. Computed from this same
+        # dict so smoke / autopilot / observer all see the identical
+        # verdict cycle.py used to reach its own conclusion.
+        try:
+            payload["pipeline_decision"] = build_pipeline_decision(payload)
+        except Exception as exc:  # noqa: BLE001
+            payload["pipeline_decision"] = {
+                "pipeline_status": "blocked",
+                "can_commit": False,
+                "can_push": False,
+                "can_publish": False,
+                "blocking_code": "pipeline_decision_error",
+                "blocking_reason": f"build_pipeline_decision raised: {exc}",
+                "checks": {},
+                "evidence": {},
+            }
+        return payload
 
 
 def _load_cycle_number() -> int:
@@ -6193,6 +6211,212 @@ def validate_apply_preflight(state: "CycleState") -> dict:
             "stale_lock_cleared": stale_lock_cleared,
         },
     )
+
+
+def build_pipeline_decision(state) -> dict:
+    """Single source of truth for autopilot publish/commit/push gating.
+
+    Pure function — accepts either a CycleState instance or a raw
+    factory_state.json dict (so smoke / autopilot / observer can call
+    it without depending on the live CycleState class) and returns a
+    PipelineDecision contract:
+
+        {
+          "pipeline_status": "blocked"|"hold"|"ready_to_review"|
+                             "ready_to_publish"|"published",
+          "can_commit": bool,
+          "can_push": bool,
+          "can_publish": bool,
+          "blocking_code": str | None,
+          "blocking_reason": str | None,
+          "checks": { "planner", "ticket", "apply", "qa", "scope",
+                      "meaningful_change" → "passed"|"failed"|"skipped" },
+          "evidence": {...},
+        }
+
+    can_publish is true iff ALL of the following hold:
+      * implementation_ticket_status == "generated"
+      * claude_apply_status == "applied"
+      * changed_files_count > 0 (or claude_apply_changed_files non-empty)
+      * qa_status == "passed"
+      * apply_preflight_status == "passed"
+      * failed_stage is empty
+      * failed_reason is empty
+
+    Legacy scope_consistency_status is surfaced under checks["scope"]
+    for compatibility but is intentionally NOT a publish-blocker on its
+    own — it would otherwise trip auto-publish whenever a cycle
+    happened to leave the field null while every "real" pipeline gate
+    passed.
+    """
+    if hasattr(state, "to_dict") and callable(getattr(state, "to_dict")):
+        s = state.to_dict()
+    elif isinstance(state, dict):
+        s = state
+    else:
+        s = {}
+
+    def _norm(v):
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    ticket_status = _norm(s.get("implementation_ticket_status"))
+    apply_status = _norm(s.get("claude_apply_status"))
+    qa_status = _norm(s.get("qa_status"))
+    preflight_status = _norm(s.get("apply_preflight_status"))
+    failed_stage = _norm(s.get("failed_stage"))
+    failed_reason = _norm(s.get("failed_reason"))
+    scope_status = _norm(s.get("scope_consistency_status"))
+    qa_failed_reason = _norm(s.get("qa_failed_reason"))
+    planner_status = _norm(s.get("product_planner_status"))
+    planner_revision_status = _norm(s.get("planner_revision_status"))
+
+    changed_files = list(s.get("claude_apply_changed_files") or [])
+    raw_count = s.get("changed_files_count")
+    try:
+        changed_files_count = int(raw_count) if raw_count is not None else len(changed_files)
+    except (TypeError, ValueError):
+        changed_files_count = len(changed_files)
+    has_changes = changed_files_count > 0 or len(changed_files) > 0
+
+    checks: dict[str, str] = {}
+
+    has_planner = (
+        planner_status in {"generated", "fallback_generated"}
+        or planner_revision_status in {"generated", "fallback_generated"}
+    )
+    if has_planner:
+        checks["planner"] = "passed"
+    elif planner_status in {"", "skipped"} and planner_revision_status in {"", "skipped"}:
+        checks["planner"] = "skipped"
+    else:
+        checks["planner"] = "failed"
+
+    if ticket_status == "generated":
+        checks["ticket"] = "passed"
+    elif ticket_status in {"", "skipped", "skipped_hold"}:
+        checks["ticket"] = "skipped"
+    else:
+        checks["ticket"] = "failed"
+
+    if preflight_status == "passed":
+        checks["apply"] = "passed"
+    elif preflight_status == "":
+        checks["apply"] = "skipped"
+    else:
+        checks["apply"] = "failed"
+
+    if qa_status == "passed":
+        checks["qa"] = "passed"
+    elif qa_status in {"", "skipped"}:
+        checks["qa"] = "skipped"
+    else:
+        checks["qa"] = "failed"
+
+    if scope_status == "passed":
+        checks["scope"] = "passed"
+    elif scope_status == "failed":
+        checks["scope"] = "failed"
+    else:
+        checks["scope"] = "skipped"
+
+    checks["meaningful_change"] = "passed" if has_changes else "failed"
+
+    apply_ok = apply_status == "applied"
+
+    blocking_code: str | None = None
+    blocking_reason: str | None = None
+
+    if failed_stage:
+        blocking_code = "stage_failed"
+        blocking_reason = (
+            f"failed_stage={failed_stage}"
+            + (f": {failed_reason}" if failed_reason else "")
+        )
+    elif failed_reason:
+        blocking_code = "stage_failed"
+        blocking_reason = f"failed_reason={failed_reason}"
+    elif checks["ticket"] != "passed":
+        blocking_code = "missing_ticket_contract"
+        blocking_reason = (
+            f"implementation_ticket_status={ticket_status or 'missing'}"
+        )
+    elif not apply_ok:
+        blocking_code = "apply_not_completed"
+        blocking_reason = f"claude_apply_status={apply_status or 'missing'}"
+    elif checks["apply"] != "passed":
+        blocking_code = "apply_preflight_failed"
+        blocking_reason = (
+            f"apply_preflight_status={preflight_status or 'missing'}"
+        )
+    elif not has_changes:
+        blocking_code = "no_meaningful_change"
+        blocking_reason = (
+            "claude_apply_changed_files empty (no meaningful diff)"
+        )
+    elif checks["qa"] != "passed":
+        blocking_code = "qa_failed"
+        reason_tail = qa_failed_reason or "no reason recorded"
+        blocking_reason = (
+            f"qa_status={qa_status or 'missing'} ({reason_tail})"
+        )
+
+    can_publish = (
+        blocking_code is None
+        and ticket_status == "generated"
+        and apply_ok
+        and has_changes
+        and qa_status == "passed"
+        and preflight_status == "passed"
+        and not failed_stage
+        and not failed_reason
+    )
+    can_commit = (
+        blocking_code is None
+        and apply_ok
+        and has_changes
+        and not failed_stage
+        and not failed_reason
+    )
+    can_push = can_commit and qa_status == "passed"
+
+    if can_publish:
+        pipeline_status = "ready_to_publish"
+    elif blocking_code in {"stage_failed", "qa_failed", "apply_preflight_failed"}:
+        pipeline_status = "blocked"
+    elif blocking_code in {
+        "missing_ticket_contract",
+        "apply_not_completed",
+        "no_meaningful_change",
+    }:
+        pipeline_status = "hold"
+    else:
+        pipeline_status = "ready_to_review"
+
+    evidence = {
+        "implementation_ticket_status": ticket_status or None,
+        "claude_apply_status": apply_status or None,
+        "qa_status": qa_status or None,
+        "qa_failed_reason": qa_failed_reason or None,
+        "apply_preflight_status": preflight_status or None,
+        "failed_stage": failed_stage or None,
+        "failed_reason": failed_reason or None,
+        "scope_consistency_status": s.get("scope_consistency_status"),
+        "changed_files_count": changed_files_count,
+        "changed_files_sample": changed_files[:6],
+    }
+
+    return {
+        "pipeline_status": pipeline_status,
+        "can_commit": bool(can_commit),
+        "can_push": bool(can_push),
+        "can_publish": bool(can_publish),
+        "blocking_code": blocking_code,
+        "blocking_reason": blocking_reason,
+        "checks": checks,
+        "evidence": evidence,
+    }
 
 
 def classify_freshness_by_run_id(

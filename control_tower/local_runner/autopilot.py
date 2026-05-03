@@ -702,13 +702,61 @@ def _scan_changed_files_for_risk(paths: list[str]) -> list[str]:
     return hits
 
 
+def _resolve_pipeline_decision(factory_state: dict) -> dict:
+    """Return the PipelineDecision contract for `factory_state`.
+
+    Prefers the contract cycle.py wrote into factory_state.json directly
+    so smoke / autopilot / observer all agree byte-for-byte. Falls back
+    to recomputing via cycle.build_pipeline_decision when the field is
+    missing — that path keeps older runtime files (written before the
+    contract existed) working without forcing a re-run.
+    """
+    decision = factory_state.get("pipeline_decision")
+    if isinstance(decision, dict) and decision:
+        return decision
+    try:
+        # Local import — autopilot.py is stdlib-only as a hard rule but
+        # cycle.py lives in the same package, so this stays import-safe.
+        from . import cycle as _cycle
+        return _cycle.build_pipeline_decision(factory_state)
+    except Exception:  # noqa: BLE001
+        return {
+            "pipeline_status": "blocked",
+            "can_commit": False,
+            "can_push": False,
+            "can_publish": False,
+            "blocking_code": "pipeline_decision_unavailable",
+            "blocking_reason": (
+                "factory_state.pipeline_decision missing and "
+                "build_pipeline_decision import failed"
+            ),
+            "checks": {},
+            "evidence": {},
+        }
+
+
 def evaluate_publish_gate(
     smoke_state: dict, factory_state: dict, *, require_scope: bool
 ) -> tuple[bool, str | None, dict]:
-    """Apply the auto-publish pre-conditions enumerated in spec §4.
+    """Apply the auto-publish pre-conditions.
+
+    Delegates the cycle-level publish/commit/push verdict to
+    `pipeline_decision.can_publish` (the single source of truth) and
+    layers autopilot-specific guards on top:
+      * smoke verdict must be READY/PASS
+      * no risky paths in the change set
+      * git branch must be `main`
+
+    `require_scope` is preserved for backwards compatibility but no
+    longer fails the gate on its own when every other publish check
+    passes — that legacy behaviour was the source of the
+    "scope_consistency_status=null blocks publish" bug.
 
     Returns (ok, failure_reason, evidence_dict).
     """
+    decision = _resolve_pipeline_decision(factory_state)
+    changed_files = factory_state.get("claude_apply_changed_files") or []
+
     evidence: dict[str, Any] = {
         "factory_status": factory_state.get("status"),
         "qa_status": factory_state.get("qa_status"),
@@ -718,74 +766,47 @@ def evaluate_publish_gate(
             "implementation_ticket_status"
         ),
         "claude_apply_status": factory_state.get("claude_apply_status"),
+        "apply_preflight_status": factory_state.get("apply_preflight_status"),
         "design_spec_acceptance_passed": factory_state.get(
             "design_spec_acceptance_passed"
         ),
         "design_spec_status": factory_state.get("design_spec_status"),
-        "changed_files_count": len(
-            factory_state.get("claude_apply_changed_files") or []
-        ),
+        "changed_files_count": len(changed_files),
         "branch": _git_branch(),
+        "pipeline_status": decision.get("pipeline_status"),
+        "pipeline_blocking_code": decision.get("blocking_code"),
+        "pipeline_blocking_reason": decision.get("blocking_reason"),
+        "pipeline_checks": decision.get("checks") or {},
     }
 
-    # 1. factory_state.status must be terminal-success.
-    f_status = (factory_state.get("status") or "").strip()
-    if f_status not in {"succeeded", "completed", "ready_to_review",
-                        "ready_to_publish"}:
-        return False, f"factory_state.status='{f_status}' not terminal-success", evidence
+    if not decision.get("can_publish"):
+        code = decision.get("blocking_code") or "pipeline_not_ready"
+        reason_text = decision.get("blocking_reason") or "pipeline gate not ready"
+        return False, f"{code}: {reason_text}", evidence
 
-    # 2. qa_status passed.
-    qa = (factory_state.get("qa_status") or "").strip()
-    if qa != "passed":
-        return False, f"qa_status='{qa or 'missing'}', expected passed", evidence
-
-    # 3. scope_consistency_status passed (if required).
+    # Hard scope-mismatch override: even when can_publish=true, if the
+    # legacy scope check explicitly reports `failed` and the operator
+    # asked for scope enforcement, refuse — that's a real diff/spec
+    # divergence, not the legacy null-field bug.
     if require_scope:
         scope = (factory_state.get("scope_consistency_status") or "").strip()
-        if scope != "passed":
+        if scope == "failed":
             reason = factory_state.get("scope_mismatch_reason") or "(no reason)"
             return False, (
-                f"scope_consistency_status='{scope or 'missing'}' "
-                f"({reason})"
+                f"scope_consistency_status='failed' ({reason})"
             ), evidence
 
-    # 4. design_spec_acceptance — only enforce when the cycle is in
-    # design-spec mode (design_spec_status reports anything non-empty).
-    spec_status = (factory_state.get("design_spec_status") or "").strip()
-    spec_passed = factory_state.get("design_spec_acceptance_passed")
-    if spec_status and spec_status not in {"missing", "skipped"}:
-        if spec_passed is False or spec_passed is None:
-            return False, (
-                f"design_spec_acceptance_passed={spec_passed} "
-                f"(status={spec_status})"
-            ), evidence
-
-    # 5. implementation_ticket / claude_apply.
-    ticket = (factory_state.get("implementation_ticket_status") or "").strip()
-    if ticket != "generated":
-        return False, f"implementation_ticket_status='{ticket}'", evidence
-    apply_status = (factory_state.get("claude_apply_status") or "").strip()
-    if apply_status != "applied":
-        return False, f"claude_apply_status='{apply_status}'", evidence
-
-    # 6. changed_files_count > 0 + risky scan.
-    changed_files = factory_state.get("claude_apply_changed_files") or []
-    if not changed_files:
-        return False, "changed_files_count=0", evidence
-    risky = _scan_changed_files_for_risk(changed_files)
+    risky = _scan_changed_files_for_risk(list(changed_files))
     if risky:
         evidence["risky_changed_files"] = risky[:10]
         return False, (
             f"risky paths in changed_files: {', '.join(risky[:3])}"
         ), evidence
 
-    # 7. Smoke verdict must be a ready/pass — caller normally pre-checks
-    # but we re-verify here so the gate is composable.
     sv = (smoke_state.get("verdict") or "").strip()
     if sv not in READY_VERDICTS:
         return False, f"smoke verdict={sv} not READY/PASS", evidence
 
-    # 8. Branch must be main for auto_publish.
     branch = evidence["branch"]
     if branch and branch != "main":
         return False, f"branch={branch}, expected main", evidence
@@ -1269,6 +1290,31 @@ def _format_report(state: AutopilotState) -> str:
                 f"| {c.get('code') or '—'} "
                 f"| {msg} |"
             )
+
+    decision = _resolve_pipeline_decision(fs)
+    lines += [
+        "",
+        "## Pipeline Decision",
+        "",
+        f"- pipeline_status: `{decision.get('pipeline_status') or '—'}`",
+        f"- can_commit: `{decision.get('can_commit')}`",
+        f"- can_push: `{decision.get('can_push')}`",
+        f"- can_publish: `{decision.get('can_publish')}`",
+        f"- blocking_code: `{decision.get('blocking_code') or '—'}`",
+        f"- blocking_reason: {decision.get('blocking_reason') or '—'}",
+    ]
+    checks = decision.get("checks") or {}
+    if checks:
+        lines += [
+            "",
+            "| check | status |",
+            "|-------|--------|",
+        ]
+        for name in (
+            "planner", "ticket", "apply", "qa", "scope", "meaningful_change"
+        ):
+            if name in checks:
+                lines.append(f"| {name} | `{checks[name]}` |")
     lines += [
         "",
         "## Cycle log",
@@ -1896,6 +1942,7 @@ def self_test() -> tuple[int, int, list[str]]:
             "status": "succeeded",
             "qa_status": "passed",
             "scope_consistency_status": "passed",
+            "apply_preflight_status": "passed",
             "implementation_ticket_status": "generated",
             "claude_apply_status": "applied",
             "claude_apply_changed_files": ["app/web/src/screens/Foo.jsx"],
@@ -2415,6 +2462,194 @@ def self_test() -> tuple[int, int, list[str]]:
                 f"P: 3xHOLD+no-change must hit "
                 f"NO_CHANGE_HOLD_STOP_THRESHOLD (got n="
                 f"{_consecutive_no_change_holds(history_p)})"
+            )
+
+        # --- PD-A. PipelineDecision: legacy scope null with everything else
+        # green must NOT block can_publish. Regression for the
+        # scope_consistency_status=null bug that froze auto-publish.
+        from . import cycle as _cycle  # local import: stdlib-only at module level
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "succeeded",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["a.py", "b.py", "c.py", "d.py", "e.py"],
+            "scope_consistency_status": None,
+        })
+        if (
+            decision.get("can_publish") is True
+            and decision.get("blocking_code") is None
+            and decision.get("pipeline_status") == "ready_to_publish"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-A: scope_consistency_status=None must NOT block "
+                f"can_publish — got decision={decision}"
+            )
+
+        # --- PD-B. ticket missing → blocking_code=missing_ticket_contract.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "succeeded",
+            "implementation_ticket_status": "skipped",
+            "claude_apply_status": "applied",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["a.py"],
+        })
+        if (
+            decision.get("can_publish") is False
+            and decision.get("blocking_code") == "missing_ticket_contract"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-B: ticket missing must blocking_code="
+                f"missing_ticket_contract — got {decision}"
+            )
+
+        # --- PD-C. claude_apply_status=retry_required → apply_not_completed.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "running",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "retry_required",
+            "qa_status": "skipped",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": [],
+        })
+        if (
+            decision.get("can_publish") is False
+            and decision.get("blocking_code") == "apply_not_completed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-C: claude_apply_status=retry_required must blocking_code="
+                f"apply_not_completed — got {decision}"
+            )
+
+        # --- PD-D. qa_status=failed → blocking_code=qa_failed.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "failed",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "qa_status": "failed",
+            "qa_failed_reason": "build_artifact missing",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["a.py"],
+        })
+        if (
+            decision.get("can_publish") is False
+            and decision.get("blocking_code") == "qa_failed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-D: qa_status=failed must blocking_code=qa_failed — "
+                f"got {decision}"
+            )
+
+        # --- PD-E. failed_stage set → blocking_code=stage_failed.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "failed",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["a.py"],
+            "failed_stage": "claude_apply",
+            "failed_reason": "build_app revalidation failed",
+        })
+        if (
+            decision.get("can_publish") is False
+            and decision.get("blocking_code") == "stage_failed"
+            and "claude_apply" in (decision.get("blocking_reason") or "")
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-E: failed_stage set must blocking_code=stage_failed — "
+                f"got {decision}"
+            )
+
+        # --- PD-F. no changed files → blocking_code=no_meaningful_change.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "succeeded",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": [],
+            "changed_files_count": 0,
+        })
+        if (
+            decision.get("can_publish") is False
+            and decision.get("blocking_code") == "no_meaningful_change"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-F: changed_files=[] must blocking_code="
+                f"no_meaningful_change — got {decision}"
+            )
+
+        # --- PD-G. Full happy path with scope_consistency_status=None →
+        # autopilot must NOT halt with publish-gate-blocked. Regression
+        # for the bug where legacy scope null froze auto-publish even
+        # though every real gate had passed.
+        total += 1
+        happy_factory = {
+            "status": "succeeded",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "claude_apply_changed_files": ["app/web/src/screens/Foo.jsx"],
+            "design_spec_acceptance_passed": True,
+            "design_spec_status": "accepted",
+            "selected_feature": "PD-G fixture",
+            # scope_consistency_status intentionally omitted (legacy null)
+        }
+        happy_smoke = {
+            "verdict": "READY_TO_REVIEW",
+            "failure_code": None,
+            "factory_status": "ready_to_review",
+            "qa_status": "passed",
+            "scope_consistency_status": None,
+            "changed_files_count": 1,
+            "changed_files": ["app/web/src/screens/Foo.jsx"],
+        }
+        result = _self_test_with_smoke(
+            happy_smoke, happy_factory,
+            config=AutopilotConfig(
+                autopilot_mode="auto_publish", max_cycles=1, max_hours=0.1,
+                stop_on_hold=False, require_scope_consistency=True,
+                require_render_check=True, require_api_health=False,
+            ),
+            git_dirty_override=True,
+            render_override={"ok": True, "status": "passed", "message": "ok"},
+            git_commit_override=(True, "feedfacecafe1234", "ok"),
+            git_push_override=(True, "ok"),
+        )
+        last = (result.get("history") or [{}])[-1]
+        if (
+            last.get("publish_action") == "push"
+            and last.get("push_status") == "succeeded"
+            and "publish gate blocked" not in (result.get("stop_reason") or "")
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-G: happy path with scope_consistency=None must reach "
+                f"push — got publish_action={last.get('publish_action')} "
+                f"push={last.get('push_status')} reason={result.get('stop_reason')}"
             )
 
     # Restore env.

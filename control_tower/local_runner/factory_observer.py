@@ -110,6 +110,9 @@ DIAGNOSTIC_CODES: tuple[str, ...] = (
     "qa_not_run",
     "qa_gate_failed",
     "claude_apply_failed_no_code_change",
+    "claude_apply_not_applied",
+    "apply_preflight_failed",
+    "pipeline_stage_failed",
     "publish_required",
     "actions_pending_timeout",
     "old_deploy_failed_stale",
@@ -705,6 +708,87 @@ def _looks_like_publish_disabled_review(state: dict) -> bool:
     )
 
 
+# pipeline_decision.blocking_code → observer diagnostic_code. The observer
+# classifies publish-gate failures from this contract instead of the
+# legacy individual fields, so a single ambiguous null (e.g.
+# scope_consistency_status) cannot trip a false-positive failure when
+# every other gate passes.
+PIPELINE_BLOCKING_CODE_TO_DIAGNOSTIC: dict[str, str] = {
+    "missing_ticket_contract": "implementation_ticket_missing",
+    "apply_not_completed": "claude_apply_not_applied",
+    "apply_preflight_failed": "apply_preflight_failed",
+    "no_meaningful_change": "claude_apply_failed_no_code_change",
+    "qa_failed": "qa_gate_failed",
+    "stage_failed": "pipeline_stage_failed",
+}
+
+
+PIPELINE_DECISION_GATEABLE_STATUSES: frozenset[str] = frozenset({
+    "ready_to_publish",
+    "ready_to_review",
+    "succeeded",
+    "completed",
+    "failed",
+    "blocked",
+})
+
+
+def _classify_from_pipeline_decision(state: dict) -> dict | None:
+    """Return an observer classification derived from
+    `factory_state.pipeline_decision`, or None if the contract isn't
+    available / isn't decisive.
+
+    Only fires when:
+      * the decision is present and says publish is blocked,
+      * factory_state.status is one of the gateable statuses (the cycle
+        actually reached the apply/QA stage — HOLD / planning_only /
+        idle states are owned by other rules), and
+      * `blocking_code` maps to a known diagnostic.
+
+    Healthy / ready states are intentionally NOT promoted here — the
+    existing publish_required / ready_to_review rules already cover
+    those.
+    """
+    fs = state.get("factory_state") or {}
+    decision = fs.get("pipeline_decision") or {}
+    if not isinstance(decision, dict) or not decision:
+        return None
+    if decision.get("can_publish"):
+        return None
+    fs_status = _str(fs.get("status"))
+    if fs_status not in PIPELINE_DECISION_GATEABLE_STATUSES:
+        return None
+    code = (decision.get("blocking_code") or "").strip()
+    if not code:
+        return None
+    diag = PIPELINE_BLOCKING_CODE_TO_DIAGNOSTIC.get(code)
+    if not diag:
+        return None
+    reason = decision.get("blocking_reason") or "(no reason)"
+    checks = decision.get("checks") or {}
+    evidence = [
+        f"pipeline_decision.blocking_code={code}",
+        f"pipeline_decision.pipeline_status={decision.get('pipeline_status') or '—'}",
+        f"pipeline_decision.blocking_reason={reason}",
+    ]
+    if checks:
+        compact = ", ".join(f"{k}={v}" for k, v in sorted(checks.items()))
+        evidence.append(f"pipeline_decision.checks={compact}")
+    severity = "warning" if diag == "claude_apply_failed_no_code_change" else "error"
+    return {
+        "diagnostic_code": diag,
+        "severity": severity,
+        "category": "failure",
+        "root_cause": (
+            f"pipeline_decision.blocking_code={code} — autopilot publish "
+            f"gate refused: {reason}"
+        ),
+        "evidence": evidence,
+        "auto_fix_possible": False,
+        "is_failure": True,
+    }
+
+
 def _ready_to_review_evidence(state: dict) -> list[str]:
     fs = state.get("factory_state") or {}
     cs = state.get("control_state") or {}
@@ -985,6 +1069,16 @@ def classify(
             "auto_fix_possible": False,
             "is_failure": False,
         }
+
+    # 2.95 pipeline_decision-driven classification — when cycle.py wrote
+    # a unified PipelineDecision contract into factory_state and it says
+    # publish is blocked, route the diagnostic by `blocking_code`. This
+    # supersedes the legacy field-shape fallbacks below so a single
+    # ambiguous null (e.g. scope_consistency_status=None) cannot trip a
+    # false-positive failure when every other publish gate passes.
+    pipeline_class = _classify_from_pipeline_decision(state)
+    if pipeline_class is not None:
+        return pipeline_class
 
     # 3. CURRENT-STATE PROMOTION — if any canonical state file already
     # carries a known diagnostic_code, promote it to the final verdict.
