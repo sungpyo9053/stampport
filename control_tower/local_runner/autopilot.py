@@ -247,6 +247,20 @@ class AutopilotState:
     stop_reason: str | None = None
     report_path: str | None = None
     history: list[dict] = field(default_factory=list)
+    # Stuck-before-first-cycle diagnostic fields. The autopilot loop
+    # writes these around every smoke spawn so the dashboard can tell
+    # the difference between "loop is alive but blocked on a slow
+    # smoke" and "loop is alive and stuck — first smoke never spawned".
+    #   first_cycle_spawn_at      — set the first time the loop calls
+    #                                _run_smoke_cycle. None until then.
+    #   current_cycle_started_at  — set at the start of every smoke
+    #                                spawn. UI compares vs finished_at
+    #                                to detect a cycle in flight.
+    #   current_cycle_finished_at — set when the smoke subprocess
+    #                                returns. >= started_at when idle.
+    first_cycle_spawn_at: str | None = None
+    current_cycle_started_at: str | None = None
+    current_cycle_finished_at: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -963,7 +977,27 @@ def run_loop(config: AutopilotConfig, stop_event: threading.Event) -> None:
             rec = CycleRecord(cycle=cycle, started_at=_utc_now())
             _log(f"cycle {cycle} starting")
 
+            # Stuck-before-first-cycle diagnostic: stamp first_cycle_spawn_at
+            # the very first time we're about to spawn a smoke. Also set
+            # current_cycle_started_at so the dashboard can tell the
+            # autopilot loop is actively spawning vs hung between cycles.
+            with _LOCK:
+                now = _utc_now()
+                if _STATE.first_cycle_spawn_at is None:
+                    _STATE.first_cycle_spawn_at = now
+                _STATE.current_cycle_started_at = now
+                # Leave finished_at as it was — pre-spawn we set it to
+                # the previous finish so started > finished signals
+                # "in flight".
+            _save_state()
+
             smoke = _run_smoke_cycle(config.smoke_timeout_sec)
+
+            # Mark the smoke subprocess complete so the UI can flip
+            # off "cycle in flight".
+            with _LOCK:
+                _STATE.current_cycle_finished_at = _utc_now()
+            _save_state()
             verdict = (smoke.get("verdict") or "").strip()
             failure = (smoke.get("failure_code") or "").strip()
             rec.verdict = verdict

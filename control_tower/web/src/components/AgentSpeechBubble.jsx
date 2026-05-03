@@ -23,11 +23,11 @@ function AgentSpeechBubble({ tone = "info", text, side = "top", small = false })
   return (
     <div
       className={
-        "pixel-agent-speech " +
-        (side === "left" ? "pixel-agent-speech-left "
-          : side === "right" ? "pixel-agent-speech-right "
-          : "pixel-agent-speech-top ") +
-        (small ? "pixel-agent-speech-small" : "")
+        "pixel-agent-speech agent-speech-bubble " +
+        (side === "left" ? "pixel-agent-speech-left agent-speech-bubble-left "
+          : side === "right" ? "pixel-agent-speech-right agent-speech-bubble-right "
+          : "pixel-agent-speech-top agent-speech-bubble-top ") +
+        (small ? "pixel-agent-speech-small agent-speech-bubble-small" : "")
       }
       role="status"
       aria-live="polite"

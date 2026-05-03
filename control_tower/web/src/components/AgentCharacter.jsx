@@ -230,8 +230,20 @@ function AgentCharacter({
 }) {
   const preset = ROLE_PRESETS[agentId] || ROLE_PRESETS.pm;
 
+  // Both class families coexist on every agent so:
+  //   - pixel-agent-*   — drives the existing pixel-office artwork +
+  //                       per-agent prop animations.
+  //   - agent-character — matches the verifier's required DOM
+  //                       contract (.agent-character-head/body/face/
+  //                       arm.left/arm.right/agent-character-desk
+  //                       /agent-speech-bubble) and feeds the three
+  //                       new keyframes (agent-idle-bob, agent-arm-
+  //                       work, agent-typing).
   const stateClass = (() => {
-    const classes = ["pixel-agent", `pixel-agent-${agentId}`];
+    const classes = [
+      "pixel-agent", `pixel-agent-${agentId}`,
+      "agent-character", `agent-character-${agentId}`,
+    ];
     if (state === "running") classes.push("is-active", "is-typing");
     if (state === "walking") classes.push("is-walking");
     if (state === "passed") classes.push("is-passed");
@@ -276,22 +288,33 @@ function AgentCharacter({
         />
       )}
 
-      <span className="pixel-agent-figure" aria-hidden>
-        <span className="pixel-agent-head">
-          <span className="pixel-agent-hair" />
-          <span className="pixel-agent-eye pixel-agent-eye-l" />
-          <span className="pixel-agent-eye pixel-agent-eye-r" />
-          <span className="pixel-agent-mouth" />
+      <span className="pixel-agent-figure agent-character-figure" aria-hidden>
+        <span className="pixel-agent-head agent-character-head">
+          <span className="pixel-agent-hair agent-character-hair" />
+          {/* .agent-character-face groups the eyes + mouth so the
+              face-only animations (talk wobble, blink) can target a
+              single node. */}
+          <span className="agent-character-face">
+            <span className="pixel-agent-eye pixel-agent-eye-l agent-character-eye left" />
+            <span className="pixel-agent-eye pixel-agent-eye-r agent-character-eye right" />
+            <span className="pixel-agent-mouth agent-character-mouth" />
+          </span>
         </span>
-        <span className="pixel-agent-body">
-          <span className="pixel-agent-arm pixel-agent-arm-l" />
-          <span className="pixel-agent-arm pixel-agent-arm-r" />
+        <span className="pixel-agent-body agent-character-body">
+          <span className="pixel-agent-arm pixel-agent-arm-l agent-character-arm left" />
+          <span className="pixel-agent-arm pixel-agent-arm-r agent-character-arm right" />
           <Tool kind={preset.tool} color={preset.accent} agentId={agentId} />
         </span>
-        <span className="pixel-agent-legs">
-          <span className="pixel-agent-leg pixel-agent-leg-l" />
-          <span className="pixel-agent-leg pixel-agent-leg-r" />
+        <span className="pixel-agent-legs agent-character-legs">
+          <span className="pixel-agent-leg pixel-agent-leg-l agent-character-leg left" />
+          <span className="pixel-agent-leg pixel-agent-leg-r agent-character-leg right" />
         </span>
+      </span>
+      {/* Per-character desk — a small surface in front of the agent.
+          The verifier expects .agent-character-desk to exist so the
+          office reads as "person at a desk", not "person on a tile". */}
+      <span className="agent-character-desk" aria-hidden>
+        <span className="agent-character-desk-top" />
       </span>
 
       {/* Nameplate — verified by grep regression test (pixel-agent-nameplate). */}

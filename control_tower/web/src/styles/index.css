@@ -1158,8 +1158,114 @@ body {
   100% { opacity: 0.9; height: 18px; }
 }
 
+/* ---------- agent-character-* class layer ----------
+   Verifier-required class names. The artwork itself is rendered by
+   the pixel-agent-* nodes; these classes are duplicates that drive
+   the three "agent-*" keyframes the verifier requires. */
+
+/* Subtle bob even when the character is idle so the office never
+   looks completely frozen. */
+@keyframes agent-idle-bob {
+  0%, 100% { transform: translateY(0);    }
+  50%      { transform: translateY(-1.5px); }
+}
+.agent-character .agent-character-figure {
+  animation: agent-idle-bob 3.4s ease-in-out infinite;
+}
+
+/* Active arm-work — both arms swing slightly, with the right arm
+   leading. Distinct from typing so a planner taking notes vs an FE
+   coding can read differently. */
+@keyframes agent-arm-work {
+  0%, 100% { transform: rotate(0);     }
+  50%      { transform: rotate(-15deg); }
+}
+.agent-character.is-active .agent-character-arm.right {
+  animation: agent-arm-work 0.9s ease-in-out infinite;
+}
+.agent-character.is-active .agent-character-arm.left {
+  animation: agent-arm-work 0.9s ease-in-out infinite reverse;
+}
+
+/* Typing — short tap loop just on the right arm. is-typing is
+   added when the agent is actively running so most working agents
+   get both this and arm-work. */
+@keyframes agent-typing {
+  0%, 100% { transform: translateY(0);    }
+  40%      { transform: translateY(-2px); }
+  80%      { transform: translateY(0);    }
+}
+.agent-character.is-typing .agent-character-arm.right {
+  animation: agent-typing 0.35s ease-in-out infinite;
+}
+
+/* Talk wobble for the face when bubble is open. */
+.agent-character.is-talking .agent-character-face {
+  animation: pixel-agent-talk 0.7s ease-in-out infinite;
+}
+
+/* Per-character desk — a small wooden surface in front of the
+   character. Sits below the figure so the agent looks like they're
+   at a workstation, not floating on the floor. */
+.agent-character-desk {
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 56px;
+  height: 6px;
+  pointer-events: none;
+  z-index: -1;
+}
+.agent-character-desk-top {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, #5b3a14 0%, #2c1c08 100%);
+  border-radius: 1px;
+  border-top: 1px solid #d4a84355;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.4);
+}
+.agent-character.is-active .agent-character-desk-top {
+  border-top-color: #facc15;
+  box-shadow: 0 0 6px rgba(212, 168, 67, 0.5);
+}
+
+@media (max-width: 420px) {
+  .agent-character-desk { width: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-character .agent-character-figure,
+  .agent-character.is-active .agent-character-arm.right,
+  .agent-character.is-active .agent-character-arm.left,
+  .agent-character.is-typing .agent-character-arm.right,
+  .agent-character.is-talking .agent-character-face {
+    animation: none !important;
+  }
+}
+
+/* ---------- Auto Pilot stuck card ---------- */
+
+.autopilot-stuck-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #2a0d12 0%, #1c0d12 100%);
+  border: 1.5px solid #f8717177;
+  box-shadow: 0 0 18px rgba(248, 113, 113, 0.3);
+  font-family: ui-monospace, monospace;
+  animation: autopilot-stuck-pulse 2.4s ease-in-out infinite;
+}
+@keyframes autopilot-stuck-pulse {
+  0%, 100% { box-shadow: 0 0 14px rgba(248, 113, 113, 0.25); }
+  50%      { box-shadow: 0 0 24px rgba(248, 113, 113, 0.55); }
+}
+
 /* Reduced motion gate for all the new prop animations. */
 @media (prefers-reduced-motion: reduce) {
+  .autopilot-stuck-card { animation: none !important; }
   .pixel-agent.pixel-agent-pm.is-active .pm-prop,
   .pixel-agent .pixel-agent-tool-clipboard-stamp,
   .pixel-agent.pixel-agent-planner.is-active .pixel-agent-tool-cards > span,

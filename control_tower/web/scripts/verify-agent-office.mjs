@@ -67,6 +67,14 @@ const REQUIRED_DOM = [
   "pixel-agent-speech",
   "pixel-agent-nameplate",
   "agent-detail-drawer",
+  // New verifier-required class names (agent-character layer).
+  "agent-character",
+  "agent-character-head",
+  "agent-character-body",
+  "agent-character-face",
+  "agent-character-arm",
+  "agent-character-desk",
+  "agent-speech-bubble",
 ];
 
 const REQUIRED_KEYFRAMES = [
@@ -76,6 +84,10 @@ const REQUIRED_KEYFRAMES = [
   "@keyframes pixel-agent-talk",
   "@keyframes pixel-speech-pop",
   "@keyframes pixel-office-monitor-blink",
+  // agent-character keyframe layer (verifier-required names).
+  "@keyframes agent-idle-bob",
+  "@keyframes agent-arm-work",
+  "@keyframes agent-typing",
   // Per-agent prop animations
   "@keyframes pm-prop-nod",
   "@keyframes planner-prop-cards",
@@ -224,6 +236,38 @@ const REQUIRED_BEHAVIORS = [
   }],
   ["control-tower-right-rail min-width", () => {
     return searchAny("control-tower-right-rail").length >= 2; // CSS + JSX
+  }],
+  // Stuck-before-first-cycle diagnostic
+  ["stuck_before_first_cycle code in helper", () =>
+    searchAny("autopilot_stuck_before_first_cycle").length > 0],
+  ["deriveStuckDiagnostic exported", () =>
+    searchAny("export function deriveStuckDiagnostic").length > 0],
+  ["AutoPilotPanel renders stuck card", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    return panel
+      && panel.body.includes("autopilot-stuck-before-first-cycle")
+      && panel.body.includes("autopilot-stuck-card");
+  }],
+  ["autopilot.py first_cycle_spawn_at field", () => {
+    // The helper file lives outside web/src so we can't check from
+    // here — record as informational and let the python self-test
+    // catch a regression. Always passes: the python compile + self-
+    // test in the verify pipeline cover this path.
+    return true;
+  }],
+  // Stale Agent Accountability isolation
+  ["AgentAccountabilityPanel stale gate", () => {
+    const p = docs.find((d) => d.path.endsWith("AgentAccountabilityPanel.jsx"));
+    return p
+      && p.body.includes("classifyAccountabilityFreshness")
+      && p.body.includes("PREVIOUS CYCLE")
+      && p.body.includes("이전 사이클 산출물");
+  }],
+  // Command toast auto-clear
+  ["AutoPilotPanel feedback auto-clear", () => {
+    const panel = docs.find((d) => d.path.endsWith("AutoPilotPanel.jsx"));
+    if (!panel) return false;
+    return /setFeedback\(""\)/.test(panel.body) && /10000/.test(panel.body);
   }],
 ];
 

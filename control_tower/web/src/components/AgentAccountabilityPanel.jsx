@@ -44,6 +44,39 @@ function pickAccountability(runners = []) {
   return null;
 }
 
+// Compare the supervisor's cycle_id to the live autopilot cycle.
+// Returns:
+//   "fresh"    — same cycle as the autopilot is currently on, OR no
+//                autopilot run is active and accountability is recent.
+//   "stale"    — cycle_id is from a previous autopilot cycle / earlier
+//                run. The accountability shouldn't drive the main UI.
+//   "unknown"  — no cycle_id field. Treat as stale to avoid the "stale
+//                blob looks fresh" trap.
+function classifyAccountabilityFreshness(aa, runners = []) {
+  if (!aa) return "unknown";
+  const ap = (() => {
+    for (const r of runners) {
+      const a = r?.metadata_json?.local_factory?.autopilot;
+      if (a) return a;
+    }
+    return null;
+  })();
+  const accCycle = aa.cycle_id != null ? Number(aa.cycle_id) : null;
+  const apCycle = ap?.cycle_count != null ? Number(ap.cycle_count) : null;
+  const apStatus = String(ap?.status || "").toLowerCase();
+  // Autopilot running but cycle_count==0: the supervisor's cycle_id is
+  // FROM AN EARLIER RUN. This is the exact scenario the user flagged
+  // (Auto Pilot cycle 0/5 + accountability cycle #1 from a prior run).
+  if (apStatus === "running" && apCycle === 0 && accCycle != null && accCycle >= 1) {
+    return "stale";
+  }
+  if (accCycle == null) return "unknown";
+  if (apCycle == null) return "fresh"; // autopilot not running — accountability is current
+  if (accCycle === apCycle) return "fresh";
+  if (accCycle < apCycle) return "stale";
+  return "fresh";
+}
+
 function fmtScore(n) {
   if (n == null) return "—";
   return `${Math.round(Number(n) || 0)}점`;
@@ -132,6 +165,62 @@ function AgentRow({ name, row }) {
 
 export default function AgentAccountabilityPanel({ runners = [] }) {
   const aa = pickAccountability(runners);
+  const freshness = classifyAccountabilityFreshness(aa, runners);
+
+  // Stale gate — when the supervisor blob is from a previous cycle,
+  // collapse the entire panel under a "이전 사이클 산출물" details so
+  // it never paints over the current Auto Pilot status. The operator
+  // can still expand it when debugging an old failure.
+  if (aa && aa.available && freshness === "stale") {
+    return (
+      <section
+        className="flex flex-col gap-2 p-3"
+        data-testid="agent-accountability-panel"
+        data-freshness="stale"
+        style={{
+          backgroundColor: "#0e1a35",
+          border: "1.5px solid #1e293b",
+          borderRadius: 6,
+          fontFamily: "ui-monospace, monospace",
+        }}
+      >
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="inline-block h-2 w-2" style={{ backgroundColor: "#94a3b8" }} />
+          <span className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-300">
+            AGENT ACCOUNTABILITY
+          </span>
+          <span
+            className="rounded-full px-2 py-0.5 text-[9.5px] font-bold tracking-widest"
+            style={{
+              color: "#94a3b8",
+              border: "1px solid #94a3b855",
+              backgroundColor: "#0a1228",
+            }}
+          >
+            PREVIOUS CYCLE
+          </span>
+          <span className="text-[10px] tracking-widest text-slate-500">
+            cycle #{aa.cycle_id ?? "—"}
+          </span>
+        </div>
+        <div className="text-[11px] text-slate-400">
+          현재 Auto Pilot cycle과 다른 산출물입니다 — 이전 사이클 결과는 접혔습니다.
+        </div>
+        <details className="text-[11px] text-slate-400">
+          <summary className="cursor-pointer hover:text-slate-200">
+            이전 사이클 산출물 보기
+          </summary>
+          <div className="mt-2 rounded p-2" style={{ backgroundColor: "#0a1228", border: "1px dashed #1e293b" }}>
+            <div>blocking_agent: {aa.blocking_agent || "—"}</div>
+            <div>blocking_reason: {aa.blocking_reason || "—"}</div>
+            <div>overall_status: {aa.overall_status || "—"}</div>
+            <div>evaluated_at: {aa.evaluated_at || "—"}</div>
+            {aa.next_action && <div className="mt-1 text-amber-200">▶ {aa.next_action}</div>}
+          </div>
+        </details>
+      </section>
+    );
+  }
 
   if (!aa || !aa.available) {
     return (

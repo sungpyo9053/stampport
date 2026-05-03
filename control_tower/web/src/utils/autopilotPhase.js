@@ -66,16 +66,64 @@ export function pickRunnerMeta(runners = []) {
   return {};
 }
 
-// "Active cycle process exists" — three independent signals must agree
-// before we'll claim work is in progress. Otherwise an old factory_smoke
-// timestamp can paint Frontend as WORKING long after the loop went idle.
+// "Active cycle process exists" — multiple signals must agree before
+// we'll claim work is in progress. Otherwise an old factory_smoke
+// timestamp can paint Frontend as WORKING long after the loop went
+// idle. The autopilot loop now also writes current_cycle_started_at /
+// _finished_at around every smoke spawn so the UI has a definitive
+// "cycle in flight" answer without polling subprocesses.
 export function hasActiveCycle(meta = {}) {
   const fs = meta.factory_state || {};
   const smoke = meta.factory_smoke || meta.smoke || {};
+  const ap = meta.autopilot || {};
   const fsRunning = String(fs.status || "").toLowerCase() === "running";
   const smokeRunning = String(smoke.status || "").toLowerCase() === "running";
   const stagePresent = !!(fs.current_stage || meta?.pipeline_recovery?.current_stage);
-  return fsRunning || smokeRunning || stagePresent;
+  // current_cycle_started_at > current_cycle_finished_at means a smoke
+  // subprocess is currently blocking the autopilot thread.
+  let smokeInFlight = false;
+  if (ap.current_cycle_started_at) {
+    const started = Date.parse(ap.current_cycle_started_at);
+    const finished = ap.current_cycle_finished_at
+      ? Date.parse(ap.current_cycle_finished_at)
+      : 0;
+    if (Number.isFinite(started) && (!Number.isFinite(finished) || started > finished)) {
+      smokeInFlight = true;
+    }
+  }
+  return fsRunning || smokeRunning || stagePresent || smokeInFlight;
+}
+
+// stuck_before_first_cycle — the diagnostic the user asked for.
+// True when:
+//   autopilot_state.status == "running"
+//   cycle_count == 0
+//   started_at > 180s ago
+//   no active cycle subprocess
+// The 180s window matches the user spec. Dashboard surfaces this as a
+// red diagnostic card with operator next-actions.
+export function deriveStuckDiagnostic(meta = {}) {
+  const ap = meta.autopilot || {};
+  if (String(ap.status || "").toLowerCase() !== "running") {
+    return { stuck: false };
+  }
+  if ((Number(ap.cycle_count) || 0) > 0) return { stuck: false };
+  if (hasActiveCycle(meta)) return { stuck: false };
+  const startedAt = ap.started_at ? Date.parse(ap.started_at) : null;
+  if (!startedAt || !Number.isFinite(startedAt)) return { stuck: false };
+  const waitSec = Math.floor((Date.now() - startedAt) / 1000);
+  if (waitSec < 180) return { stuck: false, wait_sec: waitSec };
+  return {
+    stuck: true,
+    diagnostic_code: "autopilot_stuck_before_first_cycle",
+    wait_sec: waitSec,
+    started_at: ap.started_at,
+    next_actions: [
+      "runner log 확인 (.runtime/autopilot.log)",
+      "autopilot_report.md 확인",
+      "Stop 후 Restart 권장",
+    ],
+  };
 }
 
 export function derivePhase(meta = {}, opts = {}) {
@@ -103,8 +151,13 @@ export function derivePhase(meta = {}, opts = {}) {
     // stop requested on the UI side — we render stopping until the
     // heartbeat acknowledges.
     if (opts.stopRequested) return "stopping";
-    if (cycleCount === 0 && !active) return "starting";
     if (active) return "cycle_running";
+    if (cycleCount === 0) {
+      // Could still be normal "cycle 1 about to spawn" OR the
+      // stuck-before-first-cycle case. derivePhase doesn't tell
+      // them apart; deriveStuckDiagnostic does.
+      return "starting";
+    }
     // status=running but no active cycle process — autopilot loop is
     // alive but between cycles.
     return "waiting_next_cycle";

@@ -4,6 +4,7 @@ import {
   PHASES,
   MODE_BADGE,
   derivePhase,
+  deriveStuckDiagnostic,
   hasActiveCycle,
   isRunningPhase,
   pickRunnerMeta,
@@ -189,6 +190,26 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [debugOpen, setDebugOpen] = useState(false);
+
+  // Auto-clear command feedback after 10s. The status pill is the
+  // source of truth for "what is autopilot doing right now"; toast
+  // text is just a momentary acknowledgment of the last click.
+  useEffect(() => {
+    if (!feedback) return undefined;
+    const id = setTimeout(() => setFeedback(""), 10000);
+    return () => clearTimeout(id);
+  }, [feedback]);
+
+  // Stuck-before-first-cycle diagnostic — tick every 15s while running
+  // so the wait_sec / stuck flag stays current without depending on
+  // heartbeat refresh cadence.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (state?.status !== "running") return undefined;
+    const id = setInterval(() => forceTick((n) => n + 1), 15000);
+    return () => clearInterval(id);
+  }, [state?.status]);
+  const stuck = useMemo(() => deriveStuckDiagnostic(meta), [meta, state]);
 
   const canStart = !!runnerId && !busy && !isLocked && !stopRequested;
   const canStop = !!runnerId && !busy && (isRunning || isStopping) && !stopRequested;
@@ -379,6 +400,39 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
           runner: {runnerId || "(none)"}
         </span>
       </div>
+
+      {/* Stuck-before-first-cycle warning — runner says running but
+          cycle_count=0 for >180s and no active subprocess. The user
+          spec calls this `autopilot_stuck_before_first_cycle`; we
+          name the data-testid the same so the verifier can grep it. */}
+      {stuck.stuck && (
+        <div
+          className="autopilot-stuck-card"
+          data-testid="autopilot-stuck-before-first-cycle"
+          data-diagnostic={stuck.diagnostic_code}
+        >
+          <div className="flex items-center gap-2 flex-wrap">
+            <span
+              className="rounded-full px-2 py-0.5 text-[10px] font-bold tracking-[0.25em]"
+              style={{
+                color: "#fecaca",
+                border: "1.5px solid #f8717166",
+                backgroundColor: "#1c0d12",
+              }}
+            >
+              ⚠ STUCK · 첫 cycle 미시작
+            </span>
+            <span className="text-[10.5px] text-rose-200">
+              {stuck.wait_sec}s 대기 중 · 첫 cycle 프로세스가 시작되지 않았습니다
+            </span>
+          </div>
+          <ul className="mt-1 list-disc pl-5 text-[11px] text-rose-100">
+            {(stuck.next_actions || []).map((act) => (
+              <li key={act}>{act}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* ============ A. STATUS SUMMARY ============ */}
       <div
