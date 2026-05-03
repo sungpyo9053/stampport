@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "validate:agent-office": "node scripts/verify-agent-office.mjs && node scripts/verify-autopilot-payload.mjs",
-    "validate:agent-office:render": "node scripts/capture-agent-office.mjs"
+    "validate:agent-office:render": "node scripts/capture-agent-office.mjs",
+    "validate:autopilot-ui": "node scripts/verify-autopilot-ui.mjs"
   },
   "dependencies": {
     "framer-motion": "^11.11.0",

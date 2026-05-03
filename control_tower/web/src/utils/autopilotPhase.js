@@ -280,6 +280,118 @@ export function freshnessOf({ artifactCycleId, artifactAt, autopilot }) {
   return "unknown";
 }
 
+// ---------------------------------------------------------------------------
+// Pure derivation functions for AutoPilotPanel buttons + start payload.
+// Lifted out of the component so verify-autopilot-ui.mjs can run a fixture
+// matrix without booting React.
+// ---------------------------------------------------------------------------
+
+// Returns the button enable matrix and the labels they should show
+// for a given phase / pending-flag combination. Pure function, no
+// side effects, no React.
+//
+// Inputs:
+//   phase           — one of PHASES (idle/starting/cycle_running/...)
+//   stopRequested   — true while the operator's optimistic stop is
+//                     awaiting heartbeat ack
+//   restartInFlight — true while the operator's restart is between
+//                     stop and start
+//   cycleInFlight   — hasActiveCycle(meta); used so "stop" only says
+//                     "현재 cycle 종료 후 정지" when there's a cycle
+//                     to wait for
+//   stuck           — deriveStuckDiagnostic(meta).stuck
+//
+// Returns: { canStart, canStop, canRestart, formLocked, startLabel,
+//            stopLabel, restartLabel }
+export function deriveButtonState({
+  phase,
+  stopRequested = false,
+  restartInFlight = false,
+  cycleInFlight = false,
+  stuck = false,
+  busy = false,
+  hasRunner = true,
+}) {
+  const isRunning = phase === "cycle_running" || phase === "starting" || phase === "waiting_next_cycle";
+  const isStopping = phase === "stopping";
+  const isLocked = isRunning || isStopping || phase === "restarting";
+
+  const canStart   = hasRunner && !busy && !isLocked && !stopRequested && !restartInFlight;
+  const canStop    = hasRunner && !busy && (isRunning || isStopping) && !stopRequested;
+  const canRestart = hasRunner && !busy && !restartInFlight;
+
+  let stopLabel = "정지";
+  if (stopRequested && cycleInFlight) stopLabel = "정지 요청 중 — 현재 cycle 종료 후 정지";
+  else if (stopRequested) stopLabel = "정지 요청 중...";
+  else if (isStopping) stopLabel = "현재 cycle 종료 후 정지";
+  else if (phase === "stopped") stopLabel = "정지됨";
+
+  let startLabel = "Auto Pilot 시작";
+  if (busy) startLabel = "처리 중...";
+  else if (isRunning) startLabel = "실행 중";
+  else if (isStopping) startLabel = "정지 중";
+  else if (phase === "restarting") startLabel = "재시작 중";
+
+  const restartLabel = restartInFlight ? "재시작 진행 중" : "재시작";
+
+  return {
+    canStart,
+    canStop,
+    canRestart,
+    formLocked: isLocked,
+    startLabel,
+    stopLabel,
+    restartLabel,
+    isRunning,
+    isStopping,
+  };
+}
+
+// Build the start_autopilot payload from a form draft. Single source
+// of truth shared by AutoPilotPanel.handleStart/handleRestart and
+// the verify-autopilot-ui.mjs fixture matrix. The matrix's job is to
+// prove that for every (mode, max_cycles, max_hours, checkbox combo)
+// the payload round-trips bit-for-bit and never silently downgrades
+// to safe_run / stop_on_hold=true.
+export function buildStartPayload(draft = {}) {
+  const mode = draft.mode || "safe_run";
+  return {
+    autopilot_enabled: true,
+    autopilot_mode: mode,
+    mode,                                      // alias for back-compat
+    max_cycles: Number(draft.maxCycles) || 5,
+    max_hours: Number(draft.maxHours) || 6,
+    stop_on_hold: !!draft.stopOnHold,
+    require_scope_consistency: true,
+    require_render_check: !!draft.requireRender,
+    require_api_health: !!draft.requireHealth,
+  };
+}
+
+// Effective form values when the panel is locked. Returns the
+// runtime config from autopilot_state when locked, else the operator's
+// draft. Pure — fixture-testable.
+export function deriveEffectiveConfig({ phase, draft, autopilot }) {
+  const isLocked = phase === "cycle_running" || phase === "starting"
+    || phase === "waiting_next_cycle" || phase === "stopping" || phase === "restarting";
+  const ap = autopilot || {};
+  return {
+    mode:          isLocked ? (ap.mode || draft.mode) : draft.mode,
+    maxCycles:     isLocked ? (ap.max_cycles ?? draft.maxCycles) : draft.maxCycles,
+    maxHours:      isLocked ? (ap.max_hours ?? draft.maxHours) : draft.maxHours,
+    stopOnHold:    isLocked
+      ? (ap.stop_on_hold !== undefined ? !!ap.stop_on_hold : draft.stopOnHold)
+      : draft.stopOnHold,
+    requireRender: isLocked
+      ? (ap.require_render_check !== undefined ? !!ap.require_render_check : draft.requireRender)
+      : draft.requireRender,
+    requireHealth: isLocked
+      ? (ap.require_api_health !== undefined ? !!ap.require_api_health : draft.requireHealth)
+      : draft.requireHealth,
+    locked: isLocked,
+  };
+}
+
 export const FRESHNESS_LABEL = {
   current_run:    { label: "CURRENT RUN",      tone: "active",  color: "#34d399" },
   current_cycle:  { label: "CURRENT CYCLE",    tone: "active",  color: "#fbbf24" },

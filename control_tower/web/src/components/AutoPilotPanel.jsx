@@ -3,6 +3,9 @@ import { startAutopilot, stopAutopilot } from "../api/controlTowerApi.js";
 import {
   PHASES,
   MODE_BADGE,
+  buildStartPayload,
+  deriveButtonState,
+  deriveEffectiveConfig,
   derivePhase,
   deriveStuckDiagnostic,
   hasActiveCycle,
@@ -139,32 +142,22 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   }, [stopRequested]);
 
   // -------- Effective values (lock to runtime config when running) --------
-  const effectiveMode = isLocked ? (state?.mode || draft.mode) : draft.mode;
-  const effectiveMaxCycles = isLocked ? (state?.max_cycles ?? draft.maxCycles) : draft.maxCycles;
-  const effectiveMaxHours = isLocked ? (state?.max_hours ?? draft.maxHours) : draft.maxHours;
-  const effectiveStopOnHold = isLocked
-    ? (state?.stop_on_hold !== undefined ? !!state.stop_on_hold : draft.stopOnHold)
-    : draft.stopOnHold;
-  const effectiveRequireRender = isLocked
-    ? (state?.require_render_check !== undefined ? !!state.require_render_check : draft.requireRender)
-    : draft.requireRender;
-  const effectiveRequireHealth = isLocked
-    ? (state?.require_api_health !== undefined ? !!state.require_api_health : draft.requireHealth)
-    : draft.requireHealth;
+  // Derivation lifted into autopilotPhase.deriveEffectiveConfig so the
+  // verify-autopilot-ui matrix tests the same exact rule.
+  const effective = useMemo(
+    () => deriveEffectiveConfig({ phase, draft, autopilot: state }),
+    [phase, draft, state],
+  );
+  const effectiveMode          = effective.mode;
+  const effectiveMaxCycles     = effective.maxCycles;
+  const effectiveMaxHours      = effective.maxHours;
+  const effectiveStopOnHold    = effective.stopOnHold;
+  const effectiveRequireRender = effective.requireRender;
+  const effectiveRequireHealth = effective.requireHealth;
 
   // -------- Start payload (single source of truth) --------
   // The draft is what we ALWAYS send — never a fallback to safe_run.
-  const startPayload = useMemo(() => ({
-    autopilot_enabled: true,
-    autopilot_mode: draft.mode,
-    mode: draft.mode,                                       // alias for back-compat
-    max_cycles: Number(draft.maxCycles) || 5,
-    max_hours: Number(draft.maxHours) || 6,
-    stop_on_hold: !!draft.stopOnHold,
-    require_scope_consistency: true,
-    require_render_check: !!draft.requireRender,
-    require_api_health: !!draft.requireHealth,
-  }), [draft]);
+  const startPayload = useMemo(() => buildStartPayload(draft), [draft]);
 
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -190,9 +183,18 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
   }, [state?.status]);
   const stuck = useMemo(() => deriveStuckDiagnostic(meta), [meta, state]);
 
-  const canStart = !!runnerId && !busy && !isLocked && !stopRequested;
-  const canStop = !!runnerId && !busy && (isRunning || isStopping) && !stopRequested;
-  const canRestart = !!runnerId && !busy && !restartInFlight;
+  const buttonState = useMemo(() => deriveButtonState({
+    phase,
+    stopRequested,
+    restartInFlight,
+    cycleInFlight,
+    stuck: stuck.stuck,
+    busy,
+    hasRunner: !!runnerId,
+  }), [phase, stopRequested, restartInFlight, cycleInFlight, stuck.stuck, busy, runnerId]);
+  const canStart   = buttonState.canStart;
+  const canStop    = buttonState.canStop;
+  const canRestart = buttonState.canRestart;
 
   const sendStart = useCallback(async () => {
     // eslint-disable-next-line no-console
@@ -313,20 +315,10 @@ export default function AutoPilotPanel({ runners = [], onSent }) {
     return "Auto Pilot 대기";
   })();
 
-  // -------- Stop button label --------
-  let stopLabel = "정지";
-  if (stopRequested && cycleInFlight) stopLabel = "정지 요청 중 — 현재 cycle 종료 후 정지";
-  else if (stopRequested) stopLabel = "정지 요청 중...";
-  else if (isStopping) stopLabel = "현재 cycle 종료 후 정지";
-  else if (phase === "stopped") stopLabel = "정지됨";
-
-  const startLabel = (() => {
-    if (busy) return "처리 중...";
-    if (isRunning) return "실행 중";
-    if (isStopping) return "정지 중";
-    if (phase === "restarting") return "재시작 중";
-    return "Auto Pilot 시작";
-  })();
+  // Labels come from deriveButtonState so the matrix verifier checks
+  // the same string the operator sees.
+  const stopLabel  = buttonState.stopLabel;
+  const startLabel = buttonState.startLabel;
 
   const payloadPreviewLines = [
     `mode=${startPayload.autopilot_mode}`,
