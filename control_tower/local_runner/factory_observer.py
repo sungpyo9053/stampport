@@ -136,6 +136,12 @@ DIAGNOSTIC_CODES: tuple[str, ...] = (
     "build_app_after_apply_failed",
     "claude_apply_revalidation_failed",
     "scope_mismatch",
+    # 2026-05-03: Dependency Change Contract — claude_apply touched
+    # app/web/package.json or a lockfile. Either an unallowed dep was
+    # added (dependency_not_allowed) or `npm install` failed during
+    # _revalidate_after_apply (dependency_change_failed).
+    "dependency_change_failed",
+    "dependency_not_allowed",
     "unknown",
 )
 
@@ -178,7 +184,17 @@ def collect_state(runtime: Path | None = None) -> dict:
         "factory_command_diagnostics": _read_json(
             rt / "factory_command_diagnostics.json",
         ) or {},
+        "dependency_change_state": _read_json(
+            rt / "dependency_change_state.json",
+        ) or {},
         "log_tail": _read_log_tail(rt / "local_factory.log", lines=300),
+        # Dependency Change Contract surfaced the actual vite/webpack
+        # error into .runtime/app_build_after_apply.log. We tail ≥80
+        # lines so the operator + claude repair prompt see the real
+        # failure inline instead of a path-only reference.
+        "app_build_log_tail": _read_log_tail(
+            rt / "app_build_after_apply.log", lines=80,
+        ),
     }
 
 
@@ -1182,6 +1198,62 @@ def classify(
     failed_stage = _str(fs.get("failed_stage"))
     failed_reason_text = _str(fs.get("failed_reason"))
     apply_message_text = _str(fs.get("claude_apply_message"))
+
+    # 6.4. Dependency Change Contract failures take priority over the
+    # generic build_app_after_apply_failed routing — same rollback path
+    # but the repair workflow is different (allowlist tweak / install
+    # diagnosis vs. fix the source). We route off the dependency
+    # contract state and the cycle.py-set failed_stage marker.
+    dep_state = state.get("dependency_change_state") or {}
+    dep_failure_code = _str(
+        dep_state.get("failure_code")
+        or fs.get("dependency_failure_code")
+    )
+    dep_status_field = _str(
+        dep_state.get("status") or fs.get("dependency_change_status")
+    )
+    dep_reason = _str(
+        dep_state.get("failure_reason")
+        or fs.get("dependency_failure_reason")
+    )
+    if (
+        apply_status == "rolled_back"
+        and dep_failure_code in {"dependency_not_allowed", "dependency_change_failed"}
+    ):
+        blocked = list(dep_state.get("blocked_packages") or [])
+        added = list(dep_state.get("added_dependencies") or [])
+        evidence = [
+            f"factory_state.failed_stage={failed_stage or '—'}",
+            f"claude_apply_status={apply_status}",
+            f"dependency_change_status={dep_status_field or '—'}",
+            f"dependency_failure_code={dep_failure_code}",
+            f"dependency_failure_reason={(dep_reason or '—')[:300]}",
+            f"added_dependencies={added or '—'}",
+            f"blocked_packages={blocked or '—'}",
+            f"install_attempted={bool(dep_state.get('install_attempted'))}",
+            f"install_exit_code={dep_state.get('install_exit_code')}",
+            f"install_timed_out={bool(dep_state.get('install_timed_out'))}",
+        ]
+        return {
+            "diagnostic_code": dep_failure_code,
+            "severity": "error",
+            "category": "failure",
+            "root_cause": (
+                "claude_apply 가 app/web/package.json 또는 lockfile 을 "
+                "수정했지만 Dependency Change Contract 에서 "
+                + (
+                    "허용되지 않은 dependency 가 추가됐다고 판단했습니다."
+                    if dep_failure_code == "dependency_not_allowed"
+                    else "npm install 이 실패해 빌드 재검증을 진행할 수 없습니다."
+                )
+                + " repair 대상은 cycle.py 의 DEPENDENCY_ALLOWLIST 또는 "
+                "app/web 소스에서 해당 dependency 사용을 제거하는 것입니다."
+            ),
+            "evidence": evidence,
+            "auto_fix_possible": False,
+            "is_failure": True,
+        }
+
     if (
         failed_stage == "claude_apply"
         and apply_status == "rolled_back"
@@ -1578,6 +1650,19 @@ MANUAL_COMMANDS_BY_CODE: dict[str, list[str]] = {
         "cat .runtime/implementation_ticket.md",
         "tail -200 .runtime/local_factory.log",
     ],
+    "dependency_change_failed": [
+        "cat .runtime/dependency_change_state.json",
+        "cat .runtime/dependency_install_stderr.log 2>/dev/null || echo '(none)'",
+        "cat .runtime/dependency_install_stdout.log 2>/dev/null || echo '(none)'",
+        "cat .runtime/claude_apply_rolled_back.diff",
+        "cd app/web && cat package.json",
+        "cd app/web && npm install",
+    ],
+    "dependency_not_allowed": [
+        "cat .runtime/dependency_change_state.json",
+        "cat .runtime/claude_apply_rolled_back.diff",
+        "grep -n DEPENDENCY_ALLOWLIST control_tower/local_runner/cycle.py",
+    ],
     "unknown": [
         "cat .runtime/control_state.json | python3 -m json.tool",
         "cat .runtime/factory_state.json | python3 -m json.tool",
@@ -1658,6 +1743,19 @@ REPAIR_TARGETS_BY_CODE: dict[str, list[str]] = {
         "(implementation_ticket 의 target_files 에 명시된 app/* 또는 control_tower/* 파일)",
         ".runtime/claude_apply_rolled_back.diff (롤백된 패치 본문)",
         ".runtime/implementation_ticket.md (수정 의도)",
+    ],
+    "dependency_change_failed": [
+        "app/web/package.json (추가된 dependency 가 정확한 버전 / 이름인지)",
+        "app/web/package-lock.json (있으면 stale 한지)",
+        ".runtime/dependency_install_stderr.log (npm install 실패 원인)",
+        "(필요 시) implementation_ticket 의 target_files 에 있는 app/web/src/...",
+    ],
+    "dependency_not_allowed": [
+        "(첫 번째 선택지) implementation_ticket 의 target_files 안에서 "
+        "해당 dependency 없이 구현하도록 코드 수정",
+        "(두 번째 선택지) control_tower/local_runner/cycle.py 의 "
+        "DEPENDENCY_ALLOWLIST 에 추가 — 단, native build / postinstall "
+        "위험 / 서버 설정 변경 / 알 수 없는 새 dependency 가 아닌 경우에만",
     ],
     "unknown": [
         "(분류 추가 필요 — control_tower/local_runner/factory_observer.py 의 classify())",
@@ -1798,6 +1896,34 @@ REPAIR_REQUIREMENTS_BY_CODE: dict[str, str] = {
         "3. 변경 후 해당 게이트의 명령을 로컬에서 직접 재실행해 통과 확인.\n"
         "4. control_tower 자체는 수정하지 마세요."
     ),
+    "dependency_change_failed": (
+        "1. `.runtime/dependency_change_state.json` 을 열어 added_dependencies / "
+        "removed_dependencies / install_exit_code / failure_reason 를 확인.\n"
+        "2. `.runtime/dependency_install_stderr.log` 의 마지막 npm 오류 메시지로 "
+        "실패 원인 식별 (network / EACCES / lockfile conflict 등).\n"
+        "3. `cd app/web && npm install` 를 로컬에서 직접 재실행해 0 exit 인지 확인. "
+        "성공하면 다음 사이클의 dependency 단계가 통과합니다.\n"
+        "4. lockfile 충돌이면 package-lock.json 을 갱신하거나 (의도적 변경), "
+        "또는 dependency 자체를 implementation_ticket target_files 범위에서 "
+        "제거.\n"
+        "5. control_tower / .github / scripts 는 건드리지 않음 — 이 실패는 "
+        "공장 자체 버그가 아니라 app/web dependency 설치 문제입니다."
+    ),
+    "dependency_not_allowed": (
+        "1. `.runtime/dependency_change_state.json` 의 blocked_packages 에 "
+        "어떤 패키지가 차단됐는지 확인 — Stampport 자동 설치 정책 위반입니다.\n"
+        "2. 가장 먼저 시도할 것: implementation_ticket 의 target_files 범위에서 "
+        "해당 dependency 없이 구현 (예: html2canvas 대신 SVG 또는 직접 canvas 2d).\n"
+        "3. 정말 그 dependency 가 필요하면 `control_tower/local_runner/cycle.py` 의 "
+        "DEPENDENCY_ALLOWLIST 에 추가 — 단, 다음 조건을 모두 만족해야 함:\n"
+        "   - native build (node-gyp 등) 가 필요하지 않다.\n"
+        "   - postinstall 스크립트가 위험하지 않다.\n"
+        "   - 서버 / 배포 설정을 바꾸지 않는다.\n"
+        "   - 알 수 없는 신뢰도가 낮은 패키지가 아니다.\n"
+        "4. 변경 후 `cd app/web && npm install && npm run build` 가 통과하는지 "
+        "로컬에서 검증.\n"
+        "5. control_tower / .github / scripts 는 건드리지 않음."
+    ),
     "unknown": (
         "1. control_state.json / factory_state.json / pipeline_state.json / "
         "forward_progress_state.json 의 raw 필드를 읽고 어떤 시그널이 비어있고 어떤 "
@@ -1881,6 +2007,19 @@ ACCEPTANCE_TEMPLATE_BY_CODE: dict[str, str] = {
         "- 다음 cycle 에서 _revalidate_after_apply 의 모든 게이트 통과\n"
         "- claude_apply_status != 'rolled_back'"
     ),
+    "dependency_change_failed": (
+        "- .runtime/dependency_change_state.json 의 status == 'installed'\n"
+        "- install_exit_code == 0, install_timed_out == false\n"
+        "- 다음 cycle 에서 _revalidate_after_apply 의 build_app 게이트 통과\n"
+        "- `cd app/web && npm install && npm run build` 가 로컬에서 0 exit"
+    ),
+    "dependency_not_allowed": (
+        "- .runtime/dependency_change_state.json 의 status != 'not_allowed'\n"
+        "- blocked_packages 배열이 비어 있음\n"
+        "- (또는 의도적으로 추가했다면) cycle.py 의 DEPENDENCY_ALLOWLIST 에 "
+        "해당 패키지가 등재되어 있고 native build / postinstall 위험 가능성을 검토함\n"
+        "- 다음 cycle 에서 claude_apply_status == 'applied'"
+    ),
     "unknown": (
         "- factory_observer 가 새 diagnostic_code 로 분류\n"
         "- 또는 운영자가 직접 분류 후 cycle 재실행"
@@ -1915,6 +2054,55 @@ def _format_runtime_files() -> str:
     )
 
 
+def _format_dependency_block(state: dict) -> str:
+    """Render the Dependency Change Contract section. Empty string when
+    no dependency change happened this cycle (status == "skipped" or
+    file missing) so the failure report stays compact for unrelated
+    diagnostics."""
+    dep = state.get("dependency_change_state") or {}
+    status = (dep.get("status") or "").strip()
+    fs = state.get("factory_state") or {}
+    if not status:
+        # Fall back to factory_state if observer collected before the
+        # state file landed.
+        status = (fs.get("dependency_change_status") or "").strip()
+    if not status or status == "skipped":
+        return ""
+    added = list(dep.get("added_dependencies") or [])
+    removed = list(dep.get("removed_dependencies") or [])
+    blocked = list(dep.get("blocked_packages") or [])
+    lines = [
+        "## Dependency Change Contract",
+        f"- status: `{status}`",
+        f"- package_json_changed: `{bool(dep.get('package_json_changed'))}`",
+        f"- lockfile_changed: `{bool(dep.get('lockfile_changed'))}`",
+        f"- added_dependencies: {added or '—'}",
+        f"- removed_dependencies: {removed or '—'}",
+        f"- blocked_packages: {blocked or '—'}",
+        f"- install_attempted: `{bool(dep.get('install_attempted'))}`",
+        f"- install_exit_code: `{dep.get('install_exit_code')}`",
+        f"- install_timed_out: `{bool(dep.get('install_timed_out'))}`",
+        f"- failure_code: `{dep.get('failure_code') or '—'}`",
+        f"- failure_reason: {dep.get('failure_reason') or '—'}",
+    ]
+    return "\n".join(lines) + "\n\n"
+
+
+def _format_app_build_log_tail(state: dict) -> str:
+    """Render the last 80 lines of .runtime/app_build_after_apply.log
+    inline so the operator + Claude repair prompt see the actual
+    vite/webpack failure without having to open another file. Empty
+    string when the log doesn't exist this cycle."""
+    tail = (state.get("app_build_log_tail") or "").strip()
+    if not tail:
+        return ""
+    lines = tail.splitlines()[-80:]
+    return (
+        "## app/web build error (.runtime/app_build_after_apply.log tail)\n"
+        f"```\n{chr(10).join(lines)}\n```\n\n"
+    )
+
+
 def build_failure_report(state: dict, classification: dict) -> str:
     cs = state.get("control_state") or {}
     fs = state.get("factory_state") or {}
@@ -1935,6 +2123,8 @@ def build_failure_report(state: dict, classification: dict) -> str:
     auto_fix = "예 (자동 수정 후보)" if classification.get("auto_fix_possible") else "아니오 (운영자 검토 필요)"
 
     procs_block = _format_process_block(classification)
+    dep_block = _format_dependency_block(state)
+    build_log_block = _format_app_build_log_tail(state)
 
     return (
         f"# Factory Failure Report\n\n"
@@ -1957,6 +2147,8 @@ def build_failure_report(state: dict, classification: dict) -> str:
         f"{classification.get('root_cause') or '—'}\n\n"
         f"## 근거 로그\n"
         f"{_format_evidence_lines(classification.get('evidence') or [])}\n\n"
+        f"{dep_block}"
+        f"{build_log_block}"
         f"{procs_block}"
         f"## 관련 runtime 파일\n"
         f"{_format_runtime_files()}\n\n"
@@ -2013,6 +2205,8 @@ def build_repair_prompt(state: dict, classification: dict) -> str:
 
     log_tail = (state.get("log_tail") or "").splitlines()[-40:]
     log_block = "\n".join(log_tail) if log_tail else "(no log lines)"
+    dep_block = _format_dependency_block(state)
+    build_log_block = _format_app_build_log_tail(state)
 
     repro_lines: list[str] = [
         f"control_state.status = {cs.get('status') or '—'}",
@@ -2022,9 +2216,42 @@ def build_repair_prompt(state: dict, classification: dict) -> str:
         f"factory_state.qa_status = {fs.get('qa_status') or '—'}",
         f"factory_state.implementation_ticket_status = "
         f"{fs.get('implementation_ticket_status') or '—'}",
+        f"factory_state.dependency_change_status = "
+        f"{fs.get('dependency_change_status') or '—'}",
+        f"factory_state.dependency_failure_code = "
+        f"{fs.get('dependency_failure_code') or '—'}",
     ]
 
     commit_msg = _suggest_commit_message(code)
+
+    # When a dependency change happened, lead with the contract-specific
+    # checklist so Claude can immediately see "package.json dependency
+    # added / lockfile reflect needed / dependency policy 확인 필요"
+    # without scrolling through generic build advice.
+    dep_repair_hint = ""
+    fs_dep_status = (fs.get("dependency_change_status") or "").strip()
+    fs_dep_code = (fs.get("dependency_failure_code") or "").strip()
+    if (
+        code in {
+            "build_app_after_apply_failed",
+            "claude_apply_revalidation_failed",
+            "dependency_change_failed",
+            "dependency_not_allowed",
+        }
+        and (fs_dep_status not in {"", "skipped"} or fs_dep_code)
+    ):
+        dep_repair_hint = (
+            "## Dependency 진단\n"
+            "이번 실패는 build_app 단순 syntax 가 아니라 **dependency 변경**과 "
+            "관련됐을 가능성이 높습니다. 수정 전 다음을 반드시 확인하세요:\n"
+            "- package.json 에 새 dependency 가 추가됐는지 (added_dependencies)\n"
+            "- 추가된 dependency 가 lockfile / node_modules 에 반영됐는지 "
+            "(install_attempted, install_exit_code)\n"
+            "- Stampport 의 dependency policy (DEPENDENCY_ALLOWLIST) 를 "
+            "위반하지 않는지 (blocked_packages)\n"
+            "수정 방향: 가능하면 **해당 dependency 없이 구현**, 정말 필요하면 "
+            "DEPENDENCY_ALLOWLIST 에 추가.\n\n"
+        )
 
     return (
         f"# Claude Code Repair Prompt\n\n"
@@ -2036,11 +2263,14 @@ def build_repair_prompt(state: dict, classification: dict) -> str:
         f"심각도: {severity}\n\n"
         f"## 증상\n"
         f"{classification.get('root_cause') or '—'}\n\n"
+        f"{dep_repair_hint}"
         f"## 재현 로그 (관련 상태)\n"
         + "\n".join(f"- {l}" for l in repro_lines)
         + "\n\n"
         f"### local_factory.log tail (최근 40줄)\n"
         f"```\n{log_block}\n```\n\n"
+        f"{dep_block}"
+        f"{build_log_block}"
         f"## Root cause 추정\n"
         f"{classification.get('root_cause') or '—'}\n\n"
         f"근거:\n"
@@ -2149,6 +2379,8 @@ def _suggest_commit_message(code: str) -> str:
         "scope_mismatch": "Enforce scope consistency between design_spec and claude_apply",
         "build_app_after_apply_failed": "Repair app build after claude_apply rollback",
         "claude_apply_revalidation_failed": "Repair source so claude_apply revalidation passes",
+        "dependency_change_failed": "Repair app/web dependency install after claude_apply",
+        "dependency_not_allowed": "Implement feature without unauthorized dependency or extend allowlist",
         "unknown": "(diagnose-only — extend factory_observer.classify with new code)",
     }
     return headers.get(code, "Repair factory cycle blocker")
@@ -2304,7 +2536,9 @@ def _empty_state() -> dict:
         "auto_publish_request": {},
         "qa_diagnostics": {},
         "factory_command_diagnostics": {},
+        "dependency_change_state": {},
         "log_tail": "",
+        "app_build_log_tail": "",
     }
 
 
@@ -2858,6 +3092,98 @@ def self_test() -> tuple[int, int, list[str]]:
             f"R: promoted publish_required should be review/non-failure, got "
             f"code={c['diagnostic_code']} cat={c['category']} "
             f"is_failure={c['is_failure']}"
+        )
+
+    # DEP-OBS-1. Dependency Change Contract failure (not_allowed) routes
+    # to diagnostic_code=dependency_not_allowed, NOT the generic
+    # build_app_after_apply_failed.
+    total += 1
+    s = _empty_state()
+    s["dependency_change_state"] = {
+        "status": "not_allowed",
+        "failure_code": "dependency_not_allowed",
+        "failure_reason": "unauthorized dependency added: leftpad",
+        "blocked_packages": ["leftpad"],
+        "added_dependencies": ["leftpad"],
+        "package_json_changed": True,
+        "lockfile_changed": False,
+        "install_attempted": False,
+    }
+    s["factory_state"] = {
+        "claude_apply_status": "rolled_back",
+        "failed_stage": "dependency_policy",
+        "claude_apply_message":
+            "허용되지 않은 dependency 추가 — 강제 롤백: leftpad",
+        "dependency_change_status": "not_allowed",
+        "dependency_failure_code": "dependency_not_allowed",
+    }
+    s["control_state"] = {"status": "failed", "liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] == "dependency_not_allowed":
+        passed += 1
+    else:
+        failures.append(
+            f"DEP-OBS-1: dependency_not_allowed must route to its own code, "
+            f"got {c['diagnostic_code']}"
+        )
+
+    # DEP-OBS-2. Dependency install failure routes to
+    # dependency_change_failed.
+    total += 1
+    s = _empty_state()
+    s["dependency_change_state"] = {
+        "status": "install_failed",
+        "failure_code": "dependency_change_failed",
+        "failure_reason": "npm ERR! ENOENT package not found",
+        "added_dependencies": ["html2canvas"],
+        "package_json_changed": True,
+        "install_attempted": True,
+        "install_exit_code": 1,
+        "install_timed_out": False,
+    }
+    s["factory_state"] = {
+        "claude_apply_status": "rolled_back",
+        "failed_stage": "dependency_install",
+        "claude_apply_message": "dependency install 실패 — 강제 롤백",
+        "dependency_change_status": "install_failed",
+        "dependency_failure_code": "dependency_change_failed",
+    }
+    s["control_state"] = {"status": "failed", "liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    if c["diagnostic_code"] == "dependency_change_failed":
+        passed += 1
+    else:
+        failures.append(
+            f"DEP-OBS-2: dependency_change_failed must route to its own code, "
+            f"got {c['diagnostic_code']}"
+        )
+
+    # DEP-OBS-3. build_failure_report includes the inline
+    # app_build_after_apply.log tail when present (≥80 lines).
+    total += 1
+    s = _empty_state()
+    s["app_build_log_tail"] = "\n".join(
+        f"vite line {i}" for i in range(1, 121)
+    )
+    s["factory_state"] = {
+        "claude_apply_status": "rolled_back",
+        "failed_stage": "claude_apply",
+        "claude_apply_message": "재검증 실패 (build_app)",
+        "failed_reason": "build_app",
+    }
+    s["control_state"] = {"status": "failed", "liveness": {"runner_online": True}}
+    c = classify(s, runner_processes=fake_python_runner, caffeinate_processes=[])
+    report_md = build_failure_report(s, c)
+    if (
+        "app_build_after_apply.log" in report_md
+        and "vite line 120" in report_md
+        and "vite line 41" in report_md
+    ):
+        passed += 1
+    else:
+        failures.append(
+            "DEP-OBS-3: failure report must inline app_build_after_apply.log "
+            "tail (≥80 lines)"
         )
 
     return passed, total, failures

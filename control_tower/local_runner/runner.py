@@ -2120,7 +2120,8 @@ def _revalidate_for_publish() -> tuple[bool, list[str]]:
         from . import cycle as _cycle
     except ImportError as e:
         return False, [f"cycle import failed: {e}"]
-    return _cycle._revalidate_after_apply()
+    ok, failures, _dep_state = _cycle._revalidate_after_apply()
+    return ok, failures
 
 
 def _build_publish_commit_message(

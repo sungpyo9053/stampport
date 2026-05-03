@@ -64,6 +64,43 @@ CLAUDE_APPLY_COMMAND_FILE = RUNTIME / "claude_apply_command.json"
 # Both files are pure forensics — they are never re-applied automatically.
 APPLY_ROLLED_BACK_DIFF_FILE = RUNTIME / "claude_apply_rolled_back.diff"
 APP_BUILD_AFTER_APPLY_LOG = RUNTIME / "app_build_after_apply.log"
+# Dependency Change Contract artifacts. claude_apply may modify
+# app/web/package.json — without an automatic install + lockfile
+# refresh, the very next build_app re-validation fails on the missing
+# module. This contract intercepts package.json/lockfile changes,
+# verifies the new dependencies are on an explicit allowlist, runs npm
+# install, and only then re-runs build_app. The state file is the
+# single source of truth for the observer + smoke + pipeline_decision.
+DEPENDENCY_CHANGE_STATE_FILE   = RUNTIME / "dependency_change_state.json"
+DEPENDENCY_INSTALL_STDOUT_FILE = RUNTIME / "dependency_install_stdout.log"
+DEPENDENCY_INSTALL_STDERR_FILE = RUNTIME / "dependency_install_stderr.log"
+
+# Auto-install allowlist. Anything outside this set forces a hard
+# rollback with failure_code=dependency_not_allowed; the operator must
+# either implement the feature without the dep or extend the allowlist.
+# We avoid native build / postinstall risky / server config packages by
+# default — those need conscious human approval.
+DEPENDENCY_ALLOWLIST: frozenset[str] = frozenset({
+    "html2canvas",
+    "lucide-react",
+    "clsx",
+    "date-fns",
+})
+
+# Files in the app/web tier that we treat as dependency-mutating.
+# claude_apply touching any of these triggers the contract.
+DEPENDENCY_FILES_APP_WEB: tuple[str, ...] = (
+    "app/web/package.json",
+    "app/web/package-lock.json",
+    "app/web/pnpm-lock.yaml",
+    "app/web/yarn.lock",
+)
+APP_WEB_PACKAGE_JSON_PATH = "app/web/package.json"
+APP_WEB_LOCKFILE_PATHS: tuple[str, ...] = (
+    "app/web/package-lock.json",
+    "app/web/pnpm-lock.yaml",
+    "app/web/yarn.lock",
+)
 # Product Planner v2 — replaces the older Product Discovery Mode
 # (.runtime/product_discovery.md). The new file enforces a richer
 # template (LLM need, data storage, MVP scope, success criteria) and
@@ -633,6 +670,31 @@ class CycleState:
     claude_apply_rollback: bool = False
     claude_apply_skipped_reason: str | None = None
     claude_apply_message: str | None = None
+    # Dependency Change Contract — populated by _revalidate_after_apply
+    # when claude_apply touches app/web/package.json (or a lockfile).
+    # Status values:
+    #   skipped         — no package.json / lockfile change
+    #   detected        — change detected, no install needed
+    #   installed       — npm install ran successfully
+    #   install_failed  — npm install failed (failure_code=
+    #                     dependency_change_failed)
+    #   not_allowed     — added dep outside DEPENDENCY_ALLOWLIST
+    #                     (failure_code=dependency_not_allowed)
+    dependency_change_status: str = "skipped"
+    dependency_change_detected: bool = False
+    dependency_package_json_changed: bool = False
+    dependency_lockfile_changed: bool = False
+    dependency_added: list[str] = field(default_factory=list)
+    dependency_removed: list[str] = field(default_factory=list)
+    dependency_blocked_packages: list[str] = field(default_factory=list)
+    dependency_install_attempted: bool = False
+    dependency_install_exit_code: int | None = None
+    dependency_install_timed_out: bool = False
+    dependency_failure_code: str | None = None
+    dependency_failure_reason: str | None = None
+    dependency_change_state_path: str | None = None
+    dependency_install_stdout_path: str | None = None
+    dependency_install_stderr_path: str | None = None
     # Publish blocker policy — 5-bucket classifier. Populated by
     # stage_publish_blocker_check and stage_publish_blocker_resolve.
     #   auto_restored   — files we ran `git restore` on
@@ -897,6 +959,21 @@ class CycleState:
             "claude_apply_rollback": self.claude_apply_rollback,
             "claude_apply_skipped_reason": self.claude_apply_skipped_reason,
             "claude_apply_message": self.claude_apply_message,
+            "dependency_change_status": self.dependency_change_status,
+            "dependency_change_detected": self.dependency_change_detected,
+            "dependency_package_json_changed": self.dependency_package_json_changed,
+            "dependency_lockfile_changed": self.dependency_lockfile_changed,
+            "dependency_added": list(self.dependency_added),
+            "dependency_removed": list(self.dependency_removed),
+            "dependency_blocked_packages": list(self.dependency_blocked_packages),
+            "dependency_install_attempted": self.dependency_install_attempted,
+            "dependency_install_exit_code": self.dependency_install_exit_code,
+            "dependency_install_timed_out": self.dependency_install_timed_out,
+            "dependency_failure_code": self.dependency_failure_code,
+            "dependency_failure_reason": self.dependency_failure_reason,
+            "dependency_change_state_path": self.dependency_change_state_path,
+            "dependency_install_stdout_path": self.dependency_install_stdout_path,
+            "dependency_install_stderr_path": self.dependency_install_stderr_path,
             "publish_blocked": self.publish_blocked,
             "publish_blocker_status": self.publish_blocker_status,
             "auto_resolved_files": list(self.auto_resolved_files),
@@ -6840,6 +6917,14 @@ def build_pipeline_decision(state) -> dict:
     executor_status = _norm(s.get("claude_executor_status"))
     executor_failure_code = _norm(s.get("claude_executor_failure_code"))
     executor_failure_reason = _norm(s.get("claude_executor_failure_reason"))
+    # Dependency Change Contract — promoted to a first-class blocking
+    # code so a package.json / lockfile / allowlist failure surfaces as
+    # `dependency_change_failed` or `dependency_not_allowed` rather than
+    # the generic `stage_failed` cascade. checks["dependency"] is added
+    # alongside the existing planner/ticket/apply/qa/scope rows.
+    dependency_status_field = _norm(s.get("dependency_change_status"))
+    dependency_failure_code = _norm(s.get("dependency_failure_code"))
+    dependency_failure_reason = _norm(s.get("dependency_failure_reason"))
 
     changed_files = list(s.get("claude_apply_changed_files") or [])
     raw_count = s.get("changed_files_count")
@@ -6890,6 +6975,13 @@ def build_pipeline_decision(state) -> dict:
     else:
         checks["scope"] = "skipped"
 
+    if dependency_status_field in {"installed", "detected"}:
+        checks["dependency"] = "passed"
+    elif dependency_status_field in {"install_failed", "not_allowed"} or dependency_failure_code:
+        checks["dependency"] = "failed"
+    else:
+        checks["dependency"] = "skipped"
+
     checks["meaningful_change"] = "passed" if has_changes else "failed"
 
     apply_ok = apply_status == "applied"
@@ -6911,6 +7003,23 @@ def build_pipeline_decision(state) -> dict:
             executor_failure_reason
             or f"claude executor status={executor_status or 'unknown'}"
         )
+        checks["apply"] = "failed"
+
+    # Dependency Change Contract failure beats the source-of-truth /
+    # stage_failed cascade. The patch was rolled back specifically
+    # because of a package.json / lockfile / allowlist issue, and the
+    # repair workflow is different (allowlist tweak / dependency
+    # removal) from the generic "fix the source code" advice that
+    # stage_failed implies.
+    if not blocking_code and dependency_failure_code in {
+        "dependency_change_failed", "dependency_not_allowed",
+    }:
+        blocking_code = dependency_failure_code
+        blocking_reason = (
+            dependency_failure_reason
+            or f"dependency change failed (status={dependency_status_field or 'unknown'})"
+        )
+        checks["dependency"] = "failed"
         checks["apply"] = "failed"
 
     # Source-of-Truth mismatch — surfaced as a precise blocking_code
@@ -6998,6 +7107,7 @@ def build_pipeline_decision(state) -> dict:
     elif blocking_code in {
         "stage_failed", "qa_failed", "apply_preflight_failed",
         "source_of_truth_mismatch",
+        "dependency_change_failed", "dependency_not_allowed",
     }:
         pipeline_status = "blocked"
     elif blocking_code in {
@@ -7030,6 +7140,15 @@ def build_pipeline_decision(state) -> dict:
         "claude_executor_max_cost_usd": s.get("claude_executor_max_cost_usd"),
         "claude_executor_cost_budget_source": s.get("claude_executor_cost_budget_source"),
         "claude_executor_exceeded_budget": s.get("claude_executor_exceeded_budget"),
+        "dependency_change_status": dependency_status_field or None,
+        "dependency_failure_code": dependency_failure_code or None,
+        "dependency_failure_reason": dependency_failure_reason or None,
+        "dependency_added": list(s.get("dependency_added") or []),
+        "dependency_removed": list(s.get("dependency_removed") or []),
+        "dependency_blocked_packages": list(s.get("dependency_blocked_packages") or []),
+        "dependency_install_attempted": bool(s.get("dependency_install_attempted")),
+        "dependency_install_exit_code": s.get("dependency_install_exit_code"),
+        "dependency_install_timed_out": bool(s.get("dependency_install_timed_out")),
     }
 
     return {
@@ -8371,10 +8490,323 @@ def _rollback_apply(
     return (not remove_failures, " | ".join(notes))
 
 
-def _revalidate_after_apply() -> tuple[bool, list[str]]:
+def _empty_dependency_change_state() -> dict:
+    """Schema for .runtime/dependency_change_state.json. Every key is
+    populated even on the skipped path so downstream consumers can rely
+    on a stable shape."""
+    return {
+        "status": "skipped",
+        "package_json_changed": False,
+        "lockfile_changed": False,
+        "added_dependencies": [],
+        "removed_dependencies": [],
+        "blocked_packages": [],
+        "install_attempted": False,
+        "install_exit_code": None,
+        "install_timed_out": False,
+        "failure_code": None,
+        "failure_reason": None,
+        "stdout_path": None,
+        "stderr_path": None,
+    }
+
+
+def _classify_dependency_change(
+    changed_paths: list[str],
+) -> tuple[bool, bool, bool, str, str]:
+    """Return (detected, package_json_changed, lockfile_changed,
+    package_json_path, lockfile_path) for the app/web tier."""
+    package_json_path = ""
+    lockfile_path = ""
+    for p in changed_paths:
+        if p == APP_WEB_PACKAGE_JSON_PATH:
+            package_json_path = p
+        elif p in APP_WEB_LOCKFILE_PATHS:
+            lockfile_path = p
+    detected = bool(package_json_path or lockfile_path)
+    return (
+        detected, bool(package_json_path), bool(lockfile_path),
+        package_json_path, lockfile_path,
+    )
+
+
+def _parse_package_json_deps(text: str) -> dict[str, str]:
+    """Merge `dependencies` + `devDependencies`. Returns {} on parse error."""
+    if not text or not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key in ("dependencies", "devDependencies"):
+        raw = data.get(key)
+        if isinstance(raw, dict):
+            for name, version in raw.items():
+                if isinstance(name, str):
+                    result[name] = str(version) if version is not None else ""
+    return result
+
+
+def _diff_package_dependencies(
+    before_text: str, after_text: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    before = _parse_package_json_deps(before_text)
+    after = _parse_package_json_deps(after_text)
+    added = {k: v for k, v in after.items() if k not in before}
+    removed = {k: v for k, v in before.items() if k not in after}
+    return added, removed
+
+
+def _check_dependency_allowlist(
+    added: dict[str, str],
+) -> tuple[bool, list[str]]:
+    """Return (all_allowed, sorted_blocked_names)."""
+    if not added:
+        return True, []
+    blocked = sorted(name for name in added if name not in DEPENDENCY_ALLOWLIST)
+    return (not blocked), blocked
+
+
+def _git_show_text(rel_path: str, ref: str = "HEAD") -> str:
+    """Read a file's content at a git ref (defaults to HEAD).
+
+    Used to recover the pre-apply contents of package.json for the
+    Dependency Change Contract — the working tree already carries the
+    post-apply version when this runs."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{rel_path}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return r.stdout or ""
+
+
+def _run_dependency_install(
+    web_dir: Path, *, lockfile_present: bool,
+) -> tuple[bool, int | None, bool, str, str]:
+    """Run `npm install` (or `npm install --package-lock-only` when a
+    lockfile already exists) inside `web_dir`. Returns
+    (ok, exit_code, timed_out, stdout, stderr)."""
+    npm = shutil.which("npm")
+    if not npm:
+        return False, None, False, "", "npm not installed"
+    if lockfile_present:
+        argv = [npm, "install", "--package-lock-only", "--no-audit", "--no-fund"]
+    else:
+        argv = [npm, "install", "--no-audit", "--no-fund"]
+    timeout_sec = float(
+        os.environ.get("FACTORY_DEPENDENCY_INSTALL_TIMEOUT_SEC", "300")
+    )
+    env = os.environ.copy()
+    env["CI"] = "1"
+    try:
+        r = subprocess.run(
+            argv, cwd=str(web_dir), capture_output=True, text=True,
+            timeout=timeout_sec, env=env,
+        )
+        return (
+            r.returncode == 0,
+            r.returncode,
+            False,
+            r.stdout or "",
+            r.stderr or "",
+        )
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        err = e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", errors="replace")
+        return False, None, True, out, err
+    except (OSError, ValueError) as e:
+        return False, None, False, "", f"install error: {e}"
+
+
+def _persist_dependency_change_state(
+    state: dict,
+    *,
+    stdout_text: str | None = None,
+    stderr_text: str | None = None,
+) -> None:
+    """Write the dependency state JSON + optional install stdout/stderr."""
+    try:
+        DEPENDENCY_CHANGE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEPENDENCY_CHANGE_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    if stdout_text is not None:
+        try:
+            DEPENDENCY_INSTALL_STDOUT_FILE.write_text(stdout_text, encoding="utf-8")
+            state["stdout_path"] = str(DEPENDENCY_INSTALL_STDOUT_FILE)
+        except OSError:
+            pass
+    if stderr_text is not None:
+        try:
+            DEPENDENCY_INSTALL_STDERR_FILE.write_text(stderr_text, encoding="utf-8")
+            state["stderr_path"] = str(DEPENDENCY_INSTALL_STDERR_FILE)
+        except OSError:
+            pass
+    # Re-write to capture the stdout/stderr_path fields populated above.
+    if stdout_text is not None or stderr_text is not None:
+        try:
+            DEPENDENCY_CHANGE_STATE_FILE.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+
+def _apply_dependency_change_contract(
+    changed_paths: list[str],
+    *,
+    web_dir: Path | None = None,
+    install_runner=_run_dependency_install,
+    git_show=_git_show_text,
+) -> dict:
+    """Detect package.json/lockfile changes from claude_apply, gate on
+    the allowlist, and (when permitted) run npm install. Returns the
+    contract state dict (also persisted to disk)."""
+    state = _empty_dependency_change_state()
+    web = web_dir or (REPO_ROOT / "app" / "web")
+
+    detected, pkg_changed, lock_changed, pkg_path, _lock_path = (
+        _classify_dependency_change(changed_paths)
+    )
+    state["package_json_changed"] = pkg_changed
+    state["lockfile_changed"] = lock_changed
+
+    if not detected:
+        state["status"] = "skipped"
+        _persist_dependency_change_state(state)
+        return state
+
+    added: dict[str, str] = {}
+    removed: dict[str, str] = {}
+    if pkg_changed:
+        before = git_show(APP_WEB_PACKAGE_JSON_PATH)
+        try:
+            after = (web / "package.json").read_text(encoding="utf-8")
+        except OSError:
+            after = ""
+        added, removed = _diff_package_dependencies(before, after)
+    state["added_dependencies"] = sorted(added.keys())
+    state["removed_dependencies"] = sorted(removed.keys())
+
+    allowed, blocked = _check_dependency_allowlist(added)
+    state["blocked_packages"] = blocked
+    if not allowed:
+        state["status"] = "not_allowed"
+        state["failure_code"] = "dependency_not_allowed"
+        state["failure_reason"] = (
+            f"unauthorized dependency added: {', '.join(blocked)} — "
+            "implement the feature without the dependency or extend "
+            "DEPENDENCY_ALLOWLIST in cycle.py."
+        )
+        _persist_dependency_change_state(state)
+        return state
+
+    needs_install = bool(added) or bool(removed) or pkg_changed or lock_changed
+    if not needs_install:
+        state["status"] = "detected"
+        _persist_dependency_change_state(state)
+        return state
+
+    state["install_attempted"] = True
+    if not web.is_dir():
+        state["status"] = "install_failed"
+        state["failure_code"] = "dependency_change_failed"
+        state["failure_reason"] = f"app/web directory missing: {web}"
+        _persist_dependency_change_state(state)
+        return state
+
+    lockfile_present = (web / "package-lock.json").is_file()
+    ok, exit_code, timed_out, stdout_text, stderr_text = install_runner(
+        web, lockfile_present=lockfile_present,
+    )
+    state["install_exit_code"] = exit_code
+    state["install_timed_out"] = timed_out
+    if not ok:
+        state["status"] = "install_failed"
+        state["failure_code"] = "dependency_change_failed"
+        tail = (stderr_text or stdout_text or "(no output)").strip()
+        state["failure_reason"] = tail[-500:] if tail else "npm install failed"
+        _persist_dependency_change_state(
+            state, stdout_text=stdout_text, stderr_text=stderr_text,
+        )
+        return state
+
+    state["status"] = "installed"
+    _persist_dependency_change_state(
+        state, stdout_text=stdout_text, stderr_text=stderr_text,
+    )
+    return state
+
+
+def _apply_dependency_state_to_cycle_state(
+    state: "CycleState", dep: dict,
+) -> None:
+    """Mirror the Dependency Change Contract result onto the live
+    CycleState fields so to_dict() (and downstream consumers like
+    pipeline_decision / smoke / observer) see the same verdict."""
+    if not isinstance(dep, dict):
+        return
+    state.dependency_change_status = str(dep.get("status") or "skipped")
+    state.dependency_change_detected = bool(
+        dep.get("package_json_changed") or dep.get("lockfile_changed")
+    )
+    state.dependency_package_json_changed = bool(dep.get("package_json_changed"))
+    state.dependency_lockfile_changed = bool(dep.get("lockfile_changed"))
+    state.dependency_added = list(dep.get("added_dependencies") or [])
+    state.dependency_removed = list(dep.get("removed_dependencies") or [])
+    state.dependency_blocked_packages = list(dep.get("blocked_packages") or [])
+    state.dependency_install_attempted = bool(dep.get("install_attempted"))
+    raw_exit = dep.get("install_exit_code")
+    state.dependency_install_exit_code = (
+        int(raw_exit) if isinstance(raw_exit, int) else None
+    )
+    state.dependency_install_timed_out = bool(dep.get("install_timed_out"))
+    state.dependency_failure_code = dep.get("failure_code") or None
+    state.dependency_failure_reason = dep.get("failure_reason") or None
+    state.dependency_install_stdout_path = dep.get("stdout_path") or None
+    state.dependency_install_stderr_path = dep.get("stderr_path") or None
+    if DEPENDENCY_CHANGE_STATE_FILE.is_file():
+        state.dependency_change_state_path = str(DEPENDENCY_CHANGE_STATE_FILE)
+    else:
+        state.dependency_change_state_path = None
+
+
+def _revalidate_after_apply(
+    *,
+    changed_tracked: list[str] | None = None,
+    new_untracked: list[str] | None = None,
+) -> tuple[bool, list[str], dict]:
     """Re-run the same correctness gates as the main cycle, but compact:
     we only care PASS/FAIL, not per-stage metrics. Returns
-    (all_passed, list_of_failed_check_names).
+    (all_passed, list_of_failed_check_names, dependency_change_state).
+
+    Order:
+      1. dependency_change_detect → policy check → npm install (when
+         allowed). A `dependency_not_allowed` or install failure
+         short-circuits the rest of the validation; build_app would
+         certainly fail with a missing module so running it is wasted
+         time and produces a confusing log.
+      2. app/web build (build_app)
+      3. control_tower/web build (build_control)
+      4. py_compile across api/local_runner sources
+      5. bash -n on local_factory_*.sh
+      6. risky-file scan (post-apply git status)
 
     Side effect: when build_app fails, the captured stdout+stderr is
     written to .runtime/app_build_after_apply.log so the smoke runner /
@@ -8385,6 +8817,20 @@ def _revalidate_after_apply() -> tuple[bool, list[str]]:
     """
     failures: list[str] = []
     npm = shutil.which("npm")
+    changed_paths = sorted(
+        set((changed_tracked or []) + (new_untracked or []))
+    )
+
+    # 0. Dependency Change Contract — runs first so we never spend a
+    # build attempt on a tree whose dependencies are stale relative to
+    # package.json.
+    dep_state = _apply_dependency_change_contract(changed_paths)
+    if dep_state["status"] == "not_allowed":
+        failures.append("dependency_policy")
+        return (False, failures, dep_state)
+    if dep_state["status"] == "install_failed":
+        failures.append("dependency_install")
+        return (False, failures, dep_state)
 
     # 1. app/web build
     web = REPO_ROOT / "app" / "web"
@@ -8467,7 +8913,7 @@ def _revalidate_after_apply() -> tuple[bool, list[str]]:
                 failures.append("risky_files")
                 break
 
-    return (not failures, failures)
+    return (not failures, failures, dep_state)
 
 
 def _evaluate_apply_meaningfulness(
@@ -8976,7 +9422,11 @@ def stage_claude_apply(state: CycleState) -> StageResult:
         "validation started — _revalidate_after_apply (build / py_compile / 위험파일 스캔)",
         files=(changed_tracked + new_untracked)[:30],
     )
-    revalidate_ok, failures = _revalidate_after_apply()
+    revalidate_ok, failures, dep_state = _revalidate_after_apply(
+        changed_tracked=changed_tracked,
+        new_untracked=new_untracked,
+    )
+    _apply_dependency_state_to_cycle_state(state, dep_state)
     if not revalidate_ok:
         # Snapshot the diff that's about to vanish — without this, the
         # operator (and the next cycle's repair prompt) has no record of
@@ -9000,10 +9450,37 @@ def stage_claude_apply(state: CycleState) -> StageResult:
 
         ok_rb, rb_msg = _rollback_apply(changed_tracked, new_untracked)
         sr.status = "failed"
-        sr.message = (
-            f"재검증 실패 ({', '.join(failures)}) — 롤백"
-            + ("" if ok_rb else " (일부 실패)")
-        )
+        # Dependency contract failures get their own surface message so
+        # the operator + repair prompt can immediately tell this is a
+        # package.json / lockfile / allowlist issue rather than a normal
+        # source-code build break.
+        if dep_state.get("failure_code") == "dependency_not_allowed":
+            sr.message = (
+                "허용되지 않은 dependency 추가 — 강제 롤백: "
+                f"{', '.join(dep_state.get('blocked_packages') or []) or 'unknown'}"
+                + ("" if ok_rb else " (일부 실패)")
+            )
+            state.failed_stage = "dependency_policy"
+            state.failed_reason = (
+                dep_state.get("failure_reason")
+                or "dependency_not_allowed"
+            )
+        elif dep_state.get("failure_code") == "dependency_change_failed":
+            sr.message = (
+                "dependency install 실패 — 강제 롤백 ("
+                f"exit_code={dep_state.get('install_exit_code')}, "
+                f"timed_out={dep_state.get('install_timed_out')})"
+                + ("" if ok_rb else " (일부 실패)")
+            )
+            state.failed_stage = "dependency_install"
+            state.failed_reason = (
+                dep_state.get("failure_reason") or "npm install failed"
+            )
+        else:
+            sr.message = (
+                f"재검증 실패 ({', '.join(failures)}) — 롤백"
+                + ("" if ok_rb else " (일부 실패)")
+            )
         sr.detail = rb_msg
         state.claude_apply_status = "rolled_back"
         state.claude_apply_rollback = True

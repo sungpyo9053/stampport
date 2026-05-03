@@ -2854,6 +2854,101 @@ def self_test() -> tuple[int, int, list[str]]:
                 f"push={last.get('push_status')} reason={result.get('stop_reason')}"
             )
 
+        # --- PD-DEP-NA. dependency_not_allowed must produce
+        # blocking_code=dependency_not_allowed + pipeline_status=blocked
+        # + can_publish=false + checks.dependency=failed + checks.apply=
+        # failed. Apply rolled back so claude_apply_status is rolled_back.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "failed",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "rolled_back",
+            "qa_status": "skipped",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["app/web/package.json"],
+            "changed_files_count": 1,
+            "dependency_change_status": "not_allowed",
+            "dependency_failure_code": "dependency_not_allowed",
+            "dependency_failure_reason":
+                "unauthorized dependency added: leftpad",
+            "dependency_blocked_packages": ["leftpad"],
+        })
+        if (
+            decision.get("blocking_code") == "dependency_not_allowed"
+            and decision.get("pipeline_status") == "blocked"
+            and decision.get("can_publish") is False
+            and decision.get("checks", {}).get("dependency") == "failed"
+            and decision.get("checks", {}).get("apply") == "failed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-DEP-NA: dependency_not_allowed must blocking_code="
+                f"dependency_not_allowed — got {decision}"
+            )
+
+        # --- PD-DEP-FAIL. dependency_change_failed routes the same way
+        # but with blocking_code=dependency_change_failed.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "failed",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "rolled_back",
+            "qa_status": "skipped",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": ["app/web/package.json"],
+            "changed_files_count": 1,
+            "dependency_change_status": "install_failed",
+            "dependency_failure_code": "dependency_change_failed",
+            "dependency_failure_reason":
+                "npm ERR! ENOENT package not found",
+            "dependency_install_attempted": True,
+            "dependency_install_exit_code": 1,
+        })
+        if (
+            decision.get("blocking_code") == "dependency_change_failed"
+            and decision.get("pipeline_status") == "blocked"
+            and decision.get("can_publish") is False
+            and decision.get("checks", {}).get("dependency") == "failed"
+            and decision.get("checks", {}).get("apply") == "failed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-DEP-FAIL: dependency_change_failed must blocking_code="
+                f"dependency_change_failed — got {decision}"
+            )
+
+        # --- PD-DEP-OK. dependency_change_status=installed alongside a
+        # successful claude_apply must NOT block publish — checks.
+        # dependency=passed and the existing happy-path gates rule.
+        total += 1
+        decision = _cycle.build_pipeline_decision({
+            "status": "succeeded",
+            "implementation_ticket_status": "generated",
+            "claude_apply_status": "applied",
+            "qa_status": "passed",
+            "apply_preflight_status": "passed",
+            "claude_apply_changed_files": [
+                "app/web/package.json", "app/web/src/screens/Foo.jsx",
+            ],
+            "changed_files_count": 2,
+            "dependency_change_status": "installed",
+            "dependency_install_attempted": True,
+            "dependency_install_exit_code": 0,
+        })
+        if (
+            decision.get("blocking_code") is None
+            and decision.get("can_publish") is True
+            and decision.get("checks", {}).get("dependency") == "passed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                "PD-DEP-OK: installed dependency must not block publish — "
+                f"got {decision}"
+            )
+
     # Restore env.
     if repo_prev is None:
         os.environ.pop("LOCAL_RUNNER_REPO", None)

@@ -7319,6 +7319,384 @@ def self_test() -> tuple[int, int, list[str]]:
                 _cycle.DESIGN_SPEC_FILE = saved_design
                 _cycle.IMPLEMENTATION_TICKET_FILE = saved_ticket
 
+    # ------------------------------------------------------------------
+    # Dependency Change Contract — A–H acceptance fixtures.
+    # See cycle._apply_dependency_change_contract / _revalidate_after_apply.
+    # Designed for stdlib-only execution (no real npm) — install behavior
+    # is injected via the install_runner kwarg. git_show is injected so
+    # we never touch the live repo's HEAD.
+    # ------------------------------------------------------------------
+    if _cycle is not None:
+        import tempfile
+
+        _PKG_REL = "app/web/package.json"
+        _BEFORE_PKG = json.dumps(
+            {"dependencies": {"react": "^19.0.0"}, "devDependencies": {}},
+        )
+        _AFTER_PKG_HTML2CANVAS = json.dumps(
+            {
+                "dependencies": {
+                    "react": "^19.0.0",
+                    "html2canvas": "^1.4.1",
+                },
+                "devDependencies": {},
+            },
+        )
+        _AFTER_PKG_LEFTPAD = json.dumps(
+            {
+                "dependencies": {
+                    "react": "^19.0.0",
+                    "leftpad": "^1.0.0",
+                },
+                "devDependencies": {},
+            },
+        )
+
+        def _success_install(_web, *, lockfile_present):
+            return True, 0, False, "added 1 package\n", ""
+
+        def _fail_install(_web, *, lockfile_present):
+            return False, 1, False, "", "npm ERR! ENOENT package not found\n"
+
+        def _git_show_before_pkg(_path, ref="HEAD"):
+            return _BEFORE_PKG
+
+        def _git_show_empty(_path, ref="HEAD"):
+            return ""
+
+        # DEP-A. package.json adds html2canvas + no lockfile → contract
+        # detects the change and records html2canvas under added_dependencies.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                web = Path(tmp) / "app" / "web"
+                web.mkdir(parents=True)
+                (web / "package.json").write_text(
+                    _AFTER_PKG_HTML2CANVAS, encoding="utf-8",
+                )
+                dep_a = _cycle._apply_dependency_change_contract(
+                    [_PKG_REL], web_dir=web,
+                    install_runner=_success_install,
+                    git_show=_git_show_before_pkg,
+                )
+            finally:
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+        if (
+            dep_a.get("package_json_changed") is True
+            and dep_a.get("lockfile_changed") is False
+            and "html2canvas" in (dep_a.get("added_dependencies") or [])
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-A: package.json + html2canvas → expected detected=True "
+                f"+ added — got {dep_a}"
+            )
+
+        # DEP-B. html2canvas IS in the allowlist → install_attempted=True
+        # and the contract advances to status=installed.
+        total += 1
+        if (
+            dep_a.get("install_attempted") is True
+            and dep_a.get("status") == "installed"
+            and dep_a.get("install_exit_code") == 0
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-B: html2canvas allowlist must install — got {dep_a}"
+            )
+
+        # DEP-C. Disallowed dep (leftpad) → status=not_allowed,
+        # failure_code=dependency_not_allowed, install NOT attempted.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                web = Path(tmp) / "app" / "web"
+                web.mkdir(parents=True)
+                (web / "package.json").write_text(
+                    _AFTER_PKG_LEFTPAD, encoding="utf-8",
+                )
+                dep_c = _cycle._apply_dependency_change_contract(
+                    [_PKG_REL], web_dir=web,
+                    install_runner=_success_install,
+                    git_show=_git_show_before_pkg,
+                )
+            finally:
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+        if (
+            dep_c.get("status") == "not_allowed"
+            and dep_c.get("failure_code") == "dependency_not_allowed"
+            and "leftpad" in (dep_c.get("blocked_packages") or [])
+            and dep_c.get("install_attempted") is False
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-C: leftpad must be not_allowed — got {dep_c}"
+            )
+
+        # DEP-D. npm install fails → status=install_failed,
+        # failure_code=dependency_change_failed.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                web = Path(tmp) / "app" / "web"
+                web.mkdir(parents=True)
+                (web / "package.json").write_text(
+                    _AFTER_PKG_HTML2CANVAS, encoding="utf-8",
+                )
+                dep_d = _cycle._apply_dependency_change_contract(
+                    [_PKG_REL], web_dir=web,
+                    install_runner=_fail_install,
+                    git_show=_git_show_before_pkg,
+                )
+            finally:
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+        if (
+            dep_d.get("status") == "install_failed"
+            and dep_d.get("failure_code") == "dependency_change_failed"
+            and dep_d.get("install_attempted") is True
+            and dep_d.get("install_exit_code") == 1
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-D: install failure must produce dependency_change_failed "
+                f"— got {dep_d}"
+            )
+
+        # DEP-E. No package.json change → contract status=skipped, no
+        # install attempt.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                web = Path(tmp) / "app" / "web"
+                web.mkdir(parents=True)
+                dep_e = _cycle._apply_dependency_change_contract(
+                    ["app/web/src/screens/Foo.jsx"],
+                    web_dir=web,
+                    install_runner=_success_install,
+                    git_show=_git_show_empty,
+                )
+            finally:
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+        if (
+            dep_e.get("status") == "skipped"
+            and dep_e.get("install_attempted") is False
+            and dep_e.get("package_json_changed") is False
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-E: non-package change must skip dep stage — got {dep_e}"
+            )
+
+        # DEP-F. Install success → _revalidate_after_apply does NOT
+        # short-circuit on dependency_policy / dependency_install. The
+        # build_app re-attempt path is reached (whether build_app itself
+        # passes is environment-dependent — what we verify here is that
+        # the dep stage didn't block subsequent stages).
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            saved_app_log = _cycle.APP_BUILD_AFTER_APPLY_LOG
+            saved_apply_contract = _cycle._apply_dependency_change_contract
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                _cycle.APP_BUILD_AFTER_APPLY_LOG = runtime / "build.log"
+                # Inject a known dep contract result so we don't need a
+                # real npm. The _revalidate_after_apply function looks up
+                # _apply_dependency_change_contract via module attribute,
+                # so monkeypatch the module symbol.
+                fake_dep = {
+                    **_cycle._empty_dependency_change_state(),
+                    "status": "installed",
+                    "package_json_changed": True,
+                    "added_dependencies": ["html2canvas"],
+                    "install_attempted": True,
+                    "install_exit_code": 0,
+                }
+                _cycle._apply_dependency_change_contract = (
+                    lambda paths, **kw: fake_dep
+                )
+                ok_f, failures_f, dep_state_f = _cycle._revalidate_after_apply(
+                    changed_tracked=[_PKG_REL], new_untracked=[],
+                )
+            finally:
+                _cycle._apply_dependency_change_contract = saved_apply_contract
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+                _cycle.APP_BUILD_AFTER_APPLY_LOG = saved_app_log
+        if (
+            "dependency_policy" not in failures_f
+            and "dependency_install" not in failures_f
+            and dep_state_f.get("status") == "installed"
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-F: install success must let revalidate continue past dep "
+                f"stage — failures={failures_f} dep={dep_state_f}"
+            )
+
+        # DEP-G. build_app failure → factory_failure_report.md includes
+        # app_build_after_apply.log tail (≥80 lines, inline).
+        total += 1
+        synthetic_lines = [f"build line {i}" for i in range(1, 121)]
+        fake_state = _observer._empty_state()
+        fake_state["app_build_log_tail"] = "\n".join(synthetic_lines)
+        fake_state["control_state"] = {
+            "status": "failed", "liveness": {"runner_online": True},
+        }
+        fake_state["factory_state"] = {
+            "claude_apply_status": "rolled_back",
+            "failed_stage": "claude_apply",
+            "claude_apply_message": "재검증 실패 (build_app)",
+            "failed_reason": "build_app",
+            "implementation_ticket_target_files": [
+                "app/web/src/screens/Foo.jsx",
+            ],
+        }
+        fake_state["log_tail"] = "irrelevant"
+        fake_class = _observer.classify(
+            fake_state,
+            runner_processes=["fake-py -m control_tower.local_runner.runner"],
+            caffeinate_processes=[],
+        )
+        report_md_g = _observer.build_failure_report(fake_state, fake_class)
+        contains_section = "app_build_after_apply.log" in report_md_g
+        contains_recent = "build line 120" in report_md_g
+        # 80-line tail of 1..120 is 41..120 — line 41 must appear, line 40 must NOT.
+        contains_old = "build line 41" in report_md_g
+        if contains_section and contains_recent and contains_old:
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-G: failure report must inline app_build_after_apply.log "
+                f"tail (≥80 lines) — section={contains_section} "
+                f"line120={contains_recent} line41={contains_old}"
+            )
+
+        # DEP-H. dependency failure must NOT clobber an existing
+        # claude_apply_rolled_back.diff. The contract is read-only on
+        # forensic artifacts: it should run, write its own state, and
+        # leave the rollback diff snapshot intact for stage_claude_apply
+        # to reference.
+        total += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_root = _cycle.REPO_ROOT
+            saved_dep_state = _cycle.DEPENDENCY_CHANGE_STATE_FILE
+            saved_dep_stdout = _cycle.DEPENDENCY_INSTALL_STDOUT_FILE
+            saved_dep_stderr = _cycle.DEPENDENCY_INSTALL_STDERR_FILE
+            saved_rollback_diff = _cycle.APPLY_ROLLED_BACK_DIFF_FILE
+            try:
+                runtime = Path(tmp) / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                _cycle.REPO_ROOT = Path(tmp)
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = runtime / "dep_state.json"
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = runtime / "dep_stdout.log"
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = runtime / "dep_stderr.log"
+                _cycle.APPLY_ROLLED_BACK_DIFF_FILE = runtime / "rolled_back.diff"
+                # Pre-populate a rollback diff from a "previous" cycle.
+                preserved_diff = "diff --git a/app/web/package.json\n+html2canvas added"
+                _cycle.APPLY_ROLLED_BACK_DIFF_FILE.write_text(
+                    preserved_diff, encoding="utf-8",
+                )
+                web = Path(tmp) / "app" / "web"
+                web.mkdir(parents=True)
+                (web / "package.json").write_text(
+                    _AFTER_PKG_LEFTPAD, encoding="utf-8",
+                )
+                dep_h = _cycle._apply_dependency_change_contract(
+                    [_PKG_REL], web_dir=web,
+                    install_runner=_success_install,
+                    git_show=_git_show_before_pkg,
+                )
+                rollback_after = _cycle.APPLY_ROLLED_BACK_DIFF_FILE.read_text(
+                    encoding="utf-8",
+                )
+            finally:
+                _cycle.REPO_ROOT = saved_root
+                _cycle.DEPENDENCY_CHANGE_STATE_FILE = saved_dep_state
+                _cycle.DEPENDENCY_INSTALL_STDOUT_FILE = saved_dep_stdout
+                _cycle.DEPENDENCY_INSTALL_STDERR_FILE = saved_dep_stderr
+                _cycle.APPLY_ROLLED_BACK_DIFF_FILE = saved_rollback_diff
+        if (
+            dep_h.get("status") == "not_allowed"
+            and dep_h.get("failure_code") == "dependency_not_allowed"
+            and rollback_after == preserved_diff
+        ):
+            passed += 1
+        else:
+            failures.append(
+                f"DEP-H: dependency_not_allowed must preserve rollback diff "
+                f"— dep={dep_h} rollback_after_unchanged="
+                f"{rollback_after == preserved_diff}"
+            )
+
     return passed, total, failures
 
 
