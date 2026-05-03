@@ -156,13 +156,12 @@ export function AppProvider({ children }) {
         created_at: new Date().toISOString(),
       };
       stamp.verification_level = verificationLevelFor(stamp);
-      stamp.kick_points = generateKickPoints(stamp);
+      const beforeBadges = computeBadges(previous);
+      stamp.kick_points = generateKickPoints(stamp, beforeBadges);
       const breakdown = expGainBreakdown(stamp, previous);
       stamp.exp_breakdown = breakdown.items;
       stamp.exp_gained = breakdown.total;
       stamp.grade = stampGradeFor(stamp);
-
-      const beforeBadges = computeBadges(previous);
       const nextStamps = [stamp, ...previous];
       const afterBadges = computeBadges(nextStamps);
       const newBadges = newlyEarnedBadges(beforeBadges, afterBadges);

@@ -57,7 +57,13 @@ export default function Share({ navigate, stampId }) {
   const grade = stamp.grade || stampGradeFor(stamp);
   const verification = verificationDef(stamp.verification_level || grade.level || 'manual');
 
+  const isNoticePreview = new URLSearchParams(window.location.search).get('preview') === 'notice';
+  const kickPoint = stamp.kick_points?.[0];
+
   const copy = async () => {
+    const noticeText = (isNoticePreview && kickPoint && typeof kickPoint !== 'string')
+      ? `\n📍 다음 도장 예고: ${kickPoint.area} · ${kickPoint.badge_hint || kickPoint.action_label}`
+      : '';
     const text =
       `[Stampport · 로컬 여권]\n` +
       `${stamp.place_name} (${stamp.area} · ${categoryLabel(stamp.category)})\n` +
@@ -66,7 +72,8 @@ export default function Share({ navigate, stampId }) {
       (stamp.representative_menu ? `대표 메뉴: ${stamp.representative_menu}\n` : '') +
       (stamp.tags?.length ? `#${stamp.tags.join(' #')}\n` : '') +
       `${user?.nickname || ''} · Lv.${level} · ${selectedTitle}\n` +
-      `${dateLabel}`;
+      `${dateLabel}` +
+      noticeText;
     try {
       await navigator.clipboard.writeText(text);
       setToast('공유 문구를 복사했어요');

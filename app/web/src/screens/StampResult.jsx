@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useApp } from '../context/appContext.js';
 import { categoryIcon, categoryLabel, visitPurposeLabel } from '../data/options.js';
 import { levelProgress, stampGradeFor, verificationDef } from '../utils/leveling.js';
+import KickNoticeCard from '../components/KickNoticeCard.jsx';
 
 // Animate the EXP bar from 0% → ratio% on first paint so the player
 // *sees* the gain settle in. Pure visual — totals are already final.
@@ -250,16 +251,15 @@ export default function StampResult({ navigate, stampId }) {
       </div>
 
       <div className="card">
-        <div className="card-title">다음 방문을 위한 킥 포인트 3가지</div>
-        <p className="card-sub">취향과 카테고리에 맞춰 자동 추천했어요.</p>
-        <div className="kick-list">
-          {stamp.kick_points.map((kp, i) => (
-            <div key={kp} className="kick-item">
-              <span className="num">{i + 1}</span>
-              <span>{kp}</span>
-            </div>
-          ))}
-        </div>
+        <div className="card-title">다음 도장 예고장</div>
+        <p className="card-sub">취향과 뱃지 진행 현황을 반영했어요.</p>
+        {stamp.kick_points.slice(0, 1).map((kp, i) => (
+          <KickNoticeCard
+            key={i}
+            kickPoint={kp}
+            onShare={() => navigate(`/share/${stamp.id}?preview=notice`)}
+          />
+        ))}
       </div>
 
       <div className="form-stack">

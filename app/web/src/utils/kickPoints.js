@@ -1,3 +1,5 @@
+import { categoryLabel } from '../data/options.js';
+
 const CATEGORY_POOL = {
   cafe: [
     '다음 카페에서는 시그니처 메뉴를 도전해 보세요.',
@@ -45,35 +47,28 @@ const FALLBACKS = [
   '주말에 새로운 동네에서 스탬프를 찍어 보세요.',
 ];
 
-export function generateKickPoints(stamp) {
-  const result = [];
-  const seen = new Set();
+export function generateKickPoints(stamp, badges = []) {
+  const relatedBadge = badges
+    .filter((b) => !b.earned && b.progress > 0)
+    .find((b) => {
+      const text = (b.name + b.description).toLowerCase();
+      return (stamp.area && text.includes(stamp.area))
+        || text.includes(categoryLabel(stamp.category));
+    }) || null;
 
-  const push = (text) => {
-    if (!text || seen.has(text) || result.length >= 3) return;
-    seen.add(text);
-    result.push(text);
-  };
+  const badge_hint = relatedBadge
+    ? `${relatedBadge.name}까지 ${relatedBadge.required - relatedBadge.progress}곳 남음`
+    : null;
 
-  if (stamp.representative_menu) {
-    push(`'${stamp.representative_menu}'와 비슷한 메뉴를 다른 가게에서도 시도해 보세요.`);
-  }
+  const visitCount = badges.reduce((n, b) => n + b.progress, 0);
+  const pool = CATEGORY_POOL[stamp.category] || FALLBACKS;
+  const action_label = pool[visitCount % pool.length];
 
-  const categoryPool = CATEGORY_POOL[stamp.category] || [];
-  if (categoryPool.length) push(categoryPool[0]);
-
-  for (const tag of stamp.tags || []) {
-    const text = TAG_POOL[tag];
-    if (text) push(text);
-    if (result.length >= 3) break;
-  }
-
-  if (result.length < 3 && categoryPool[1]) push(categoryPool[1]);
-  if (result.length < 3 && categoryPool[2]) push(categoryPool[2]);
-  for (const fallback of FALLBACKS) {
-    if (result.length >= 3) break;
-    push(fallback);
-  }
-
-  return result.slice(0, 3);
+  return [{
+    area: stamp.area || '',
+    category: stamp.category || '',
+    badge_hint,
+    exp_preview: 20,
+    action_label,
+  }];
 }
